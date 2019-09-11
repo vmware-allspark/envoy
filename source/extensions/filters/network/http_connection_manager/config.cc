@@ -268,8 +268,7 @@ HttpConnectionManagerConfig::HttpConnectionManagerConfig(
     // deprecate that and move to a straight fractional percent config.
     uint64_t random_sampling_numerator{PROTOBUF_PERCENT_TO_ROUNDED_INTEGER_OR_DEFAULT(
       tracing_config, random_sampling, 10000, 10000)};
-    random_sampling.set_numerator(
-        tracing_config.has_random_sampling() ? random_sampling_numerator : 10000);
+    random_sampling.set_numerator(random_sampling_numerator);
     random_sampling.set_denominator(envoy::type::FractionalPercent::TEN_THOUSAND);
     envoy::type::FractionalPercent overall_sampling;
     overall_sampling.set_numerator(
