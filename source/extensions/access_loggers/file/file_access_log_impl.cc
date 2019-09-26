@@ -24,9 +24,13 @@ void FileAccessLog::log(const Http::HeaderMap* request_headers,
   }
   if (!response_headers) {
     response_headers = &empty_headers;
+  } else {
+    const_cast<Http::HeaderMap*>(response_headers)->refreshByteSize();
   }
   if (!response_trailers) {
     response_trailers = &empty_headers;
+  } else {
+    const_cast<Http::HeaderMap*>(response_trailers)->refreshByteSize();
   }
 
   if (filter_) {

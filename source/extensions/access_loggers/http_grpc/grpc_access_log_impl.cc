@@ -171,9 +171,13 @@ void HttpGrpcAccessLog::log(const Http::HeaderMap* request_headers,
   }
   if (!response_headers) {
     response_headers = &empty_headers;
+  } else {
+    const_cast<Http::HeaderMap*>(response_headers)->refreshByteSize();
   }
   if (!response_trailers) {
     response_trailers = &empty_headers;
+  } else {
+    const_cast<Http::HeaderMap*>(response_trailers)->refreshByteSize();
   }
 
   if (filter_) {
@@ -329,7 +333,7 @@ void HttpGrpcAccessLog::log(const Http::HeaderMap* request_headers,
   if (request_headers->EnvoyOriginalPath() != nullptr) {
     request_properties->set_original_path(request_headers->EnvoyOriginalPath()->value().c_str());
   }
-  request_properties->set_request_headers_bytes(request_headers->byteSize());
+  request_properties->set_request_headers_bytes(request_headers->byteSize().value());
   request_properties->set_request_body_bytes(stream_info.bytesReceived());
   if (request_headers->Method() != nullptr) {
     envoy::api::v2::core::RequestMethod method =
@@ -354,7 +358,7 @@ void HttpGrpcAccessLog::log(const Http::HeaderMap* request_headers,
   if (stream_info.responseCode()) {
     response_properties->mutable_response_code()->set_value(stream_info.responseCode().value());
   }
-  response_properties->set_response_headers_bytes(response_headers->byteSize());
+  response_properties->set_response_headers_bytes(response_headers->byteSize().value());
   response_properties->set_response_body_bytes(stream_info.bytesSent());
   if (!response_headers_to_log_.empty()) {
     auto* logged_headers = response_properties->mutable_response_headers();

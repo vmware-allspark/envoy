@@ -993,6 +993,7 @@ Filter::UpstreamRequest::~UpstreamRequest() {
 
   stream_info_.setUpstreamTiming(upstream_timing_);
   stream_info_.onRequestComplete();
+
   for (const auto& upstream_log : parent_.config_.upstream_logs_) {
     upstream_log->log(parent_.downstream_headers_, upstream_headers_, upstream_trailers_,
                       stream_info_);
