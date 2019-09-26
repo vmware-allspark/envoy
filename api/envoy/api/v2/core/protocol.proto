@@ -30,7 +30,7 @@ message HttpProtocolOptions {
   // :ref:`drain_timeout
   // <envoy_api_field_config.filter.network.http_connection_manager.v2.HttpConnectionManager.drain_timeout>`.
   // Note that request based timeouts mean that HTTP/2 PINGs will not keep the connection alive.
-  google.protobuf.Duration idle_timeout = 1;
+  google.protobuf.Duration idle_timeout = 1 [(gogoproto.stdduration) = true];
 
   // The maximum number of headers. If unconfigured, the default
   // maximum number of request headers allowed is 100. Requests that exceed this limit will receive
