@@ -847,11 +847,177 @@ name: decode-headers-only
 }
 
 TEST_P(DownstreamProtocolIntegrationTest, LargeRequestHeadersRejected) {
-  testLargeRequestHeaders(95, 60);
+  // Send one 95 kB header with limit 60 kB and 100 headers.
+  testLargeRequestHeaders(95, 1, 60, 100);
 }
 
 TEST_P(DownstreamProtocolIntegrationTest, LargeRequestHeadersAccepted) {
-  testLargeRequestHeaders(95, 96);
+  // Send one 95 kB header with limit 96 kB and 100 headers.
+  testLargeRequestHeaders(95, 1, 96, 100);
+}
+
+TEST_P(DownstreamProtocolIntegrationTest, ManyRequestHeadersRejected) {
+  // Send 101 empty headers with limit 60 kB and 100 headers.
+  testLargeRequestHeaders(0, 101, 60, 80);
+}
+
+TEST_P(DownstreamProtocolIntegrationTest, ManyRequestHeadersAccepted) {
+  // Send 145 empty headers with limit 60 kB and 150 headers.
+  testLargeRequestHeaders(0, 140, 60, 150);
+}
+
+TEST_P(DownstreamProtocolIntegrationTest, LargeRequestTrailersRejected) {
+  // Default limit for headers and trailers is 60.
+  Http::TestHeaderMapImpl request_trailers;
+  request_trailers.addCopy("trailer", std::string(91 * 1024, 'a'));
+
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto encoder_decoder = codec_client_->startRequest(default_request_headers_);
+  request_encoder_ = &encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+  codec_client_->sendData(*request_encoder_, 1, false);
+  codec_client_->sendTrailers(*request_encoder_, request_trailers);
+
+  // Only relevant to Http2Downstream.
+  if (downstream_protocol_ == Http::CodecClient::Type::HTTP1) {
+    // Http1 Downstream ignores trailers.
+    waitForNextUpstreamRequest();
+    upstream_request_->encodeHeaders(default_response_headers_, true);
+    response->waitForEndStream();
+    EXPECT_TRUE(response->complete());
+    EXPECT_EQ("200", response->headers().Status()->value().getStringView());
+  } else {
+    // Expect rejection.
+    ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+    response->waitForReset();
+    ASSERT_TRUE(fake_upstream_connection_->close());
+    ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
+  }
+}
+
+TEST_P(DownstreamProtocolIntegrationTest, LargeRequestTrailersAccepted) {
+  // Set header (and trailer) limit to 95 kB.
+  uint32_t max_size = 95;
+  config_helper_.addConfigModifier(
+      [&](envoy::config::filter::network::http_connection_manager::v2::HttpConnectionManager& hcm)
+          -> void { hcm.mutable_max_request_headers_kb()->set_value(max_size); });
+  max_request_headers_kb_ = max_size;
+  Http::TestHeaderMapImpl request_trailers;
+  request_trailers.addCopy("trailer", std::string(91 * 1024, 'a'));
+
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto encoder_decoder = codec_client_->startRequest(default_request_headers_);
+  request_encoder_ = &encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+  codec_client_->sendData(*request_encoder_, 1, false);
+  codec_client_->sendTrailers(*request_encoder_, request_trailers);
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(default_response_headers_, true);
+  response->waitForEndStream();
+  EXPECT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().Status()->value().getStringView());
+}
+
+TEST_P(DownstreamProtocolIntegrationTest, ManyRequestTrailersRejected) {
+  // Default header (and trailer) count limit is 100.
+  Http::TestHeaderMapImpl request_trailers;
+  for (int i = 0; i < 150; i++) {
+    request_trailers.addCopy("trailer", std::string(1, 'a'));
+  }
+
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto encoder_decoder = codec_client_->startRequest(default_request_headers_);
+  request_encoder_ = &encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+  codec_client_->sendData(*request_encoder_, 1, false);
+  codec_client_->sendTrailers(*request_encoder_, request_trailers);
+
+  // Only relevant to Http2Downstream.
+  if (downstream_protocol_ == Http::CodecClient::Type::HTTP1) {
+    // Http1 Downstream ignores trailers.
+    waitForNextUpstreamRequest();
+    upstream_request_->encodeHeaders(default_response_headers_, true);
+    response->waitForEndStream();
+    EXPECT_TRUE(response->complete());
+    EXPECT_EQ("200", response->headers().Status()->value().getStringView());
+  } else {
+    // Expect rejection.
+    ASSERT_TRUE(fake_upstreams_[0]->waitForHttpConnection(*dispatcher_, fake_upstream_connection_));
+    response->waitForReset();
+    ASSERT_TRUE(fake_upstream_connection_->close());
+    ASSERT_TRUE(fake_upstream_connection_->waitForDisconnect());
+  }
+}
+
+TEST_P(DownstreamProtocolIntegrationTest, ManyRequestTrailersAccepted) {
+  // Set header (and trailer) count limit to 200.
+  uint32_t max_count = 200;
+  config_helper_.addConfigModifier(
+      [&](envoy::config::filter::network::http_connection_manager::v2::HttpConnectionManager& hcm)
+          -> void {
+        hcm.mutable_common_http_protocol_options()->mutable_max_headers_count()->set_value(
+            max_count);
+      });
+  max_request_headers_count_ = max_count;
+  Http::TestHeaderMapImpl request_trailers;
+  for (int i = 0; i < 150; i++) {
+    request_trailers.addCopy("trailer", std::string(1, 'a'));
+  }
+
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto encoder_decoder = codec_client_->startRequest(default_request_headers_);
+  request_encoder_ = &encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+  codec_client_->sendData(*request_encoder_, 1, false);
+  codec_client_->sendTrailers(*request_encoder_, request_trailers);
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(default_response_headers_, true);
+  response->waitForEndStream();
+  EXPECT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().Status()->value().getStringView());
+}
+
+TEST_P(DownstreamProtocolIntegrationTest, ManyRequestHeadersTimeout) {
+  // Set timeout for 5 seconds, and ensure that a request with 20k+ headers can be sent.
+  testManyRequestHeaders(std::chrono::milliseconds(5000));
+}
+
+TEST_P(DownstreamProtocolIntegrationTest, ManyTrailerHeaders) {
+  config_helper_.addConfigModifier(
+      [&](envoy::config::filter::network::http_connection_manager::v2::HttpConnectionManager& hcm)
+          -> void {
+        hcm.mutable_max_request_headers_kb()->set_value(96);
+        hcm.mutable_common_http_protocol_options()->mutable_max_headers_count()->set_value(20100);
+      });
+  max_request_headers_kb_ = 96;
+  max_request_headers_count_ = 201000;
+
+  Http::TestHeaderMapImpl request_trailers{};
+  for (int i = 0; i < 20000; i++) {
+    request_trailers.addCopy(std::to_string(i), "");
+  }
+
+  initialize();
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  auto encoder_decoder =
+      codec_client_->startRequest(Http::TestHeaderMapImpl{{":method", "POST"},
+                                                          {":path", "/test/long/url"},
+                                                          {":scheme", "http"},
+                                                          {":authority", "host"}});
+  request_encoder_ = &encoder_decoder.first;
+  auto response = std::move(encoder_decoder.second);
+  codec_client_->sendTrailers(*request_encoder_, request_trailers);
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(default_response_headers_, true);
+  response->waitForEndStream();
+
+  EXPECT_TRUE(upstream_request_->complete());
+  EXPECT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().Status()->value().getStringView());
 }
 
 // Tests StopAllIterationAndBuffer. Verifies decode-headers-return-stop-all-filter calls decodeData
