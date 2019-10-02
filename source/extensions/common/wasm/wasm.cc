@@ -1364,7 +1364,7 @@ uint32_t Context::getHeaderMapSize(HeaderMapType type) {
   if (!map) {
     return 0;
   }
-  return map->byteSize();
+  return static_cast<uint32_t>(map->refreshByteSize());
 }
 
 // Body Buffer

@@ -248,14 +248,16 @@ ServerConnection::ServerConnection(const std::string& name, uint32_t id,
   switch (http_type) {
   case Http::CodecClient::Type::HTTP1:
     http_connection_ = std::make_unique<Http::Http1::ServerConnectionImpl>(
-        network_connection, scope, *this, Http::Http1Settings(), max_request_headers_kb);
+        network_connection, scope, *this, Http::Http1Settings(), max_request_headers_kb,
+        Envoy::Http::DEFAULT_MAX_HEADERS_COUNT);
     break;
   case Http::CodecClient::Type::HTTP2: {
     Http::Http2Settings settings;
     settings.allow_connect_ = true;
     settings.allow_metadata_ = true;
     http_connection_ = std::make_unique<Http::Http2::ServerConnectionImpl>(
-        network_connection, *this, scope, settings, max_request_headers_kb);
+        network_connection, *this, scope, settings, max_request_headers_kb,
+        Envoy::Http::DEFAULT_MAX_HEADERS_COUNT);
   } break;
   default:
     ENVOY_LOG(error,
@@ -263,7 +265,8 @@ ServerConnection::ServerConnection(const std::string& name, uint32_t id,
               "defaulting to HTTP1",
               name_, id_, static_cast<int>(http_type) + 1);
     http_connection_ = std::make_unique<Http::Http1::ServerConnectionImpl>(
-        network_connection, scope, *this, Http::Http1Settings(), max_request_headers_kb);
+        network_connection, scope, *this, Http::Http1Settings(), max_request_headers_kb,
+        Envoy::Http::DEFAULT_MAX_HEADERS_COUNT);
     break;
   }
 }
