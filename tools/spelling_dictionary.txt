@@ -414,6 +414,7 @@ decrypting
 dedup
 dedupe
 deduplicate
+deduplicates
 deflateInit
 deletable
 deleter
