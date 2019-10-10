@@ -220,26 +220,8 @@ protected:
    *
    * @param update_fn the callback to run on each thread, it takes the previous version Config and
    * returns a updated/new version Config.
-   * @param complete_cb the callback to run when the update propagation is done.
    */
-  void applyConfigUpdate(
-      const ConfigUpdateCb& update_fn, const Event::PostCb& complete_cb = []() {}) {
-    // It is safe to call shared_from_this here as this is in main thread, and destruction of a
-    // ConfigSubscriptionCommonBase owner (i.e., a provider) happens in main thread as well.
-    auto shared_this = shared_from_this();
-    tls_->runOnAllThreads(
-        [this, update_fn]() {
-          tls_->getTyped<ThreadLocalConfig>().config_ = update_fn(this->getConfig());
-        },
-        // During the update propagation, a subscription may get teared down in main thread due to
-        // all owners/providers destructed in a xDS update (e.g. LDS demolishes a
-        // RouteConfigProvider and its subscription).
-        // If such a race condition happens, holding a reference to the "*this" subscription
-        // instance in this cb will ensure the shared "*this" gets posted back to main thread, after
-        // all the workers finish calling the update_fn, at which point it's safe to destruct
-        // "*this" instance.
-        [shared_this, complete_cb]() { complete_cb(); });
-  }
+  void applyConfigUpdate(const ConfigUpdateCb& update_fn);
 
   void setLastUpdated() { last_updated_ = time_source_.systemTime(); }
 
