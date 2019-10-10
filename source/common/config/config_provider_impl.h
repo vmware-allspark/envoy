@@ -369,8 +369,12 @@ public:
     if (getConfig() == config) {
       return;
     }
-    tls_->runOnAllThreads(
-        [this, config]() -> void { tls_->getTyped<ThreadLocalConfig>().config_ = config; });
+    tls_->runOnAllThreads([config](ThreadLocal::ThreadLocalObjectSharedPtr previous)
+                              -> ThreadLocal::ThreadLocalObjectSharedPtr {
+      auto prev_thread_local_config = std::dynamic_pointer_cast<ThreadLocalConfig>(previous);
+      prev_thread_local_config->config_ = config;
+      return previous;
+    });
   }
 
 protected:
