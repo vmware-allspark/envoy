@@ -170,8 +170,12 @@ absl::optional<RouteConfigProvider::ConfigInfo> RdsRouteConfigProviderImpl::conf
 void RdsRouteConfigProviderImpl::onConfigUpdate() {
   ConfigConstSharedPtr new_config(
       new ConfigImpl(subscription_->route_config_proto_, factory_context_, false));
-  tls_->runOnAllThreads(
-      [this, new_config]() -> void { tls_->getTyped<ThreadLocalConfig>().config_ = new_config; });
+  tls_->runOnAllThreads([new_config](ThreadLocal::ThreadLocalObjectSharedPtr previous)
+                            -> ThreadLocal::ThreadLocalObjectSharedPtr {
+    auto prev_config = std::dynamic_pointer_cast<ThreadLocalConfig>(previous);
+    prev_config->config_ = new_config;
+    return previous;
+  });
 }
 
 RouteConfigProviderManagerImpl::RouteConfigProviderManagerImpl(Server::Admin& admin) {
