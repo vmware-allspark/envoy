@@ -27,6 +27,15 @@ typedef std::shared_ptr<ThreadLocalObject> ThreadLocalObjectSharedPtr;
 class Slot {
 public:
   virtual ~Slot() {}
+  /**
+   * Returns if there is thread local data for this thread.
+   *
+   * This should return true for Envoy worker threads and false for threads which do not have thread
+   * local storage allocated.
+   *
+   * @return true if registerThread has been called for this thread, false otherwise.
+   */
+  virtual bool currentThreadRegistered() PURE;
 
   /**
    * @return ThreadLocalObjectSharedPtr a thread local object stored in the slot.
@@ -64,6 +73,17 @@ public:
    */
   typedef std::function<ThreadLocalObjectSharedPtr(Event::Dispatcher& dispatcher)> InitializeCb;
   virtual void set(InitializeCb cb) PURE;
+
+  /**
+   * UpdateCb takes the current stored data, and returns an updated/new version data.
+   * TLS will run the callback and replace the stored data with the returned value *in each thread*.
+   *
+   * NOTE: The update callback is not supposed to capture the Slot, or its owner. As the owner may
+   * be destructed in main thread before the update_cb gets called in a worker thread.
+   **/
+  using UpdateCb = std::function<ThreadLocalObjectSharedPtr(ThreadLocalObjectSharedPtr)>;
+  virtual void runOnAllThreads(const UpdateCb& update_cb) PURE;
+  virtual void runOnAllThreads(const UpdateCb& update_cb, Event::PostCb complete_cb) PURE;
 };
 
 typedef std::unique_ptr<Slot> SlotPtr;

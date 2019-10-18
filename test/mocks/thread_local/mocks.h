@@ -58,10 +58,19 @@ public:
 
     // ThreadLocal::Slot
     ThreadLocalObjectSharedPtr get() override { return parent_.data_[index_]; }
+    bool currentThreadRegistered() override { return parent_.registered_; }
     void runOnAllThreads(Event::PostCb cb) override { parent_.runOnAllThreads(cb); }
     void runOnAllThreads(Event::PostCb cb, Event::PostCb main_callback) override {
       parent_.runOnAllThreads(cb, main_callback);
     }
+    void runOnAllThreads(const UpdateCb& cb) override {
+      parent_.runOnAllThreads([cb, this]() { parent_.data_[index_] = cb(parent_.data_[index_]); });
+    }
+    void runOnAllThreads(const UpdateCb& cb, Event::PostCb main_callback) override {
+      parent_.runOnAllThreads([cb, this]() { parent_.data_[index_] = cb(parent_.data_[index_]); },
+                              main_callback);
+    }
+
     void set(InitializeCb cb) override { parent_.data_[index_] = cb(parent_.dispatcher_); }
 
     MockInstance& parent_;
@@ -72,6 +81,7 @@ public:
   testing::NiceMock<Event::MockDispatcher> dispatcher_;
   std::vector<ThreadLocalObjectSharedPtr> data_;
   bool shutdown_{};
+  bool registered_{true};
 };
 
 } // namespace ThreadLocal
