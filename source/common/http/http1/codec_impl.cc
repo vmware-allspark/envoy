@@ -429,16 +429,22 @@ void ConnectionImpl::onHeaderValue(const char* data, size_t length) {
     // Ignore trailers.
     return;
   }
+
+  // Work around a bug in http_parser where trailing whitespace is not trimmed
+  // as the spec requires: https://tools.ietf.org/html/rfc7230#section-3.2.4
+  const absl::string_view header_value = StringUtil::trim(absl::string_view(data, length));
+
   // http-parser should filter for this
   // (https://tools.ietf.org/html/rfc7230#section-3.2.6), but it doesn't today. HeaderStrings
   // have an invariant that they must not contain embedded zero characters
   // (NUL, ASCII 0x0).
-  if (absl::string_view(data, length).find('\0') != absl::string_view::npos) {
+  if (header_value.find('\0') != absl::string_view::npos) {
     throw CodecProtocolException("http/1.1 protocol error: header value contains NUL");
   }
 
   header_parsing_state_ = HeaderParsingState::Value;
-  current_header_value_.append(data, length);
+  current_header_value_.append(header_value.data(), header_value.length());
+
   // Verify that the cached value in byte size exists.
   ASSERT(current_header_map_->byteSize().has_value());
   const uint32_t total = current_header_field_.size() + current_header_value_.size() +

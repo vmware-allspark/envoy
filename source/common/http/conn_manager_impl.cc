@@ -27,11 +27,13 @@
 #include "common/http/exception.h"
 #include "common/http/header_map_impl.h"
 #include "common/http/headers.h"
+#include "common/http/header_utility.h"
 #include "common/http/http1/codec_impl.h"
 #include "common/http/http2/codec_impl.h"
 #include "common/http/path_utility.h"
 #include "common/http/utility.h"
 #include "common/network/utility.h"
+#include "common/runtime/runtime_impl.h"
 
 #include "absl/strings/escaping.h"
 #include "absl/strings/match.h"
@@ -681,6 +683,15 @@ void ConnectionManagerImpl::ActiveStream::decodeHeaders(HeaderMapPtr&& headers, 
                      StreamInfo::ResponseCodeDetails::get().MissingHost);
       return;
     }
+  }
+
+  // Make sure the host is valid.
+  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.strict_authority_validation") &&
+      !HeaderUtility::authorityIsValid(request_headers_->Host()->value().getStringView())) {
+    sendLocalReply(Grpc::Common::hasGrpcContentType(*request_headers_), Code::BadRequest, "",
+                   nullptr, is_head_request_, absl::nullopt,
+                   StreamInfo::ResponseCodeDetails::get().InvalidAuthority);
+    return;
   }
 
   // Currently we only support relative paths at the application layer. We expect the codec to have

@@ -46,6 +46,12 @@ public:
   static bool matchHeaders(const Http::HeaderMap& request_headers, const HeaderData& config_header);
 
   /**
+   * Validates that the characters in the authority are valid.
+   * @return bool true if the header values are valid, false otherwise.
+   */
+  static bool authorityIsValid(const absl::string_view authority_value);
+
+  /**
    * Add headers from one HeaderMap to another
    * @param headers target where headers will be added
    * @param headers_to_add supplies the headers to be added
