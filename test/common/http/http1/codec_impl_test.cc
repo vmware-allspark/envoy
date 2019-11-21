@@ -405,7 +405,7 @@ TEST_F(Http1ServerConnectionImplTest, HeaderEmbeddedNulRejection) {
   Buffer::OwnedImpl buffer(
       absl::StrCat("GET / HTTP/1.1\r\nHOST: h.com\r\nfoo: bar", std::string(1, '\0'), "baz\r\n"));
   EXPECT_THROW_WITH_MESSAGE(codec_->dispatch(buffer), CodecProtocolException,
-                            "http/1.1 protocol error: header value contains NUL");
+                            "http/1.1 protocol error: header value contains invalid chars");
 }
 
 // Mutate an HTTP GET with embedded NULs, this should always be rejected in some

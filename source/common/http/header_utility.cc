@@ -118,6 +118,11 @@ bool HeaderUtility::matchHeaders(const Http::HeaderMap& request_headers,
   return match != header_data.invert_match_;
 }
 
+bool HeaderUtility::headerIsValid(const absl::string_view header_value) {
+  return (nghttp2_check_header_value(reinterpret_cast<const uint8_t*>(header_value.data()),
+                                     header_value.size()) != 0);
+}
+
 bool HeaderUtility::authorityIsValid(const absl::string_view header_value) {
   return (nghttp2_check_authority(reinterpret_cast<const uint8_t*>(header_value.data()),
                                   header_value.size()) != 0);
