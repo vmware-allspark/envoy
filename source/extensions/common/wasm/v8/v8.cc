@@ -28,7 +28,8 @@ namespace V8 {
 
 wasm::Engine* engine() {
   // Enable Wasm optimizations.
-  v8::internal::FLAG_wasm_opt = true;
+  // This is a TSAN race and has been eliminated in master.
+  // v8::internal::FLAG_wasm_opt = true;
 
   static const auto engine = wasm::Engine::make();
   return engine.get();
