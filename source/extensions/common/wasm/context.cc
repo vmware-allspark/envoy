@@ -1013,7 +1013,7 @@ WasmResult Context::setProperty(absl::string_view key, absl::string_view seriali
   if (!stream_info) {
     return WasmResult::NotFound;
   }
-  stream_info->filterState().setData(key, std::make_unique<WasmState>(serialized_value),
+  stream_info->filterState()->setData(key, std::make_unique<WasmState>(serialized_value),
                                      StreamInfo::FilterState::StateType::Mutable);
   return WasmResult::Ok;
 }
