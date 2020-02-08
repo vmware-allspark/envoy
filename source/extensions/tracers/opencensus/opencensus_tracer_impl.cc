@@ -250,7 +250,6 @@ Driver::Driver(const envoy::config::trace::v3::OpenCensusConfig& oc_config,
   if (port_iter != node_metadata.fields().end()) {
     sts_port = port_iter->second.string_value();
   }
-  auto google_default_cred = grpc::GoogleDefaultCredentials();
   if (oc_config.stackdriver_exporter_enabled()) {
     ::opencensus::exporters::trace::StackdriverOptions opts;
     opts.project_id = oc_config.stackdriver_project_id();
@@ -258,20 +257,20 @@ Driver::Driver(const envoy::config::trace::v3::OpenCensusConfig& oc_config,
       auto channel =
           grpc::CreateChannel(oc_config.stackdriver_address(), grpc::InsecureChannelCredentials());
       opts.trace_service_stub = ::google::devtools::cloudtrace::v2::TraceService::NewStub(channel);
-    } else if (!sts_port.empty() && google_default_cred) {
+    } else if (!sts_port.empty()) {
       ::grpc::experimental::StsCredentialsOptions sts_options;
-      sts_options.token_exchange_service_uri =
-          "http://localhost:" + sts_port + "/token";
+      sts_options.token_exchange_service_uri = "http://localhost:" + sts_port + "/token";
       sts_options.subject_token_path = "/var/run/secrets/tokens/istio-token";
       sts_options.subject_token_type = "urn:ietf:params:oauth:token-type:jwt";
       sts_options.scope = "https://www.googleapis.com/auth/cloud-platform";
       auto call_creds = grpc::experimental::StsCredentials(sts_options);
-      auto channel = ::grpc::CreateChannel(
-          "cloudtrace.googleapis.com",
-          grpc::CompositeChannelCredentials(google_default_cred,
-                                            call_creds));
-      opts.trace_service_stub =
-          ::google::devtools::cloudtrace::v2::TraceService::NewStub(channel);
+      auto ssl_creds_options = grpc::SslCredentialsOptions();
+      ssl_creds_options.pem_root_certs = "/etc/ssl/certs/ca-certificates.crt";
+      auto channel_creds = grpc::SslCredentials(ssl_creds_options);
+      auto channel =
+          ::grpc::CreateChannel("cloudtrace.googleapis.com",
+                                grpc::CompositeChannelCredentials(channel_creds, call_creds));
+      opts.trace_service_stub = ::google::devtools::cloudtrace::v2::TraceService::NewStub(channel);
     }
     ::opencensus::exporters::trace::StackdriverExporter::Register(std::move(opts));
   }
