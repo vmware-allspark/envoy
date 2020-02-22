@@ -23,7 +23,9 @@ namespace Wasm {
 
 class TestContext : public Extensions::Common::Wasm::Context {
 public:
-  TestContext(Extensions::Common::Wasm::Wasm* wasm) : Extensions::Common::Wasm::Context(wasm) {}
+  TestContext() : Extensions::Common::Wasm::Context() {}
+  explicit TestContext(Extensions::Common::Wasm::Wasm* wasm)
+      : Extensions::Common::Wasm::Context(wasm) {}
   ~TestContext() override {}
   void scriptLog(spdlog::level::level_enum level, absl::string_view message) override {
     std::cerr << std::string(message) << "\n";
@@ -52,11 +54,12 @@ TEST_P(WasmCommonTest, Logging) {
   auto root_id = "";
   auto vm_id = "";
   auto vm_configuration = "logging";
+  auto vm_key = "";
   auto plugin = std::make_shared<Extensions::Common::Wasm::Plugin>(
       name, root_id, vm_id, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info,
       nullptr);
   auto wasm = std::make_shared<Extensions::Common::Wasm::Wasm>(
-      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, scope,
+      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, vm_key, scope,
       cluster_manager, *dispatcher);
   EXPECT_NE(wasm, nullptr);
   auto wasm_weak = std::weak_ptr<Extensions::Common::Wasm::Wasm>(wasm);
@@ -107,11 +110,12 @@ TEST_P(WasmCommonTest, BadSignature) {
   auto root_id = "";
   auto vm_id = "";
   auto vm_configuration = "";
+  auto vm_key = "";
   auto plugin = std::make_shared<Extensions::Common::Wasm::Plugin>(
       name, root_id, vm_id, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info,
       nullptr);
   auto wasm = std::make_unique<Extensions::Common::Wasm::Wasm>(
-      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, scope,
+      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, vm_key, scope,
       cluster_manager, *dispatcher);
   EXPECT_NE(wasm, nullptr);
   const auto code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
@@ -136,11 +140,12 @@ TEST_P(WasmCommonTest, Segv) {
   auto root_id = "";
   auto vm_id = "";
   auto vm_configuration = "segv";
+  auto vm_key = "";
   auto plugin = std::make_shared<Extensions::Common::Wasm::Plugin>(
       name, root_id, vm_id, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info,
       nullptr);
   auto wasm = std::make_unique<Extensions::Common::Wasm::Wasm>(
-      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, scope,
+      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, vm_key, scope,
       cluster_manager, *dispatcher);
   const auto code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
       "{{ test_rundir }}/test/extensions/common/wasm/test_data/test_cpp.wasm"));
@@ -173,11 +178,12 @@ TEST_P(WasmCommonTest, DivByZero) {
   auto root_id = "";
   auto vm_id = "";
   auto vm_configuration = "divbyzero";
+  auto vm_key = "";
   auto plugin = std::make_shared<Extensions::Common::Wasm::Plugin>(
       name, root_id, vm_id, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info,
       nullptr);
   auto wasm = std::make_unique<Extensions::Common::Wasm::Wasm>(
-      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, scope,
+      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, vm_key, scope,
       cluster_manager, *dispatcher);
   EXPECT_NE(wasm, nullptr);
   const auto code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
@@ -211,11 +217,12 @@ TEST_P(WasmCommonTest, EmscriptenVersion) {
   auto root_id = "";
   auto vm_id = "";
   auto vm_configuration = "";
+  auto vm_key = "";
   auto plugin = std::make_shared<Extensions::Common::Wasm::Plugin>(
       name, root_id, vm_id, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info,
       nullptr);
   auto wasm = std::make_unique<Extensions::Common::Wasm::Wasm>(
-      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, scope,
+      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, vm_key, scope,
       cluster_manager, *dispatcher);
   EXPECT_NE(wasm, nullptr);
   const auto code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
@@ -244,11 +251,12 @@ TEST_P(WasmCommonTest, IntrinsicGlobals) {
   auto root_id = "";
   auto vm_id = "";
   auto vm_configuration = "globals";
+  auto vm_key = "";
   auto plugin = std::make_shared<Extensions::Common::Wasm::Plugin>(
       name, root_id, vm_id, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info,
       nullptr);
   auto wasm = std::make_unique<Extensions::Common::Wasm::Wasm>(
-      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, scope,
+      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, vm_key, scope,
       cluster_manager, *dispatcher);
   EXPECT_NE(wasm, nullptr);
   std::string code;
@@ -278,11 +286,12 @@ TEST_P(WasmCommonTest, Stats) {
   auto root_id = "";
   auto vm_id = "";
   auto vm_configuration = "stats";
+  auto vm_key = "";
   auto plugin = std::make_shared<Extensions::Common::Wasm::Plugin>(
       name, root_id, vm_id, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info,
       nullptr);
   auto wasm = std::make_unique<Extensions::Common::Wasm::Wasm>(
-      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, scope,
+      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, vm_key, scope,
       cluster_manager, *dispatcher);
   EXPECT_NE(wasm, nullptr);
   std::string code;
@@ -319,11 +328,12 @@ TEST_P(WasmCommonTest, Foreign) {
   auto root_id = "";
   auto vm_id = "";
   auto vm_configuration = "foreign";
+  auto vm_key = "";
   auto plugin = std::make_shared<Extensions::Common::Wasm::Plugin>(
       name, root_id, vm_id, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info,
       nullptr);
   auto wasm = std::make_unique<Extensions::Common::Wasm::Wasm>(
-      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, scope,
+      absl::StrCat("envoy.wasm.runtime.", GetParam()), vm_id, vm_configuration, vm_key, scope,
       cluster_manager, *dispatcher);
   EXPECT_NE(wasm, nullptr);
   std::string code;
@@ -342,6 +352,66 @@ TEST_P(WasmCommonTest, Foreign) {
 
   EXPECT_TRUE(wasm->initialize(code, false));
   wasm->startForTesting(std::move(context), plugin);
+}
+
+TEST_P(WasmCommonTest, VmCache) {
+  Stats::IsolatedStoreImpl stats_store;
+  Api::ApiPtr api = Api::createApiForTest(stats_store);
+  NiceMock<Upstream::MockClusterManager> cluster_manager;
+  NiceMock<Init::MockManager> init_manager;
+  Event::DispatcherPtr dispatcher(api->allocateDispatcher());
+  Config::DataSource::RemoteAsyncDataProviderPtr remote_data_provider;
+  auto scope = Stats::ScopeSharedPtr(stats_store.createScope("wasm."));
+  NiceMock<LocalInfo::MockLocalInfo> local_info;
+  auto name = "";
+  auto root_id = "";
+  auto vm_id = "";
+  auto vm_configuration = "vm_cache";
+  auto plugin = std::make_shared<Extensions::Common::Wasm::Plugin>(
+      name, root_id, vm_id, envoy::config::core::v3::TrafficDirection::UNSPECIFIED, local_info,
+      nullptr);
+
+  VmConfig vm_config;
+  vm_config.set_runtime(absl::StrCat("envoy.wasm.runtime.", GetParam()));
+  vm_config.set_configuration(vm_configuration);
+  std::string code;
+  if (GetParam() != "null") {
+    code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
+        absl::StrCat("{{ test_rundir }}/test/extensions/common/wasm/test_data/test_cpp.wasm")));
+  } else {
+    // The name of the Null VM plugin.
+    code = "CommonWasmTestCpp";
+  }
+  EXPECT_FALSE(code.empty());
+  vm_config.mutable_code()->mutable_local()->set_inline_bytes(code);
+  WasmHandleSharedPtr wasm_handle;
+  auto root_context = new Extensions::Common::Wasm::TestContext();
+  EXPECT_CALL(*root_context, scriptLog_(spdlog::level::info, Eq("on_vm_start vm_cache")));
+  EXPECT_CALL(*root_context, scriptLog_(spdlog::level::info, Eq("on_done logging")));
+  EXPECT_CALL(*root_context, scriptLog_(spdlog::level::info, Eq("on_delete logging")));
+  createWasmForTesting(vm_config, plugin, scope, cluster_manager, init_manager, *dispatcher, *api,
+                       std::unique_ptr<Context>(root_context), remote_data_provider,
+                       [&wasm_handle](WasmHandleSharedPtr w) { wasm_handle = w; });
+
+  EXPECT_NE(wasm_handle, nullptr);
+
+  WasmHandleSharedPtr wasm_handle2;
+  auto root_context2 = new Extensions::Common::Wasm::Context();
+  createWasmForTesting(vm_config, plugin, scope, cluster_manager, init_manager, *dispatcher, *api,
+                       std::unique_ptr<Context>(root_context2), remote_data_provider,
+                       [&wasm_handle2](WasmHandleSharedPtr w) { wasm_handle2 = w; });
+  EXPECT_NE(wasm_handle2, nullptr);
+  EXPECT_EQ(wasm_handle, wasm_handle2);
+
+  plugin.reset();
+  auto wasm = wasm_handle->wasm().get();
+  wasm_handle.reset();
+  wasm_handle2.reset();
+
+  dispatcher->run(Event::Dispatcher::RunType::NonBlock);
+  wasm->configure(root_context, plugin, "done");
+  dispatcher->run(Event::Dispatcher::RunType::NonBlock);
+  dispatcher->clearDeferredDeleteList();
 }
 
 } // namespace Wasm
