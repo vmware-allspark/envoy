@@ -424,7 +424,11 @@ void Wasm::tickHandler(uint32_t root_context_id) {
   auto& tick_period = tick_period_[root_context_id];
   auto& timer = timer_[root_context_id];
   if (on_tick_) {
-    on_tick_(getContext(root_context_id), root_context_id);
+    auto it = contexts_.find(root_context_id);
+    if (it == contexts_.end() || !it->second->isRootContext()) {
+      return;
+    }
+    it->second->onTick();
     if (timer && tick_period.count() > 0) {
       timer->enableTimer(tick_period);
     }
@@ -443,13 +447,14 @@ uint32_t Wasm::allocContextId() {
 
 class Wasm::ShutdownHandle : public Envoy::Event::DeferredDeletable {
 public:
+  ~ShutdownHandle() { wasm_->finishShutdown(); }
   ShutdownHandle(WasmSharedPtr wasm) : wasm_(wasm) {}
 
 private:
   WasmSharedPtr wasm_;
 };
 
-void Wasm::shutdown() {
+void Wasm::startShutdown() {
   bool all_done = true;
   for (auto& p : root_contexts_) {
     if (!p.second->onDone()) {
@@ -459,6 +464,8 @@ void Wasm::shutdown() {
   }
   if (!all_done) {
     shutdown_handle_ = std::make_unique<ShutdownHandle>(shared_from_this());
+  } else {
+    finishShutdown();
   }
 }
 
@@ -468,13 +475,16 @@ WasmResult Wasm::done(Context* root_context) {
     return WasmResult::NotFound;
   }
   pending_done_.erase(it);
-  if (pending_done_.empty()) {
-    for (auto& p : root_contexts_) {
-      p.second->onDelete();
-    }
+  if (pending_done_.empty() && shutdown_handle_) {
     dispatcher_.deferredDelete(std::move(shutdown_handle_));
   }
   return WasmResult::Ok;
+}
+
+void Wasm::finishShutdown() {
+  for (auto& p : root_contexts_) {
+    p.second->onDelete();
+  }
 }
 
 void Wasm::queueReady(uint32_t root_context_id, uint32_t token) {

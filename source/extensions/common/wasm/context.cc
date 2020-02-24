@@ -1096,6 +1096,12 @@ std::pair<uint32_t, absl::string_view> Context::getStatus() {
   return std::make_pair(status_code_, status_message_);
 }
 
+void Context::onTick() {
+  if (wasm_->on_tick_) {
+    wasm_->on_tick_(this, id_);
+  }
+}
+
 void Context::onCreate(uint32_t parent_context_id) {
   if (wasm_->on_context_create_) {
     wasm_->on_context_create_(this, id_, parent_context_id);
