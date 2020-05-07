@@ -1,16 +1,14 @@
 #include "extensions/common/wasm/wasm.h"
 
 #include <stdio.h>
-#include <algorithm>
-#include <chrono>
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <string>
 
-#include "common/config/remote_data_fetcher.h"
 #include "envoy/common/exception.h"
 #include "envoy/config/wasm/v3/wasm.pb.validate.h"
 #include "envoy/event/deferred_deletable.h"
@@ -23,10 +21,10 @@
 #include "common/buffer/buffer_impl.h"
 #include "common/common/assert.h"
 #include "common/common/base64.h"
-#include "common/config/remote_data_fetcher.h"
 #include "common/common/empty_string.h"
 #include "common/common/enum_to_int.h"
 #include "common/common/logger.h"
+#include "common/config/remote_data_fetcher.h"
 #include "common/http/header_map_impl.h"
 #include "common/http/message_impl.h"
 #include "common/http/utility.h"
@@ -71,6 +69,19 @@ std::string Sha256(absl::string_view data) {
 
 namespace {
 
+#define CREATE_WASM_STATS(COUNTER, GAUGE)                                                          \
+  COUNTER(remote_load_cache_hits)                                                                  \
+  COUNTER(remote_load_cache_negative_hits)                                                         \
+  COUNTER(remote_load_cache_misses)                                                                \
+  COUNTER(remote_load_fetch_successes)                                                             \
+  COUNTER(remote_load_fetch_failures)                                                              \
+  GAUGE(remote_load_cache_entries, NeverImport)
+
+struct CreateWasmStats {
+  Stats::ScopeSharedPtr scope_;
+  CREATE_WASM_STATS(GENERATE_COUNTER_STRUCT, GENERATE_GAUGE_STRUCT)
+};
+
 struct CodeCacheEntry {
   std::string code;
   bool in_progress;
@@ -97,6 +108,7 @@ private:
 std::atomic<int64_t> active_wasm_;
 std::mutex code_cache_mutex;
 std::unordered_map<std::string, CodeCacheEntry>* code_cache = nullptr;
+CreateWasmStats* create_wasm_stats = nullptr;
 
 std::string Xor(absl::string_view a, absl::string_view b) {
   ASSERT(a.size() == b.size());
@@ -574,6 +586,10 @@ void clearCodeCacheForTesting(bool fail_if_not_cached) {
     delete code_cache;
     code_cache = nullptr;
   }
+  if (create_wasm_stats) {
+    delete create_wasm_stats;
+    create_wasm_stats = nullptr;
+  }
 }
 
 // TODO: remove this post #4160: Switch default to SimulatedTimeSystem.
@@ -597,6 +613,11 @@ createWasmInternal(const VmConfig& vm_config, PluginSharedPtr plugin, Stats::Sco
     if (!code_cache) {
       code_cache = new std::remove_reference<decltype(*code_cache)>::type;
     }
+    if (!create_wasm_stats) {
+      create_wasm_stats =
+          new CreateWasmStats{scope, CREATE_WASM_STATS(POOL_COUNTER_PREFIX(*scope, "wasm."),
+                                                       POOL_GAUGE_PREFIX(*scope, "wasm."))};
+    }
     // Remove entries older than CODE_CACHE_SECONDS_CACHING_TTL except for our target.
     for (auto it = code_cache->begin(); it != code_cache->end();) {
       if (now - it->second.use_time > std::chrono::seconds(CODE_CACHE_SECONDS_CACHING_TTL) &&
@@ -606,12 +627,14 @@ createWasmInternal(const VmConfig& vm_config, PluginSharedPtr plugin, Stats::Sco
         ++it;
       }
     }
+    create_wasm_stats->remote_load_cache_entries_.set(code_cache->size());
     auto it = code_cache->find(vm_config.code().remote().sha256());
     if (it != code_cache->end()) {
       it->second.use_time = now;
       if (it->second.in_progress) {
         ENVOY_LOG_TO_LOGGER(Envoy::Logger::Registry::getLog(Envoy::Logger::Id::wasm), warn,
                             "createWasm: failed to load (in progress) from {}", source);
+        create_wasm_stats->remote_load_cache_misses_.inc();
         throw WasmException(
             fmt::format("Failed to load WASM code (fetch in progress) from {}", source));
       }
@@ -619,6 +642,7 @@ createWasmInternal(const VmConfig& vm_config, PluginSharedPtr plugin, Stats::Sco
       if (code.empty()) {
         if (now - it->second.fetch_time <
             std::chrono::seconds(CODE_CACHE_SECONDS_NEGATIVE_CACHING)) {
+          create_wasm_stats->remote_load_cache_negative_hits_.inc();
           ENVOY_LOG_TO_LOGGER(Envoy::Logger::Registry::getLog(Envoy::Logger::Id::wasm), warn,
                               "createWasm: failed to load (cached) from {}", source);
           throw WasmException(fmt::format("Failed to load WASM code (cached) from {}", source));
@@ -626,12 +650,16 @@ createWasmInternal(const VmConfig& vm_config, PluginSharedPtr plugin, Stats::Sco
         fetch = true; // Fetch failed, retry.
         it->second.in_progress = true;
         it->second.fetch_time = now;
+      } else {
+        create_wasm_stats->remote_load_cache_hits_.inc();
       }
     } else {
       fetch = true; // Not in cache, fetch.
       auto& e = (*code_cache)[vm_config.code().remote().sha256()];
       e.in_progress = true;
       e.use_time = e.fetch_time = now;
+      create_wasm_stats->remote_load_cache_entries_.set(code_cache->size());
+      create_wasm_stats->remote_load_cache_misses_.inc();
     }
   } else if (vm_config.code().has_local()) {
     code = Config::DataSource::read(vm_config.code().local(), true, api);
@@ -684,13 +712,19 @@ createWasmInternal(const VmConfig& vm_config, PluginSharedPtr plugin, Stats::Sco
 
   if (fetch) {
     auto holder = std::make_shared<std::unique_ptr<Event::DeferredDeletable>>();
-    auto fetch_callback = [vm_config, complete_cb, source, &dispatcher,
+    auto fetch_callback = [vm_config, complete_cb, source, &dispatcher, scope,
                            holder](const std::string& code) {
       {
         std::lock_guard<std::mutex> guard(code_cache_mutex);
         auto& e = (*code_cache)[vm_config.code().remote().sha256()];
         e.in_progress = false;
         e.code = code;
+        if (code.empty()) {
+          create_wasm_stats->remote_load_fetch_failures_.inc();
+        } else {
+          create_wasm_stats->remote_load_fetch_successes_.inc();
+        }
+        create_wasm_stats->remote_load_cache_entries_.set(code_cache->size());
       }
       if (!fail_if_code_not_cached) {
         if (code.empty()) {
