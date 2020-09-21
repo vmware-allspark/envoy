@@ -10,7 +10,6 @@
 #include "common/common/assert.h"
 #include "common/common/dump_state_utils.h"
 #include "common/common/empty_string.h"
-#include "common/runtime/runtime_features.h"
 #include "common/singleton/const_singleton.h"
 
 #include "absl/strings/match.h"
@@ -385,9 +384,9 @@ void HeaderMapImpl::addCopy(const LowerCaseString& key, absl::string_view value)
 
 void HeaderMapImpl::appendCopy(const LowerCaseString& key, absl::string_view value) {
   // TODO(#9221): converge on and document a policy for coalescing multiple headers.
-  auto entry = getExisting(key);
-  if (!entry.empty()) {
-    const uint64_t added_size = appendToHeader(entry[0]->value(), value);
+  auto* entry = getExisting(key);
+  if (entry) {
+    const uint64_t added_size = appendToHeader(entry->value(), value);
     addSize(added_size);
   } else {
     addCopy(key, value);
@@ -395,27 +394,29 @@ void HeaderMapImpl::appendCopy(const LowerCaseString& key, absl::string_view val
 }
 
 void HeaderMapImpl::setReference(const LowerCaseString& key, absl::string_view value) {
+  HeaderString ref_key(key);
+  HeaderString ref_value(value);
   remove(key);
-  addReference(key, value);
+  insertByKey(std::move(ref_key), std::move(ref_value));
 }
 
 void HeaderMapImpl::setReferenceKey(const LowerCaseString& key, absl::string_view value) {
+  HeaderString ref_key(key);
+  HeaderString new_value;
+  new_value.setCopy(value);
   remove(key);
-  addReferenceKey(key, value);
+  insertByKey(std::move(ref_key), std::move(new_value));
+  ASSERT(new_value.empty()); // NOLINT(bugprone-use-after-move)
 }
 
 void HeaderMapImpl::setCopy(const LowerCaseString& key, absl::string_view value) {
-  if (!Runtime::runtimeFeatureEnabled(
-          "envoy.reloadable_features.http_set_copy_replace_all_headers")) {
-    auto entry = getExisting(key);
-    if (!entry.empty()) {
-      updateSize(entry[0]->value().size(), value.size());
-      entry[0]->value(value);
-    } else {
-      addCopy(key, value);
-    }
+  // Replaces the first occurrence of a header if it exists, otherwise adds by copy.
+  // TODO(#9221): converge on and document a policy for coalescing multiple headers.
+  auto* entry = getExisting(key);
+  if (entry) {
+    updateSize(entry->value().size(), value.size());
+    entry->value(value);
   } else {
-    remove(key);
     addCopy(key, value);
   }
 }
@@ -433,26 +434,17 @@ void HeaderMapImpl::verifyByteSizeInternalForTest() const {
 }
 
 const HeaderEntry* HeaderMapImpl::get(const LowerCaseString& key) const {
-  const auto result = getAll(key);
-  return result.empty() ? nullptr : result[0];
+  return const_cast<HeaderMapImpl*>(this)->getExisting(key);
 }
 
-HeaderMap::GetResult HeaderMapImpl::getAll(const LowerCaseString& key) const {
-  return HeaderMap::GetResult(const_cast<HeaderMapImpl*>(this)->getExisting(key));
-}
-
-HeaderMap::NonConstGetResult HeaderMapImpl::getExisting(const LowerCaseString& key) {
+HeaderEntry* HeaderMapImpl::getExisting(const LowerCaseString& key) {
   // Attempt a trie lookup first to see if the user is requesting an O(1) header. This may be
   // relatively common in certain header matching / routing patterns.
   // TODO(mattklein123): Add inline handle support directly to the header matcher code to support
   // this use case more directly.
-  HeaderMap::NonConstGetResult ret;
   auto lookup = staticLookup(key.get());
   if (lookup.has_value()) {
-    if (*lookup.value().entry_ != nullptr) {
-      ret.push_back(*lookup.value().entry_);
-    }
-    return ret;
+    return *lookup.value().entry_;
   }
 
   // If the requested header is not an O(1) header we do a full scan. Doing the trie lookup is
@@ -463,11 +455,11 @@ HeaderMap::NonConstGetResult HeaderMapImpl::getExisting(const LowerCaseString& k
   // implementation or potentially create a lazy map if the size of the map is above a threshold.
   for (HeaderEntryImpl& header : headers_) {
     if (header.key() == key.get().c_str()) {
-      ret.push_back(&header);
+      return &header;
     }
   }
 
-  return ret;
+  return nullptr;
 }
 
 void HeaderMapImpl::iterate(HeaderMap::ConstIterateCb cb, void* context) const {

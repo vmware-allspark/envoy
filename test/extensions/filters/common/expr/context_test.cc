@@ -23,8 +23,7 @@ namespace {
 constexpr absl::string_view Undefined = "undefined";
 
 TEST(Context, EmptyHeadersAttributes) {
-  Protobuf::Arena arena;
-  HeadersWrapper<Http::RequestHeaderMap> headers(arena, nullptr);
+  HeadersWrapper<Http::RequestHeaderMap> headers(nullptr);
   auto header = headers[CelValue::CreateStringView(Referer)];
   EXPECT_FALSE(header.has_value());
   EXPECT_EQ(0, headers.size());
@@ -37,11 +36,10 @@ TEST(Context, RequestAttributes) {
   Http::TestRequestHeaderMapImpl header_map{
       {":method", "POST"},           {":scheme", "http"},      {":path", "/meow?yes=1"},
       {":authority", "kittens.com"}, {"referer", "dogs.com"},  {"user-agent", "envoy-mobile"},
-      {"content-length", "10"},      {"x-request-id", "blah"}, {"double-header", "foo"},
-      {"double-header", "bar"}};
-  Protobuf::Arena arena;
-  RequestWrapper request(arena, &header_map, info);
-  RequestWrapper empty_request(arena, nullptr, empty_info);
+      {"content-length", "10"},      {"x-request-id", "blah"},
+  };
+  RequestWrapper request(&header_map, info);
+  RequestWrapper empty_request(nullptr, empty_info);
 
   EXPECT_CALL(info, bytesReceived()).WillRepeatedly(Return(10));
   // "2018-04-03T23:06:09.123Z".
@@ -138,7 +136,7 @@ TEST(Context, RequestAttributes) {
     EXPECT_TRUE(value.has_value());
     ASSERT_TRUE(value.value().IsInt64());
     // this includes the headers size
-    EXPECT_EQ(170, value.value().Int64OrDie());
+    EXPECT_EQ(138, value.value().Int64OrDie());
   }
 
   {
@@ -162,17 +160,12 @@ TEST(Context, RequestAttributes) {
     ASSERT_TRUE(value.value().IsMap());
     auto& map = *value.value().MapOrDie();
     EXPECT_FALSE(map.empty());
-    EXPECT_EQ(10, map.size());
+    EXPECT_EQ(8, map.size());
 
     auto header = map[CelValue::CreateStringView(Referer)];
     EXPECT_TRUE(header.has_value());
     ASSERT_TRUE(header.value().IsString());
     EXPECT_EQ("dogs.com", header.value().StringOrDie().value());
-
-    auto header2 = map[CelValue::CreateStringView("double-header")];
-    EXPECT_TRUE(header2.has_value());
-    ASSERT_TRUE(header2.value().IsString());
-    EXPECT_EQ("foo,bar", header2.value().StringOrDie().value());
   }
 
   {
@@ -207,8 +200,7 @@ TEST(Context, RequestFallbackAttributes) {
       {":scheme", "http"},
       {":path", "/meow?yes=1"},
   };
-  Protobuf::Arena arena;
-  RequestWrapper request(arena, &header_map, info);
+  RequestWrapper request(&header_map, info);
 
   EXPECT_CALL(info, bytesReceived()).WillRepeatedly(Return(10));
 
@@ -235,9 +227,8 @@ TEST(Context, ResponseAttributes) {
   const std::string grpc_status = "grpc-status";
   Http::TestResponseHeaderMapImpl header_map{{header_name, "a"}};
   Http::TestResponseTrailerMapImpl trailer_map{{trailer_name, "b"}, {grpc_status, "8"}};
-  Protobuf::Arena arena;
-  ResponseWrapper response(arena, &header_map, &trailer_map, info);
-  ResponseWrapper empty_response(arena, nullptr, nullptr, empty_info);
+  ResponseWrapper response(&header_map, &trailer_map, info);
+  ResponseWrapper empty_response(nullptr, nullptr, empty_info);
 
   EXPECT_CALL(info, responseCode()).WillRepeatedly(Return(404));
   EXPECT_CALL(info, bytesSent()).WillRepeatedly(Return(123));
@@ -334,8 +325,7 @@ TEST(Context, ResponseAttributes) {
   {
     Http::TestResponseHeaderMapImpl header_map{{header_name, "a"}, {grpc_status, "7"}};
     Http::TestResponseTrailerMapImpl trailer_map{{trailer_name, "b"}};
-    Protobuf::Arena arena;
-    ResponseWrapper response_header_status(arena, &header_map, &trailer_map, info);
+    ResponseWrapper response_header_status(&header_map, &trailer_map, info);
     auto value = response_header_status[CelValue::CreateStringView(GrpcStatus)];
     EXPECT_TRUE(value.has_value());
     ASSERT_TRUE(value.value().IsInt64());
@@ -344,8 +334,7 @@ TEST(Context, ResponseAttributes) {
   {
     Http::TestResponseHeaderMapImpl header_map{{header_name, "a"}};
     Http::TestResponseTrailerMapImpl trailer_map{{trailer_name, "b"}};
-    Protobuf::Arena arena;
-    ResponseWrapper response_no_status(arena, &header_map, &trailer_map, info);
+    ResponseWrapper response_no_status(&header_map, &trailer_map, info);
     auto value = response_no_status[CelValue::CreateStringView(GrpcStatus)];
     EXPECT_TRUE(value.has_value());
     ASSERT_TRUE(value.value().IsInt64());
@@ -355,8 +344,7 @@ TEST(Context, ResponseAttributes) {
     NiceMock<StreamInfo::MockStreamInfo> info_without_code;
     Http::TestResponseHeaderMapImpl header_map{{header_name, "a"}};
     Http::TestResponseTrailerMapImpl trailer_map{{trailer_name, "b"}};
-    Protobuf::Arena arena;
-    ResponseWrapper response_no_status(arena, &header_map, &trailer_map, info_without_code);
+    ResponseWrapper response_no_status(&header_map, &trailer_map, info_without_code);
     auto value = response_no_status[CelValue::CreateStringView(GrpcStatus)];
     EXPECT_FALSE(value.has_value());
   }
