@@ -1151,10 +1151,10 @@ WasmResult Context::getProperty(absl::string_view path, std::string* result) {
             Protobuf::Arena::Create<WasmStateWrapper>(&arena, info->filterState()));
       } else if (part == "request") {
         value = CelValue::CreateMap(Protobuf::Arena::Create<Filters::Common::Expr::RequestWrapper>(
-            &arena, request_headers, *info));
+            &arena, arena, request_headers, *info));
       } else if (part == "response") {
         value = CelValue::CreateMap(Protobuf::Arena::Create<Filters::Common::Expr::ResponseWrapper>(
-            &arena, response_headers, response_trailers, *info));
+            &arena, arena, response_headers, response_trailers, *info));
       } else if (part == "connection") {
         value = CelValue::CreateMap(
             Protobuf::Arena::Create<Filters::Common::Expr::ConnectionWrapper>(&arena, *info));
