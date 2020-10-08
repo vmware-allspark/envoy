@@ -1,18 +1,25 @@
 Version history
 ---------------
 
-1.12.3 (Pending)
-==========================
-* buffer: force copy when appending small slices to OwnedImpl buffer to avoid fragmentation.
-* listeners: fixed issue where :ref:`TLS inspector listener filter <config_listener_filters_tls_inspector>` could have been bypassed by a client using only TLS 1.3.
-* sds: fixed the SDS vulnerability that TLS validation context (e.g., subject alt name or hash) cannot be effectively validated in some cases.
-* http: added HTTP/1.1 flood protection. Can be temporarily disabled using the runtime feature `envoy.reloadable_features.http1_flood_protection`.
-1.12.5 (Pending)
+1.12.7 (pending)
 ================
-* http: the :ref:`stream_idle_timeout <envoy_api_field_config.filter.network.http_connection_manager.v2.HttpConnectionManager.stream_idle_timeout>`
-  now also defends against an HTTP/2 peer that does not open stream window once an entire response has been buffered to be sent to a downstream client.
-* listener: add runtime support for `per-listener limits <config_listeners_runtime>` on active/accepted connections.
-* overload management: add runtime support for :ref:`global limits <config_overload_manager>` on active/accepted connections.
+* http: fixed CVE-2020-25017. Previously header matching did not match on all headers for non-inline headers. This patch
+  changes the default behavior to always logically match on all headers. Multiple individual
+  headers will be logically concatenated with ',' similar to what is done with inline headers. This
+  makes the behavior effectively consistent. This behavior can be temporary reverted by setting
+  the runtime value "envoy.reloadable_features.header_match_on_all_headers" to "false".
+
+  Targeted fixes have been additionally performed on the following extensions which make them
+  consider all duplicate headers by default as a comma concatenated list:
+
+    1. Any extension using CEL matching on headers.
+    2. The header to metadata filter.
+    3. The JWT filter.
+    4. The Lua filter.
+
+  Like primary header matching used in routing, RBAC, etc. this behavior can be disabled by setting
+  the runtime value "envoy.reloadable_features.header_match_on_all_headers" to false.
+
 1.12.6 (July 7, 2020)
 =====================
 * tls: fixed a bug where wilcard matching for "\*.foo.com" also matched domains of the form "a.b.foo.com". This behavior can be temporarily reverted by setting runtime feature `envoy.reloadable_features.fix_wildcard_matching` to false.
