@@ -965,6 +965,9 @@ envoy_cc_test(
         "tcp_proxy_integration_test.cc",
         "tcp_proxy_integration_test.h",
     ],
+    tags = [
+        "no_tsan",
+    ],
     data = [
         "//test/config/integration/certs",
     ],
