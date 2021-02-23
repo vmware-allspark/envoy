@@ -296,7 +296,7 @@ static bool createWasmInternal(const VmConfig& vm_config, const PluginSharedPtr&
         ++it;
       }
     }
-    wasm_extension->onRemoteCacheEntriesChanged(code_cache->size());
+    // wasm_extension->onRemoteCacheEntriesChanged(code_cache->size());
     auto it = code_cache->find(vm_config.code().remote().sha256());
     if (it != code_cache->end()) {
       it->second.use_time = now;
@@ -326,7 +326,7 @@ static bool createWasmInternal(const VmConfig& vm_config, const PluginSharedPtr&
       auto& e = (*code_cache)[vm_config.code().remote().sha256()];
       e.in_progress = true;
       e.use_time = e.fetch_time = now;
-      wasm_extension->onRemoteCacheEntriesChanged(code_cache->size());
+      // wasm_extension->onRemoteCacheEntriesChanged(code_cache->size());
       wasm_extension->onEvent(WasmExtension::WasmEvent::RemoteLoadCacheMiss, plugin);
     }
   } else if (vm_config.code().has_local()) {
@@ -381,7 +381,7 @@ static bool createWasmInternal(const VmConfig& vm_config, const PluginSharedPtr&
         } else {
           wasm_extension->onEvent(WasmExtension::WasmEvent::RemoteLoadCacheFetchSuccess, plugin);
         }
-        wasm_extension->onRemoteCacheEntriesChanged(code_cache->size());
+        // wasm_extension->onRemoteCacheEntriesChanged(code_cache->size());
       }
       // NB: xDS currently does not support failing asynchronously, so we fail immediately
       // if remote Wasm code is not cached and do a background fill.
