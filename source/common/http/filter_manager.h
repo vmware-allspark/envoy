@@ -69,7 +69,7 @@ using FilterMatchStateSharedPtr = std::shared_ptr<FilterMatchState>;
 class SkipActionFactory : public Matcher::ActionFactory {
 public:
   std::string name() const override { return "skip"; }
-  Matcher::ActionFactoryCb createActionFactoryCb(const Protobuf::Message&,
+  Matcher::ActionFactoryCb createActionFactoryCb(const Protobuf::Message&, const std::string&,
                                                  Server::Configuration::FactoryContext&) override {
     return []() { return std::make_unique<SkipAction>(); };
   }
@@ -133,6 +133,7 @@ struct ActiveStreamFilterBase : public virtual StreamFilterCallbacks,
   void resetStream() override;
   Router::RouteConstSharedPtr route() override;
   Router::RouteConstSharedPtr route(const Router::RouteCallback& cb) override;
+  void setRoute(Router::RouteConstSharedPtr route) override;
   Upstream::ClusterInfoConstSharedPtr clusterInfo() override;
   void clearRouteCache() override;
   uint64_t streamId() const override;
@@ -509,6 +510,11 @@ public:
    * Returns the current route.
    */
   virtual Router::RouteConstSharedPtr route(const Router::RouteCallback& cb) PURE;
+
+  /**
+   * Sets the current route.
+   */
+  virtual void setRoute(Router::RouteConstSharedPtr route) PURE;
 
   /**
    * Clears the cached route.
