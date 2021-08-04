@@ -1,15 +1,15 @@
-licenses(["notice"])  # Apache 2
-
-# A filter for mirroring the downstream remote address on the upstream's source.
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_extension",
     "envoy_cc_library",
-    "envoy_package",
+    "envoy_extension_package",
 )
 
-envoy_package()
+licenses(["notice"])  # Apache 2
+
+# A filter for mirroring the downstream remote address on the upstream's source.
+
+envoy_extension_package()
 
 envoy_cc_library(
     name = "config_lib",
@@ -35,6 +35,7 @@ envoy_cc_extension(
     name = "config",  # The extension build system requires a library named config
     srcs = ["original_src_config_factory.cc"],
     hdrs = ["original_src_config_factory.h"],
+    category = "envoy.filters.http",
     security_posture = "robust_to_untrusted_downstream",
     status = "alpha",
     deps = [
