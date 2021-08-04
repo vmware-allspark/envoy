@@ -1,17 +1,18 @@
-licenses(["notice"])  # Apache 2
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_extension",
-    "envoy_package",
+    "envoy_extension_package",
 )
 
-envoy_package()
+licenses(["notice"])  # Apache 2
+
+envoy_extension_package()
 
 envoy_cc_extension(
     name = "cluster",
     srcs = ["cluster.cc"],
     hdrs = ["cluster.h"],
+    category = "envoy.clusters",
     security_posture = "robust_to_untrusted_downstream",
     deps = [
         "//source/common/network:transport_socket_options_lib",

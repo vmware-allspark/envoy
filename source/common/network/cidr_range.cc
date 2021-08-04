@@ -11,6 +11,7 @@
 
 #include "common/common/assert.h"
 #include "common/common/fmt.h"
+#include "common/common/safe_memcpy.h"
 #include "common/common/utility.h"
 #include "common/network/address_impl.h"
 #include "common/network/utility.h"
@@ -183,23 +184,11 @@ InstanceConstSharedPtr CidrRange::truncateIpAddressAndLength(InstanceConstShared
 
     absl::uint128 ip6_htonl = Utility::Ip6htonl(ip6);
     static_assert(sizeof(absl::uint128) == 16, "The size of asbl::uint128 is not 16.");
-    memcpy(&sa6.sin6_addr.s6_addr, &ip6_htonl, sizeof(absl::uint128));
+    safeMemcpy(&sa6.sin6_addr.s6_addr, &ip6_htonl);
     return std::make_shared<Ipv6Instance>(sa6);
   }
   }
   NOT_REACHED_GCOVR_EXCL_LINE;
-}
-
-IpList::IpList(const std::vector<std::string>& subnets) {
-  for (const std::string& entry : subnets) {
-    CidrRange list_entry = CidrRange::create(entry);
-    if (list_entry.isValid()) {
-      ip_list_.push_back(list_entry);
-    } else {
-      throw EnvoyException(
-          fmt::format("invalid ip/mask combo '{}' (format is <ip>/<# mask bits>)", entry));
-    }
-  }
 }
 
 IpList::IpList(const Protobuf::RepeatedPtrField<envoy::config::core::v3::CidrRange>& cidrs) {
@@ -223,10 +212,6 @@ bool IpList::contains(const Instance& address) const {
   }
   return false;
 }
-
-IpList::IpList(const Json::Object& config, const std::string& member_name)
-    : IpList(config.hasObject(member_name) ? config.getStringArray(member_name)
-                                           : std::vector<std::string>()) {}
 
 } // namespace Address
 } // namespace Network

@@ -43,9 +43,9 @@ The fuzz test will be executed in three environments:
 1. Under Envoy's fuzz test driver when run in the Envoy repository with `bazel test
    //test/path/to/some_fuzz_test`. This provides a litmus test indicating that the test passes CI
    and basic sanitizers just on the supplied corpus.
-   
+
 1. Using the libFuzzer fuzzing engine and ASAN when run in the Envoy repository with `bazel run
-   //test/path/to/some_fuzz_test_with_libfuzzer --config asan-fuzzer`. This is where real fuzzing
+   //test/path/to/some_fuzz_test --config asan-fuzzer`. This is where real fuzzing
    takes place locally. The built binary can take libFuzzer command-line flags, including the number
    of runs and the maximum input length.
 
@@ -65,10 +65,10 @@ The fuzz test will be executed in three environments:
 
 4. Run the `envoy_cc_fuzz_test` target to test against the seed corpus. E.g. `bazel test
    //test/common/common:base64_fuzz_test`.
-   
-5. Run the `*_fuzz_test_with_libfuzzer` target against libFuzzer. E.g. `bazel run
+
+5. Run the `*_fuzz_test` target against libFuzzer. E.g. `bazel run
    //test/common/common:base64_fuzz_test --config asan-fuzzer`.
-   
+
 ## Protobuf fuzz tests
 
 We also have integration with [libprotobuf-mutator](https://github.com/google/libprotobuf-mutator),
@@ -88,21 +88,21 @@ Within the Envoy repository, we have various `*_fuzz_test` targets. When run und
 these will exercise the corpus as inputs but not actually link and run against any fuzzer (e.g.
 [`libfuzzer`](https://llvm.org/docs/LibFuzzer.html)).
 
-To get actual fuzzing performed, the `*_fuzz_test_with_libfuzzer` target needs to be built with
-`--config asan-fuzzer`. This links the target to the libFuzzer fuzzing engine. This is recommended
-when writing new fuzz tests to check if they pick up any low hanging fruit (i.e. what you can find
-on your local machine vs. the fuzz cluster). The binary takes the location of the seed corpus
+To get actual fuzzing performed, the `*_fuzz_test` target needs to be built with `--config
+asan-fuzzer`. This links the target to the libFuzzer fuzzing engine. This is recommended when
+writing new fuzz tests to check if they pick up any low hanging fruit (i.e. what you can find on
+your local machine vs. the fuzz cluster). The binary takes the location of the seed corpus
 directory. Fuzzing continues indefinitely until a bug is found or the number of iterations it should
 perform is specified with `-runs`. For example,
 
-`bazel run //test/common/common:base64_fuzz_test_with_libfuzzer --config asan-fuzzer --
-test/common/common/base64_corpus -runs=1000`
+`bazel run //test/common/common:base64_fuzz_test --config asan-fuzzer
+--test/common/common/base64_corpus -runs=1000`
 
 The fuzzer prints information to stderr:
 
 ```
 INFO: Seed: 774517650
-INFO: Loaded 1 modules   (1090433 guards): 1090433 [0x8875600, 0x8c9e404), 
+INFO: Loaded 1 modules   (1090433 guards): 1090433 [0x8875600, 0x8c9e404),
 INFO: -max_len is not provided; libFuzzer will not generate inputs larger than 4096 bytes
 INFO: A corpus is not provided, starting from an empty corpus
 #2	INITED cov: 47488 ft: 30 corp: 1/1b lim: 4 exec/s: 0 rss: 139Mb
@@ -136,7 +136,7 @@ provide fuzzing against other fuzzing engines.
 3. `python infra/helper.py build_image envoy`
 4. `python infra/helper.py build_fuzzers --sanitizer=address envoy <path to envoy source tree>`. The
    path to the Envoy source tree can be omitted if you want to consume Envoy from GitHub at
-   HEAD/master.
+   HEAD/main.
 5. `python infra/helper.py run_fuzzer envoy <fuzz test target>`. The fuzz test target will be the
    test name, e.g. `server_fuzz_test`.
 
@@ -158,7 +158,15 @@ to provide fuzzers some interesting starting points for invalid inputs.
 ## Coverage reports
 
 Coverage reports, where individual lines are annotated with fuzzing hit counts, are a useful way to
-understand the scope and efficacy of the Envoy fuzzers. You can generate such reports from the
+understand the scope and efficacy of the Envoy fuzzers. You can generate fuzz coverage reports both locally, and using the OSS-Fuzz infrastructure.
+
+To generate fuzz coverage reports locally (see [Coverage builds](bazel/README.md), run
+```
+FUZZ_COVERAGE=true test/run_envoy_bazel_coverage.sh
+```
+This generates a coverage report after running the fuzz targets for one minute against the fuzzing engine libfuzzer and using the checked-in corpus as an initial seed.
+
+Otherwise, you can generate reports from the
 ClusterFuzz corpus following the general ClusterFuzz [instructions for profiling
 setup](https://github.com/google/oss-fuzz/blob/master/docs/code_coverage.md).
 
