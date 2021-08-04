@@ -2,10 +2,10 @@
 
 #include <chrono>
 #include <cstdint>
+#include <ios>
 #include <set>
 #include <sstream>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include "envoy/common/interval_set.h"
@@ -18,6 +18,14 @@
 #include "absl/strings/string_view.h"
 
 namespace Envoy {
+
+/**
+ * Retrieve string description of error code
+ * @param int error code
+ * @return const std::string error detail description
+ */
+const std::string errorDetails(int error_code);
+
 /**
  * Utility class for formatting dates given an absl::FormatTime style format string.
  */
@@ -104,6 +112,32 @@ public:
 };
 
 /**
+ * Class used for creating non-memory allocating std::ostream.
+ */
+class MutableMemoryStreamBuffer : public std::streambuf {
+public:
+  MutableMemoryStreamBuffer(char* base, size_t size);
+};
+
+/**
+ * std::ostream class that serializes writes into the provided buffer.
+ */
+class OutputBufferStream : private MutableMemoryStreamBuffer, public std::ostream {
+public:
+  OutputBufferStream(char* data, size_t size);
+
+  /**
+   * @return the number of bytes written prior to the "put" pointer into the buffer.
+   */
+  int bytesWritten() const;
+
+  /**
+   * @return a string view of the written bytes.
+   */
+  absl::string_view contents() const;
+};
+
+/**
  * Class used for creating non-copying std::istream's. See InputConstMemoryStream below.
  */
 class ConstMemoryStreamBuffer : public std::streambuf {
@@ -143,6 +177,30 @@ public:
    * @return uint64_t the number of milliseconds since the epoch.
    */
   static uint64_t nowToMilliseconds(TimeSource& time_source);
+
+  /**
+   * @param time_source time keeping source.
+   * @return uint64_t the number os seconds since the epoch.
+   */
+  static uint64_t nowToSeconds(TimeSource& time_source);
+};
+
+/**
+ * Utility routines for working with integers.
+ */
+class IntUtil {
+public:
+  /**
+   * Round `val` up to the next multiple. Examples:
+   *   roundUpToMultiple(3, 8) -> 8
+   *   roundUpToMultiple(9, 8) -> 16
+   *   roundUpToMultiple(8, 8) -> 8
+   */
+  static uint64_t roundUpToMultiple(uint64_t val, uint32_t multiple) {
+    ASSERT(multiple > 0);
+    ASSERT((val + multiple) >= val, "Unsigned overflow");
+    return ((val + multiple - 1) / multiple) * multiple;
+  }
 };
 
 /**
@@ -347,6 +405,16 @@ public:
    * @return escaped string.
    */
   static std::string escape(const std::string& source);
+
+  /**
+   * Outputs the string to the provided ostream, while escaping \n, \r, \t, and "
+   * (double quote), ' (single quote), and \ (backslash) escaped.
+   * This may be particularly useful if you cannot allocate memory, and the
+   * ostream being written to is backed by an entity that won't allocate memory.
+   * @param os the ostream to output to.
+   * @param view a string view to output
+   */
+  static void escapeToOstream(std::ostream& os, absl::string_view view);
 
   /**
    * Provide a default value for a string if empty.
@@ -585,8 +653,8 @@ template <class Value> struct TrieLookupTable {
   }
 
   /**
-   * Finds the entry associated with the longest prefix. Complexity is O(min(longest key prefix, key
-   * length))
+   * Finds the entry associated with the longest prefix. Complexity is O(min(longest key prefix,
+   * key length)).
    * @param key the key used to find.
    * @return the value matching the longest prefix based on the key.
    */
@@ -610,6 +678,15 @@ template <class Value> struct TrieLookupTable {
   }
 
   TrieEntry<Value> root_;
+};
+
+/**
+ * A global utility class to take care of all the exception throwing behaviors in header files.
+ * Its functions simply forward the throwing into .cc file.
+ */
+class ExceptionUtil {
+public:
+  [[noreturn]] static void throwEnvoyException(const std::string& message);
 };
 
 // Mix-in class for allocating classes with variable-sized inlined storage.
@@ -700,16 +777,6 @@ public:
    */
   absl::string_view toStringView() const { return {data_, size_}; }
 
-  /**
-   * @return the number of bytes in the string
-   */
-  size_t size() const { return size_; }
-
-  /**
-   * @return a pointer to the first byte of the string.
-   */
-  const char* data() const { return data_; }
-
 private:
   // Constructor is declared private so that no one constructs one without the
   // proper size allocation. to accommodate the variable-size buffer.
@@ -717,6 +784,19 @@ private:
 
   uint32_t size_;
   char data_[];
+};
+
+class SetUtil {
+public:
+  // Use instead of std::set_difference for unordered absl::flat_hash_set containers.
+  template <typename T>
+  static void setDifference(const absl::flat_hash_set<T>& original_set,
+                            const absl::flat_hash_set<T>& remove_set,
+                            absl::flat_hash_set<T>& result_set) {
+    std::copy_if(original_set.begin(), original_set.end(),
+                 std::inserter(result_set, result_set.begin()),
+                 [&remove_set](const T& v) -> bool { return remove_set.count(v) == 0; });
+  }
 };
 
 } // namespace Envoy
