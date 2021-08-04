@@ -5,6 +5,7 @@
 #include "common/common/fmt.h"
 #include "common/network/addr_family_aware_socket_option_impl.h"
 #include "common/network/socket_option_impl.h"
+#include "common/network/win32_redirect_records_option_impl.h"
 
 namespace Envoy {
 namespace Network {
@@ -52,12 +53,27 @@ std::unique_ptr<Socket::Options> SocketOptionFactory::buildIpTransparentOptions(
   return options;
 }
 
+std::unique_ptr<Socket::Options>
+SocketOptionFactory::buildWFPRedirectRecordsOptions(const Win32RedirectRecords& redirect_records) {
+  std::unique_ptr<Socket::Options> options = std::make_unique<Socket::Options>();
+  options->push_back(std::make_shared<Network::Win32RedirectRecordsOptionImpl>(redirect_records));
+  return options;
+}
+
 std::unique_ptr<Socket::Options> SocketOptionFactory::buildSocketMarkOptions(uint32_t mark) {
   std::unique_ptr<Socket::Options> options = std::make_unique<Socket::Options>();
   // we need this to happen prior to binding or prior to connecting. In both cases, PREBIND will
   // fire.
   options->push_back(std::make_shared<Network::SocketOptionImpl>(
       envoy::config::core::v3::SocketOption::STATE_PREBIND, ENVOY_SOCKET_SO_MARK, mark));
+  return options;
+}
+
+std::unique_ptr<Socket::Options> SocketOptionFactory::buildSocketNoSigpipeOptions() {
+  // Provide additional handling for `SIGPIPE` at the socket layer by converting it to `EPIPE`.
+  std::unique_ptr<Socket::Options> options = std::make_unique<Socket::Options>();
+  options->push_back(std::make_shared<Network::SocketOptionImpl>(
+      envoy::config::core::v3::SocketOption::STATE_PREBIND, ENVOY_SOCKET_SO_NOSIGPIPE, 1));
   return options;
 }
 
@@ -121,6 +137,13 @@ std::unique_ptr<Socket::Options> SocketOptionFactory::buildReusePortOptions() {
   std::unique_ptr<Socket::Options> options = std::make_unique<Socket::Options>();
   options->push_back(std::make_shared<Network::SocketOptionImpl>(
       envoy::config::core::v3::SocketOption::STATE_PREBIND, ENVOY_SOCKET_SO_REUSEPORT, 1));
+  return options;
+}
+
+std::unique_ptr<Socket::Options> SocketOptionFactory::buildUdpGroOptions() {
+  std::unique_ptr<Socket::Options> options = std::make_unique<Socket::Options>();
+  options->push_back(std::make_shared<SocketOptionImpl>(
+      envoy::config::core::v3::SocketOption::STATE_BOUND, ENVOY_SOCKET_UDP_GRO, 1));
   return options;
 }
 
