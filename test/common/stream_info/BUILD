@@ -1,11 +1,11 @@
-licenses(["notice"])  # Apache 2
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_test",
     "envoy_cc_test_library",
     "envoy_package",
 )
+
+licenses(["notice"])  # Apache 2
 
 envoy_package()
 
@@ -27,7 +27,10 @@ envoy_cc_test(
         "//include/envoy/upstream:host_description_interface",
         "//source/common/stream_info:stream_info_lib",
         "//test/mocks/router:router_mocks",
-        "//test/mocks/upstream:upstream_mocks",
+        "//test/mocks/ssl:ssl_mocks",
+        "//test/mocks/upstream:cluster_info_mocks",
+        "//test/mocks/upstream:host_mocks",
+        "//test/test_common:utility_lib",
     ],
 )
 
@@ -46,9 +49,10 @@ envoy_cc_test_library(
         "//include/envoy/http:request_id_extension_interface",
         "//include/envoy/stream_info:stream_info_interface",
         "//source/common/common:assert_lib",
-        "//source/common/http:request_id_extension_lib",
+        "//source/common/common:random_generator_lib",
         "//source/common/runtime:runtime_lib",
         "//source/common/stream_info:filter_state_lib",
+        "//source/extensions/request_id/uuid:config",
         "//test/test_common:simulated_time_system_lib",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
     ],

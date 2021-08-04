@@ -30,7 +30,8 @@ public:
   MOCK_METHOD(bool, evaluate,
               (const StreamInfo::StreamInfo& info, const Http::RequestHeaderMap& request_headers,
                const Http::ResponseHeaderMap& response_headers,
-               const Http::ResponseTrailerMap& response_trailers));
+               const Http::ResponseTrailerMap& response_trailers),
+              (const));
 };
 
 class MockAccessLogManager : public AccessLogManager {
@@ -40,7 +41,8 @@ public:
 
   // AccessLog::AccessLogManager
   MOCK_METHOD(void, reopen, ());
-  MOCK_METHOD(AccessLogFileSharedPtr, createAccessLog, (const std::string& file_name));
+  MOCK_METHOD(AccessLogFileSharedPtr, createAccessLog,
+              (const Envoy::Filesystem::FilePathAndType& file_info));
 
   std::shared_ptr<MockAccessLogFile> file_{new testing::NiceMock<MockAccessLogFile>()};
 };
