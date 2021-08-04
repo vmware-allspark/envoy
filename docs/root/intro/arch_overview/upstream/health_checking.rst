@@ -13,7 +13,7 @@ unhealthy, successes required before marking a host healthy, etc.):
 
 * **HTTP**: During HTTP health checking Envoy will send an HTTP request to the upstream host. By
   default, it expects a 200 response if the host is healthy. Expected response codes are
-  :ref:`configurable <envoy_api_msg_core.HealthCheck.HttpHealthCheck>`. The
+  :ref:`configurable <envoy_v3_api_msg_config.core.v3.HealthCheck.HttpHealthCheck>`. The
   upstream host can return 503 if it wants to immediately notify downstream hosts to no longer
   forward traffic to it.
 * **L3/L4**: During L3/L4 health checking, Envoy will send a configurable byte buffer to the
@@ -24,13 +24,13 @@ unhealthy, successes required before marking a host healthy, etc.):
   failure. Optionally, Envoy can perform EXISTS on a user-specified key. If the key does not exist
   it is considered a passing healthcheck. This allows the user to mark a Redis instance for
   maintenance by setting the specified key to any value and waiting for traffic to drain. See
-  :ref:`redis_key <envoy_api_msg_config.health_checker.redis.v2.Redis>`.
+  :ref:`redis_key <envoy_v3_api_msg_extensions.health_checkers.redis.v3.Redis>`.
 
 Health checks occur over the transport socket specified for the cluster. This implies that if a cluster is
 using a TLS-enabled transport socket, the health check will also occur over TLS. The
-:ref:`TLS options <envoy_api_msg_core.HealthCheck.TlsOptions>` used for health check connections
+:ref:`TLS options <envoy_v3_api_msg_config.core.v3.HealthCheck.TlsOptions>` used for health check connections
 can be specified, which is useful if the corresponding upstream is using ALPN-based
-:ref:`FilterChainMatch <envoy_api_msg_listener.FilterChainMatch>` with different protocols for
+:ref:`FilterChainMatch <envoy_v3_api_msg_config.listener.v3.FilterChainMatch>` with different protocols for
 health checks versus data connections.
 
 .. _arch_overview_per_cluster_health_check_config:
@@ -40,14 +40,14 @@ Per cluster member health check config
 
 If active health checking is configured for an upstream cluster, a specific additional configuration
 for each registered member can be specified by setting the
-:ref:`HealthCheckConfig<envoy_api_msg_endpoint.Endpoint.HealthCheckConfig>`
-in the :ref:`Endpoint<envoy_api_msg_endpoint.Endpoint>` of an :ref:`LbEndpoint<envoy_api_msg_endpoint.LbEndpoint>`
-of each defined :ref:`LocalityLbEndpoints<envoy_api_msg_endpoint.LocalityLbEndpoints>` in a
-:ref:`ClusterLoadAssignment<envoy_api_msg_ClusterLoadAssignment>`.
+:ref:`HealthCheckConfig<envoy_v3_api_msg_config.endpoint.v3.Endpoint.HealthCheckConfig>`
+in the :ref:`Endpoint<envoy_v3_api_msg_config.endpoint.v3.Endpoint>` of an :ref:`LbEndpoint<envoy_v3_api_msg_config.endpoint.v3.LbEndpoint>`
+of each defined :ref:`LocalityLbEndpoints<envoy_v3_api_msg_config.endpoint.v3.LocalityLbEndpoints>` in a
+:ref:`ClusterLoadAssignment<envoy_v3_api_msg_config.endpoint.v3.ClusterLoadAssignment>`.
 
-An example of setting up :ref:`health check config<envoy_api_msg_endpoint.Endpoint.HealthCheckConfig>`
-to set a :ref:`cluster member<envoy_api_msg_endpoint.Endpoint>`'s alternative health check
-:ref:`port<envoy_api_field_endpoint.Endpoint.HealthCheckConfig.port_value>` is:
+An example of setting up :ref:`health check config<envoy_v3_api_msg_config.endpoint.v3.Endpoint.HealthCheckConfig>`
+to set a :ref:`cluster member<envoy_v3_api_msg_config.endpoint.v3.Endpoint>`'s alternative health check
+:ref:`port<envoy_v3_api_field_config.endpoint.v3.Endpoint.HealthCheckConfig.port_value>` is:
 
 .. code-block:: yaml
 
@@ -68,12 +68,12 @@ Health check event logging
 --------------------------
 
 A per-healthchecker log of ejection and addition events can optionally be produced by Envoy by
-specifying a log file path in :ref:`the HealthCheck config <envoy_api_field_core.HealthCheck.event_log_path>`.
+specifying a log file path in :ref:`the HealthCheck config <envoy_v3_api_field_config.core.v3.HealthCheck.event_log_path>`.
 The log is structured as JSON dumps of
-:ref:`HealthCheckEvent messages <envoy_api_msg_data.core.v2alpha.HealthCheckEvent>`.
+:ref:`HealthCheckEvent messages <envoy_v3_api_msg_data.core.v3.HealthCheckEvent>`.
 
 Envoy can be configured to log all health check failure events by setting the :ref:`always_log_health_check_failures
-flag <envoy_api_field_core.HealthCheck.always_log_health_check_failures>` to true.
+flag <envoy_v3_api_field_config.core.v3.HealthCheck.always_log_health_check_failures>` to true.
 
 Passive health checking
 -----------------------
@@ -100,7 +100,7 @@ operation:
   Envoy will respond with a 200 or a 503 depending on the current draining state of the server.
 * **No pass through, computed from upstream cluster health**: In this mode, the health checking
   filter will return a 200 or a 503 depending on whether at least a :ref:`specified percentage
-  <envoy_api_field_config.filter.http.health_check.v2.HealthCheck.cluster_min_healthy_percentages>`
+  <envoy_v3_api_field_extensions.filters.http.health_check.v3.HealthCheck.cluster_min_healthy_percentages>`
   of the servers are available (healthy + degraded) in one or more upstream clusters. (If the Envoy
   server is in a draining state, though, it will respond with a 503 regardless of the upstream
   cluster health.)
@@ -121,6 +121,8 @@ Further reading:
 * :ref:`/healthcheck/fail <operations_admin_interface_healthcheck_fail>` admin endpoint.
 * :ref:`/healthcheck/ok <operations_admin_interface_healthcheck_ok>` admin endpoint.
 
+.. _arch_overview_health_checking_fast_failure:
+
 Active health checking fast failure
 -----------------------------------
 
@@ -129,10 +131,12 @@ When using active health checking along with passive health checking (:ref:`outl
 large amount of active health checking traffic. In this case, it is still useful to be able to
 quickly drain an upstream host when using the :ref:`/healthcheck/fail
 <operations_admin_interface_healthcheck_fail>` admin endpoint. To support this, the :ref:`router
-filter <config_http_filters_router>` will respond to the :ref:`x-envoy-immediate-health-check-fail
+filter <config_http_filters_router>` *and* the HTTP active health checker will respond to the
+:ref:`x-envoy-immediate-health-check-fail
 <config_http_filters_router_x-envoy-immediate-health-check-fail>` header. If this header is set by
-an upstream host, Envoy will immediately mark the host as being failed for active health check. Note
-that this only occurs if the host's cluster has active health checking :ref:`configured
+an upstream host, Envoy will immediately mark the host as being failed for active health check and
+:ref:`excluded <arch_overview_load_balancing_excluded>` from load balancing. Note that this only
+occurs if the host's cluster has active health checking :ref:`configured
 <config_cluster_manager_cluster_hc>`. The :ref:`health checking filter
 <config_http_filters_health_check>` will automatically set this header if Envoy has been marked as
 failed via the :ref:`/healthcheck/fail <operations_admin_interface_healthcheck_fail>` admin
@@ -151,8 +155,8 @@ is having a different HTTP health checking URL for every service type. The downs
 is that overall configuration becomes more complicated as every health check URL is fully custom.
 
 The Envoy HTTP health checker supports the :ref:`service_name_matcher
-<envoy_api_field_core.HealthCheck.HttpHealthCheck.service_name_matcher>` option. If this option is set,
-the health checker additionally compares the value of the *x-envoy-upstream-healthchecked-cluster* 
+<envoy_v3_api_field_config.core.v3.HealthCheck.HttpHealthCheck.service_name_matcher>` option. If this option is set,
+the health checker additionally compares the value of the *x-envoy-upstream-healthchecked-cluster*
 response header to *service_name_matcher*. If the values do not match, the health check does not pass.
 The upstream health check filter appends *x-envoy-upstream-healthchecked-cluster* to the response headers.
 The appended value is determined by the :option:`--service-cluster` command line option.
