@@ -1,3 +1,5 @@
+#pragma once
+
 #include <memory>
 
 #include "envoy/admin/v3/config_dump.pb.h"
@@ -12,9 +14,15 @@
 #include "server/listener_manager_impl.h"
 
 #include "test/mocks/network/mocks.h"
-#include "test/mocks/server/mocks.h"
+#include "test/mocks/server/drain_manager.h"
+#include "test/mocks/server/guard_dog.h"
+#include "test/mocks/server/instance.h"
+#include "test/mocks/server/listener_component_factory.h"
+#include "test/mocks/server/worker.h"
+#include "test/mocks/server/worker_factory.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/simulated_time_system.h"
+#include "test/test_common/test_runtime.h"
 #include "test/test_common/threadsafe_singleton_injector.h"
 
 #include "gmock/gmock.h"
@@ -47,11 +55,15 @@ public:
 
 class ListenerManagerImplTest : public testing::Test {
 protected:
-  ListenerManagerImplTest() : api_(Api::createApiForTest()) {}
+  ListenerManagerImplTest() : api_(Api::createApiForTest(server_.api_.random_)) {}
 
   void SetUp() override {
     ON_CALL(server_, api()).WillByDefault(ReturnRef(*api_));
     EXPECT_CALL(worker_factory_, createWorker_()).WillOnce(Return(worker_));
+    ON_CALL(server_.validation_context_, staticValidationVisitor())
+        .WillByDefault(ReturnRef(validation_visitor));
+    ON_CALL(server_.validation_context_, dynamicValidationVisitor())
+        .WillByDefault(ReturnRef(validation_visitor));
     manager_ = std::make_unique<ListenerManagerImpl>(server_, listener_factory_, worker_factory_,
                                                      enable_dispatcher_stats_);
 
@@ -133,6 +145,33 @@ protected:
     return raw_listener;
   }
 
+  ListenerHandle* expectListenerOverridden(bool need_init, ListenerHandle* origin = nullptr) {
+    auto raw_listener = new ListenerHandle(false);
+    // Simulate ListenerImpl: drain manager is copied from origin.
+    if (origin != nullptr) {
+      raw_listener->drain_manager_ = origin->drain_manager_;
+    }
+    // Overridden listener is always added by api.
+    EXPECT_CALL(server_.validation_context_, staticValidationVisitor()).Times(0);
+    EXPECT_CALL(server_.validation_context_, dynamicValidationVisitor());
+
+    EXPECT_CALL(listener_factory_, createNetworkFilterFactoryList(_, _))
+        .WillOnce(Invoke(
+            [raw_listener, need_init](
+                const Protobuf::RepeatedPtrField<envoy::config::listener::v3::Filter>&,
+                Server::Configuration::FilterChainFactoryContext& filter_chain_factory_context)
+                -> std::vector<Network::FilterFactoryCb> {
+              std::shared_ptr<ListenerHandle> notifier(raw_listener);
+              raw_listener->context_ = &filter_chain_factory_context;
+              if (need_init) {
+                filter_chain_factory_context.initManager().add(notifier->target_);
+              }
+              return {[notifier](Network::FilterManager&) -> void {}};
+            }));
+
+    return raw_listener;
+  }
+
   const Network::FilterChain*
   findFilterChain(uint16_t destination_port, const std::string& destination_address,
                   const std::string& server_name, const std::string& transport_protocol,
@@ -144,7 +183,7 @@ protected:
       local_address_ =
           Network::Utility::parseInternetAddress(destination_address, destination_port);
     }
-    ON_CALL(*socket_, localAddress()).WillByDefault(ReturnRef(local_address_));
+    socket_->address_provider_->setLocalAddress(local_address_);
 
     ON_CALL(*socket_, requestedServerName()).WillByDefault(Return(absl::string_view(server_name)));
     ON_CALL(*socket_, detectedTransportProtocol())
@@ -157,7 +196,7 @@ protected:
     } else {
       remote_address_ = Network::Utility::parseInternetAddress(source_address, source_port);
     }
-    ON_CALL(*socket_, remoteAddress()).WillByDefault(ReturnRef(remote_address_));
+    socket_->address_provider_->setRemoteAddress(remote_address_);
 
     return manager_->listeners().back().get().filterChainManager().findFilterChain(*socket_);
   }
@@ -171,8 +210,7 @@ protected:
                            ListenSocketCreationParams expected_creation_params = {true, true}) {
     EXPECT_CALL(listener_factory_, createListenSocket(_, _, _, expected_creation_params))
         .WillOnce(Invoke([this, expected_num_options, &expected_state](
-                             const Network::Address::InstanceConstSharedPtr&,
-                             Network::Address::SocketType,
+                             const Network::Address::InstanceConstSharedPtr&, Network::Socket::Type,
                              const Network::Socket::OptionsSharedPtr& options,
                              const ListenSocketCreationParams&) -> Network::SocketSharedPtr {
           EXPECT_NE(options.get(), nullptr);
@@ -184,23 +222,26 @@ protected:
   }
 
   /**
-   * Validate that setsockopt() is called the expected number of times with the expected options.
+   * Validate that setSocketOption() is called the expected number of times with the expected
+   * options.
    */
-  void expectSetsockopt(NiceMock<Api::MockOsSysCalls>& os_sys_calls, int expected_sockopt_level,
-                        int expected_sockopt_name, int expected_value,
+  void expectSetsockopt(int expected_sockopt_level, int expected_sockopt_name, int expected_value,
                         uint32_t expected_num_calls = 1) {
-    EXPECT_CALL(os_sys_calls,
-                setsockopt_(_, expected_sockopt_level, expected_sockopt_name, _, sizeof(int)))
+    EXPECT_CALL(*listener_factory_.socket_,
+                setSocketOption(expected_sockopt_level, expected_sockopt_name, _, sizeof(int)))
         .Times(expected_num_calls)
-        .WillRepeatedly(
-            Invoke([expected_value](int, int, int, const void* optval, socklen_t) -> int {
+        .WillRepeatedly(Invoke(
+            [expected_value](int, int, const void* optval, socklen_t) -> Api::SysCallIntResult {
               EXPECT_EQ(expected_value, *static_cast<const int*>(optval));
-              return 0;
+              return {0, 0};
             }));
   }
 
-  void checkStats(uint64_t added, uint64_t modified, uint64_t removed, uint64_t warming,
-                  uint64_t active, uint64_t draining) {
+  void checkStats(int line_num, uint64_t added, uint64_t modified, uint64_t removed,
+                  uint64_t warming, uint64_t active, uint64_t draining,
+                  uint64_t draining_filter_chains) {
+    SCOPED_TRACE(line_num);
+
     EXPECT_EQ(added, server_.stats_store_.counter("listener_manager.listener_added").value());
     EXPECT_EQ(modified, server_.stats_store_.counter("listener_manager.listener_modified").value());
     EXPECT_EQ(removed, server_.stats_store_.counter("listener_manager.listener_removed").value());
@@ -216,6 +257,10 @@ protected:
                             .gauge("listener_manager.total_listeners_draining",
                                    Stats::Gauge::ImportMode::NeverImport)
                             .value());
+    EXPECT_EQ(draining_filter_chains, server_.stats_store_
+                                          .gauge("listener_manager.total_filter_chains_draining",
+                                                 Stats::Gauge::ImportMode::NeverImport)
+                                          .value());
   }
 
   void checkConfigDump(const std::string& expected_dump_yaml) {
@@ -228,11 +273,20 @@ protected:
     EXPECT_EQ(expected_listeners_config_dump.DebugString(), listeners_config_dump.DebugString());
   }
 
+  ABSL_MUST_USE_RESULT
+  auto enableTlsInspectorInjectionForThisTest() {
+    auto scoped_runtime = std::make_unique<TestScopedRuntime>();
+    Runtime::LoaderSingleton::getExisting()->mergeValues(
+        {{"envoy.reloadable_features.disable_tls_inspector_injection", "false"}});
+    return scoped_runtime;
+  }
+
   NiceMock<Api::MockOsSysCalls> os_sys_calls_;
   TestThreadsafeSingletonInjector<Api::OsSysCallsImpl> os_calls_{&os_sys_calls_};
   Api::OsSysCallsImpl os_sys_calls_actual_;
   NiceMock<MockInstance> server_;
   NiceMock<MockListenerComponentFactory> listener_factory_;
+  NiceMock<ProtobufMessage::MockValidationVisitor> validation_visitor;
   MockWorker* worker_ = new MockWorker();
   NiceMock<MockWorkerFactory> worker_factory_;
   std::unique_ptr<ListenerManagerImpl> manager_;
@@ -244,6 +298,7 @@ protected:
   std::unique_ptr<Network::MockConnectionSocket> socket_;
   uint64_t listener_tag_{1};
   bool enable_dispatcher_stats_{false};
+  NiceMock<testing::MockFunction<void()>> callback_;
 };
 
 } // namespace Server

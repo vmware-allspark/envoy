@@ -1,3 +1,9 @@
+# Security Reporting Process
+
+Please report any security issue or Envoy crash report to
+envoy-security@googlegroups.com where the issue will be triaged appropriately.
+Thank you in advance for helping to keep Envoy secure.
+
 # Security Release Process
 
 Envoy is a large growing community of volunteers, users, and vendors. The Envoy community has
@@ -57,33 +63,33 @@ score >= 4; see below). If the fix relies on another upstream project's disclosu
 will adjust the process as well. We will work with the upstream project to fit their timeline and
 best protect our users.
 
-### Released versions and master branch
+### Released versions and main branch
 
 If the vulnerability affects the last point release version, e.g. 1.10, then the full security
 release process described in this document will be activated. A security point release will be
-created for 1.10, e.g. 1.10.1, together with a fix to master if necessary. Older point releases,
+created for 1.10, e.g. 1.10.1, together with a fix to main if necessary. Older point releases,
 e.g. 1.9, are not supported by the Envoy project and will not have any security release created.
 
-If a security vulnerability affects only these older versions but not master or the last supported
+If a security vulnerability affects only these older versions but not main or the last supported
 point release, the Envoy security team will share this information with the private distributor
 list, following the standard embargo process, but not create a security release. After the embargo
 expires, the vulnerability will be described as a GitHub issue. A CVE will be filed if warranted by
 severity.
 
-If a vulnerability does not affect any point release but only master, additional caveats apply:
+If a vulnerability does not affect any point release but only main, additional caveats apply:
 
-* If the issue is detected and a fix is available within 5 days of the introduction of the
-  vulnerability, the fix will be publicly reviewed and landed on master. A courtesy e-mail will be
-  sent to envoy-users@googlegroups.com, envoy-dev@googlegroups.com,
-  envoy-security-announce@googlegroups.com and cncf-envoy-distributors-announce@lists.cncf.io if 
-  the severity is medium or greater.
-* If the vulnerability has been in existence for more than 5 days, we will activate the security
-  release process for any medium or higher vulnerabilities. Low severity vulnerabilities will still
-  be merged onto master as soon as a fix is available.
+* If the issue is detected and a fix is available within 7 days of the introduction of the
+  vulnerability, or the issue is deemed a low severity vulnerability by the Envoy maintainer and
+  security teams, the fix will be publicly reviewed and landed on main. If the severity is at least
+  medium or at maintainer discretion a courtesy e-mail will be sent to envoy-users@googlegroups.com,
+  envoy-dev@googlegroups.com, envoy-security-announce@googlegroups.com and
+  cncf-envoy-distributors-announce@lists.cncf.io.
+* If the vulnerability has been in existence for more than 7 days and is medium or higher, we will
+  activate the security release process.
 
-We advise distributors and operators working from the master branch to allow at least 3 days soak
+We advise distributors and operators working from the main branch to allow at least 5 days soak
 time after cutting a binary release before distribution or rollout, to allow time for our fuzzers to
-detect issues during their execution on ClusterFuzz. A soak period of 5 days provides an even stronger
+detect issues during their execution on ClusterFuzz. A soak period of 7 days provides an even stronger
 guarantee, since we will invoke the security release process for medium or higher severity issues
 for these older bugs.
 
@@ -118,11 +124,38 @@ score](https://www.first.org/cvss/specification-document#i5)) the Fix Team can d
 release process down in the face of holidays, developer bandwidth, etc. These decisions must be
 discussed on the envoy-security mailing list.
 
-A two week window will be provided to members of the private distributor list from candidate patch
+A three week window will be provided to members of the private distributor list from candidate patch
 availability until the security release date. It is expected that distributors will normally be able
 to perform a release within this time window. If there are exceptional circumstances, the Envoy
 security team will raise this window to four weeks. The release window will be reduced if the
 security issue is public or embargo is broken.
+
+We will endeavor not to overlap this three week window with or place it adjacent to major corporate
+holiday periods or end-of-quarter (e.g. impacting downstream Istio releases), where possible.
+
+### Fix and disclosure SLOs
+
+* All reports to envoy-security@googlegroups.com will be triaged and have an
+  initial response within 1 business day.
+
+* Privately disclosed issues will be fixed or publicly disclosed within 90 days
+  by the Envoy security team. In exceptional circumstances we reserve the right
+  to work with the discloser to coordinate on an extension, but this will be
+  rarely used.
+
+* Any issue discovered by the Envoy security team and raised in our private bug
+  tracker will be converted to a public issue within 90 days. We will regularly
+  audit these issues to ensure that no major vulnerability (from the perspective
+  of the threat model) is accidentally leaked.
+
+* Fuzz bugs are subject to a 90 day disclosure deadline.
+
+* Three weeks notice will be provided to private distributors from patch
+  availability until the embargo deadline.
+
+* Public zero days will be fixed ASAP, but there is no SLO for this, since this
+  will depend on the severity and impact to the organizations backing the Envoy
+  security team.
 
 ### Fix Disclosure Process
 
@@ -148,7 +181,8 @@ patches, understand exact mitigation steps, etc.
   should be reserved for remotely exploitable or privilege escalation issues. Otherwise, this
   process can be skipped.
 - The Fix Lead will email the patches to cncf-envoy-distributors-announce@lists.cncf.io so
-  distributors can prepare builds to be available to users on the day of the issue's announcement.
+  distributors can prepare builds to be available to users on the day of the issue's announcement. Any
+  patches against main will be updated and resent weekly.
   Distributors should read about the [Private Distributors List](#private-distributors-list) to find
   out the requirements for being added to this list.
 - **What if a vendor breaks embargo?** The PST will assess the damage. The Fix Lead will make the
@@ -159,7 +193,7 @@ patches, understand exact mitigation steps, etc.
 - The maintainers will create a new patch release branch from the latest patch release tag + the fix
   from the security branch. As a practical example if v1.5.3 is the latest patch release in Envoy.git
   a new branch will be created called v1.5.4 which includes only patches required to fix the issue.
-- The Fix Lead will cherry-pick the patches onto the master branch and all relevant release branches.
+- The Fix Lead will cherry-pick the patches onto the main branch and all relevant release branches.
   The Fix Team will LGTM and merge. Maintainers will merge these PRs as quickly as possible. Changes
   shouldn't be made to the commits even for a typo in the CHANGELOG as this will change the git sha
   of the commits leading to confusion and potentially conflicts as the fix is cherry-picked around
@@ -171,6 +205,13 @@ patches, understand exact mitigation steps, etc.
   and user action. As much as possible this email should be actionable and include links on how to apply
   the fix to user's environments; this can include links to external distributor documentation.
 - The Fix Lead will remove the Fix Team from the private security repo.
+
+The reporter of a vulnerability will be granted early access to fix patches upon
+request, prior to the general disclosure of patches to the Private Distributors
+List for the purpose of testing and internal vulnerability mitigation. They must
+accept the embargo policy below in order for this to occur. If the vulnerability
+reporter is also responsible for developing fix patches, they may make use of
+the patches internally in their organization at any point in the fix cycle.
 
 ### Retrospective
 
@@ -302,7 +343,7 @@ use of Envoy should:
    have a way to privately stage and validate your updates that does not violate
    the embargo.
 7. Be willing to [contribute back](#contributing-back) as outlined above.
-8. Be able to perform a security release of your product within a two week window from candidate fix
+8. Be able to perform a security release of your product within a three week window from candidate fix
    patch availability.
 9. Have someone already on the list vouch for the person requesting membership
    on behalf of your distribution.
@@ -382,7 +423,7 @@ We accept.
 
 We are definitely willing to help!
 
-> 8. Be able to perform a security release of your product within a two week window from candidate fix
+> 8. Be able to perform a security release of your product within a three week window from candidate fix
      patch availability.
 
 We affirm we can spin out new security releases within a 2 week window.
@@ -418,6 +459,7 @@ and security team to ensure they still qualify for inclusion on the list.
 | google-internal-envoy-security@google.com             | Google        | No       | 12/19       |
 | argoprod@us.ibm.com                                   | IBM           | No       | 12/19       |
 | istio-security-vulnerability-reports@googlegroups.com | Istio         | No       | 12/19       |
+| envoy-security@microsoft.com                          | Microsoft     | No       | 2/21        |
 | secalert@redhat.com                                   | Red Hat       | No       | 12/19       |
 | envoy-security@solo.io                                | solo.io       | No       | 12/19       |
 | envoy-security@tetrate.io                             | Tetrate       | No       | 12/19       |
