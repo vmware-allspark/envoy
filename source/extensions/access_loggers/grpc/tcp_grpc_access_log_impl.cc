@@ -4,6 +4,7 @@
 #include "envoy/extensions/access_loggers/grpc/v3/als.pb.h"
 
 #include "common/common/assert.h"
+#include "common/config/utility.h"
 #include "common/network/utility.h"
 #include "common/stream_info/utility.h"
 
@@ -20,12 +21,14 @@ TcpGrpcAccessLog::ThreadLocalLogger::ThreadLocalLogger(GrpcCommon::GrpcAccessLog
 TcpGrpcAccessLog::TcpGrpcAccessLog(
     AccessLog::FilterPtr&& filter,
     envoy::extensions::access_loggers::grpc::v3::TcpGrpcAccessLogConfig config,
-    ThreadLocal::SlotAllocator& tls, GrpcCommon::GrpcAccessLoggerCacheSharedPtr access_logger_cache)
-    : Common::ImplBase(std::move(filter)), config_(std::move(config)),
+    ThreadLocal::SlotAllocator& tls, GrpcCommon::GrpcAccessLoggerCacheSharedPtr access_logger_cache,
+    Stats::Scope& scope)
+    : Common::ImplBase(std::move(filter)), scope_(scope), config_(std::move(config)),
       tls_slot_(tls.allocateSlot()), access_logger_cache_(std::move(access_logger_cache)) {
-  tls_slot_->set([this](Event::Dispatcher&) {
+  tls_slot_->set([this, transport_version = Config::Utility::getAndCheckTransportVersion(
+                            config_.common_config())](Event::Dispatcher&) {
     return std::make_shared<ThreadLocalLogger>(access_logger_cache_->getOrCreateLogger(
-        config_.common_config(), GrpcCommon::GrpcAccessLoggerType::TCP));
+        config_.common_config(), transport_version, Common::GrpcAccessLoggerType::TCP, scope_));
   });
 }
 
