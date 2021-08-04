@@ -14,14 +14,11 @@ class FileAccessLogFactory : public Server::Configuration::AccessLogInstanceFact
 public:
   AccessLog::InstanceSharedPtr
   createAccessLogInstance(const Protobuf::Message& config, AccessLog::FilterPtr&& filter,
-                          Server::Configuration::FactoryContext& context) override;
+                          Server::Configuration::CommonFactoryContext& context) override;
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override;
 
   std::string name() const override;
-
-private:
-  std::unordered_map<std::string, std::string> convertJsonFormatToMap(ProtobufWkt::Struct config);
 };
 
 } // namespace File
