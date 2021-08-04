@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include "envoy/common/callback.h"
+#include "envoy/common/time.h"
 #include "envoy/config/cluster/v3/cluster.pb.h"
 #include "envoy/config/core/v3/address.pb.h"
 #include "envoy/config/core/v3/base.pb.h"
@@ -38,8 +40,12 @@
 #include "common/common/callback_impl.h"
 #include "common/common/enum_to_int.h"
 #include "common/common/logger.h"
+#include "common/common/thread.h"
 #include "common/config/metadata.h"
 #include "common/config/well_known_names.h"
+#include "common/http/http1/codec_stats.h"
+#include "common/http/http2/codec_stats.h"
+#include "common/http/http3/codec_stats.h"
 #include "common/init/manager_impl.h"
 #include "common/network/utility.h"
 #include "common/shared_pool/shared_pool.h"
@@ -51,6 +57,9 @@
 
 #include "server/transport_socket_config_impl.h"
 
+#include "extensions/upstreams/http/config.h"
+
+#include "absl/container/node_hash_set.h"
 #include "absl/synchronization/mutex.h"
 
 namespace Envoy {
@@ -62,7 +71,7 @@ namespace Upstream {
 class HealthCheckHostMonitorNullImpl : public HealthCheckHostMonitor {
 public:
   // Upstream::HealthCheckHostMonitor
-  void setUnhealthy() override {}
+  void setUnhealthy(UnhealthyType) override {}
 };
 
 /**
@@ -76,7 +85,7 @@ public:
       Network::Address::InstanceConstSharedPtr dest_address, MetadataConstSharedPtr metadata,
       const envoy::config::core::v3::Locality& locality,
       const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
-      uint32_t priority);
+      uint32_t priority, TimeSource& time_source);
 
   Network::TransportSocketFactory& transportSocketFactory() const override {
     return socket_factory_;
@@ -132,11 +141,10 @@ public:
   }
   uint32_t priority() const override { return priority_; }
   void priority(uint32_t priority) override { priority_ = priority; }
-
-private:
   Network::TransportSocketFactory&
   resolveTransportSocketFactory(const Network::Address::InstanceConstSharedPtr& dest_address,
-                                const envoy::config::core::v3::Metadata* metadata);
+                                const envoy::config::core::v3::Metadata* metadata) const;
+  MonotonicTime creationTime() const override { return creation_time_; }
 
 protected:
   ClusterInfoConstSharedPtr cluster_;
@@ -148,12 +156,13 @@ protected:
   mutable absl::Mutex metadata_mutex_;
   MetadataConstSharedPtr metadata_ ABSL_GUARDED_BY(metadata_mutex_);
   const envoy::config::core::v3::Locality locality_;
-  Stats::StatNameManagedStorage locality_zone_stat_name_;
+  Stats::StatNameDynamicStorage locality_zone_stat_name_;
   mutable HostStats stats_;
   Outlier::DetectorHostMonitorPtr outlier_detector_;
   HealthCheckHostMonitorPtr health_checker_;
   std::atomic<uint32_t> priority_;
   Network::TransportSocketFactory& socket_factory_;
+  const MonotonicTime creation_time_;
 };
 
 /**
@@ -167,12 +176,13 @@ public:
            Network::Address::InstanceConstSharedPtr address, MetadataConstSharedPtr metadata,
            uint32_t initial_weight, const envoy::config::core::v3::Locality& locality,
            const envoy::config::endpoint::v3::Endpoint::HealthCheckConfig& health_check_config,
-           uint32_t priority, const envoy::config::core::v3::HealthStatus health_status)
+           uint32_t priority, const envoy::config::core::v3::HealthStatus health_status,
+           TimeSource& time_source)
       : HostDescriptionImpl(cluster, hostname, address, metadata, locality, health_check_config,
-                            priority),
+                            priority, time_source),
         used_(true) {
     setEdsHealthFlag(health_status);
-    weight(initial_weight);
+    HostImpl::weight(initial_weight);
   }
 
   // Upstream::Host
@@ -183,9 +193,10 @@ public:
   CreateConnectionData createConnection(
       Event::Dispatcher& dispatcher, const Network::ConnectionSocket::OptionsSharedPtr& options,
       Network::TransportSocketOptionsSharedPtr transport_socket_options) const override;
-  CreateConnectionData createHealthCheckConnection(
-      Event::Dispatcher& dispatcher,
-      Network::TransportSocketOptionsSharedPtr transport_socket_options) const override;
+  CreateConnectionData
+  createHealthCheckConnection(Event::Dispatcher& dispatcher,
+                              Network::TransportSocketOptionsSharedPtr transport_socket_options,
+                              const envoy::config::core::v3::Metadata* metadata) const override;
 
   std::vector<std::pair<absl::string_view, Stats::PrimitiveGaugeReference>>
   gauges() const override {
@@ -193,14 +204,7 @@ public:
   }
   void healthFlagClear(HealthFlag flag) override { health_flags_ &= ~enumToInt(flag); }
   bool healthFlagGet(HealthFlag flag) const override { return health_flags_ & enumToInt(flag); }
-  void healthFlagSet(HealthFlag flag) override { health_flags_ |= enumToInt(flag); }
-
-  ActiveHealthFailureType getActiveHealthFailureType() const override {
-    return active_health_failure_type_;
-  }
-  void setActiveHealthFailureType(ActiveHealthFailureType type) override {
-    active_health_failure_type_ = type;
-  }
+  void healthFlagSet(HealthFlag flag) final { health_flags_ |= enumToInt(flag); }
 
   void setHealthChecker(HealthCheckHostMonitorPtr&& health_checker) override {
     health_checker_ = std::move(health_checker);
@@ -244,7 +248,6 @@ private:
   void setEdsHealthFlag(envoy::config::core::v3::HealthStatus health_status);
 
   std::atomic<uint32_t> health_flags_{};
-  ActiveHealthFailureType active_health_failure_type_{};
   std::atomic<uint32_t> weight_;
   std::atomic<bool> used_;
 };
@@ -295,9 +298,10 @@ public:
   /**
    * Install a callback that will be invoked when the host set membership changes.
    * @param callback supplies the callback to invoke.
-   * @return Common::CallbackHandle* the callback handle.
+   * @return Common::CallbackHandlePtr the callback handle.
    */
-  Common::CallbackHandle* addPriorityUpdateCb(PrioritySet::PriorityUpdateCb callback) const {
+  ABSL_MUST_USE_RESULT Common::CallbackHandlePtr
+  addPriorityUpdateCb(PrioritySet::PriorityUpdateCb callback) const {
     return member_update_cb_helper_.add(callback);
   }
 
@@ -432,10 +436,12 @@ class PrioritySetImpl : public PrioritySet {
 public:
   PrioritySetImpl() : batch_update_(false) {}
   // From PrioritySet
-  Common::CallbackHandle* addMemberUpdateCb(MemberUpdateCb callback) const override {
+  ABSL_MUST_USE_RESULT Common::CallbackHandlePtr
+  addMemberUpdateCb(MemberUpdateCb callback) const override {
     return member_update_cb_helper_.add(callback);
   }
-  Common::CallbackHandle* addPriorityUpdateCb(PriorityUpdateCb callback) const override {
+  ABSL_MUST_USE_RESULT Common::CallbackHandlePtr
+  addPriorityUpdateCb(PriorityUpdateCb callback) const override {
     return priority_update_cb_helper_.add(callback);
   }
   const std::vector<std::unique_ptr<HostSet>>& hostSetsPerPriority() const override {
@@ -474,6 +480,9 @@ protected:
   std::vector<std::unique_ptr<HostSet>> host_sets_;
 
 private:
+  // This is a matching vector to store the callback handles for host_sets_. It is kept separately
+  // because host_sets_ is directly returned so we avoid translation.
+  std::vector<Common::CallbackHandlePtr> host_sets_priority_update_cbs_;
   // TODO(mattklein123): Remove mutable.
   mutable Common::CallbackManager<const HostVector&, const HostVector&> member_update_cb_helper_;
   mutable Common::CallbackManager<uint32_t, const HostVector&, const HostVector&>
@@ -496,32 +505,41 @@ private:
                      const HostVector& hosts_removed,
                      absl::optional<uint32_t> overprovisioning_factor) override;
 
-    std::unordered_set<HostSharedPtr> all_hosts_added_;
-    std::unordered_set<HostSharedPtr> all_hosts_removed_;
+    absl::node_hash_set<HostSharedPtr> all_hosts_added_;
+    absl::node_hash_set<HostSharedPtr> all_hosts_removed_;
 
   private:
     PrioritySetImpl& parent_;
-    std::unordered_set<uint32_t> priorities_;
+    absl::node_hash_set<uint32_t> priorities_;
   };
 };
 
 /**
  * Implementation of ClusterInfo that reads from JSON.
  */
-class ClusterInfoImpl : public ClusterInfo, protected Logger::Loggable<Logger::Id::upstream> {
+class ClusterInfoImpl : public ClusterInfo,
+                        public Event::DispatcherThreadDeletable,
+                        protected Logger::Loggable<Logger::Id::upstream> {
 public:
+  using HttpProtocolOptionsConfigImpl =
+      Envoy::Extensions::Upstreams::Http::ProtocolOptionsConfigImpl;
   ClusterInfoImpl(const envoy::config::cluster::v3::Cluster& config,
                   const envoy::config::core::v3::BindConfig& bind_config, Runtime::Loader& runtime,
                   TransportSocketMatcherPtr&& socket_matcher, Stats::ScopePtr&& stats_scope,
-                  bool added_via_api, ProtobufMessage::ValidationVisitor& validation_visitor,
-                  Server::Configuration::TransportSocketFactoryContext&);
+                  bool added_via_api, Server::Configuration::TransportSocketFactoryContext&);
 
-  static ClusterStats generateStats(Stats::Scope& scope);
-  static ClusterLoadReportStats generateLoadReportStats(Stats::Scope& scope);
-  static ClusterCircuitBreakersStats generateCircuitBreakersStats(Stats::Scope& scope,
-                                                                  const std::string& stat_prefix,
-                                                                  bool track_remaining);
-  static ClusterTimeoutBudgetStats generateTimeoutBudgetStats(Stats::Scope&);
+  static ClusterStats generateStats(Stats::Scope& scope,
+                                    const ClusterStatNames& cluster_stat_names);
+  static ClusterLoadReportStats
+  generateLoadReportStats(Stats::Scope& scope, const ClusterLoadReportStatNames& stat_names);
+  static ClusterCircuitBreakersStats
+  generateCircuitBreakersStats(Stats::Scope& scope, Stats::StatName prefix, bool track_remaining,
+                               const ClusterCircuitBreakersStatNames& stat_names);
+  static ClusterRequestResponseSizeStats
+  generateRequestResponseSizeStats(Stats::Scope&,
+                                   const ClusterRequestResponseSizeStatNames& stat_names);
+  static ClusterTimeoutBudgetStats
+  generateTimeoutBudgetStats(Stats::Scope&, const ClusterTimeoutBudgetStatNames& stat_names);
 
   // Upstream::ClusterInfo
   bool addedViaApi() const override { return added_via_api_; }
@@ -532,13 +550,23 @@ public:
   const absl::optional<std::chrono::milliseconds> idleTimeout() const override {
     return idle_timeout_;
   }
+  float perUpstreamPreconnectRatio() const override { return per_upstream_preconnect_ratio_; }
+  float peekaheadRatio() const override { return peekahead_ratio_; }
   uint32_t perConnectionBufferLimitBytes() const override {
     return per_connection_buffer_limit_bytes_;
   }
   uint64_t features() const override { return features_; }
-  const Http::Http1Settings& http1Settings() const override { return http1_settings_; }
+  const Http::Http1Settings& http1Settings() const override {
+    return http_protocol_options_->http1_settings_;
+  }
   const envoy::config::core::v3::Http2ProtocolOptions& http2Options() const override {
-    return http2_options_;
+    return http_protocol_options_->http2_options_;
+  }
+  const envoy::config::core::v3::Http3ProtocolOptions& http3Options() const override {
+    return http_protocol_options_->http3_options_;
+  }
+  const envoy::config::core::v3::HttpProtocolOptions& commonHttpProtocolOptions() const override {
+    return http_protocol_options_->common_http_protocol_options_;
   }
   ProtocolOptionsConfigConstSharedPtr
   extensionProtocolOptions(const std::string& name) const override;
@@ -556,22 +584,48 @@ public:
   lbRingHashConfig() const override {
     return lb_ring_hash_config_;
   }
+  const absl::optional<envoy::config::cluster::v3::Cluster::MaglevLbConfig>&
+  lbMaglevConfig() const override {
+    return lb_maglev_config_;
+  }
   const absl::optional<envoy::config::cluster::v3::Cluster::OriginalDstLbConfig>&
   lbOriginalDstConfig() const override {
     return lb_original_dst_config_;
+  }
+  const absl::optional<envoy::config::core::v3::TypedExtensionConfig>&
+  upstreamConfig() const override {
+    return upstream_config_;
   }
   bool maintenanceMode() const override;
   uint64_t maxRequestsPerConnection() const override { return max_requests_per_connection_; }
   uint32_t maxResponseHeadersCount() const override { return max_response_headers_count_; }
   const std::string& name() const override { return name_; }
+  const std::string& observabilityName() const override { return observability_name_; }
   ResourceManager& resourceManager(ResourcePriority priority) const override;
   TransportSocketMatcher& transportSocketMatcher() const override { return *socket_matcher_; }
   ClusterStats& stats() const override { return stats_; }
   Stats::Scope& statsScope() const override { return *stats_scope_; }
-  ClusterLoadReportStats& loadReportStats() const override { return load_report_stats_; }
-  const absl::optional<ClusterTimeoutBudgetStats>& timeoutBudgetStats() const override {
-    return timeout_budget_stats_;
+
+  ClusterRequestResponseSizeStatsOptRef requestResponseSizeStats() const override {
+    if (optional_cluster_stats_ == nullptr ||
+        optional_cluster_stats_->request_response_size_stats_ == nullptr) {
+      return absl::nullopt;
+    }
+
+    return std::ref(*(optional_cluster_stats_->request_response_size_stats_));
   }
+
+  ClusterLoadReportStats& loadReportStats() const override { return load_report_stats_; }
+
+  ClusterTimeoutBudgetStatsOptRef timeoutBudgetStats() const override {
+    if (optional_cluster_stats_ == nullptr ||
+        optional_cluster_stats_->timeout_budget_stats_ == nullptr) {
+      return absl::nullopt;
+    }
+
+    return std::ref(*(optional_cluster_stats_->timeout_budget_stats_));
+  }
+
   const Network::Address::InstanceConstSharedPtr& sourceAddress() const override {
     return source_address_;
   };
@@ -584,22 +638,36 @@ public:
   };
 
   bool drainConnectionsOnHostRemoval() const override { return drain_connections_on_host_removal_; }
+  bool connectionPoolPerDownstreamConnection() const override {
+    return connection_pool_per_downstream_connection_;
+  }
   bool warmHosts() const override { return warm_hosts_; }
   const absl::optional<envoy::config::core::v3::UpstreamHttpProtocolOptions>&
   upstreamHttpProtocolOptions() const override {
-    return upstream_http_protocol_options_;
+    return http_protocol_options_->upstream_http_protocol_options_;
   }
 
-  absl::optional<std::string> eds_service_name() const override { return eds_service_name_; }
+  absl::optional<std::string> edsServiceName() const override { return eds_service_name_; }
 
   void createNetworkFilterChain(Network::Connection&) const override;
-  Http::Protocol
+  std::vector<Http::Protocol>
   upstreamHttpProtocol(absl::optional<Http::Protocol> downstream_protocol) const override;
+
+  Http::Http1::CodecStats& http1CodecStats() const override;
+  Http::Http2::CodecStats& http2CodecStats() const override;
+  Http::Http3::CodecStats& http3CodecStats() const override;
+
+protected:
+  // Gets the retry budget percent/concurrency from the circuit breaker thresholds. If the retry
+  // budget message is specified, defaults will be filled in if either params are unspecified.
+  static std::pair<absl::optional<double>, absl::optional<uint32_t>>
+  getRetryBudgetParams(const envoy::config::cluster::v3::CircuitBreakers::Thresholds& thresholds);
 
 private:
   struct ResourceManagers {
     ResourceManagers(const envoy::config::cluster::v3::Cluster& config, Runtime::Loader& runtime,
-                     const std::string& cluster_name, Stats::Scope& stats_scope);
+                     const std::string& cluster_name, Stats::Scope& stats_scope,
+                     const ClusterCircuitBreakersStatNames& circuit_breakers_stat_names);
     ResourceManagerImplPtr load(const envoy::config::cluster::v3::Cluster& config,
                                 Runtime::Loader& runtime, const std::string& cluster_name,
                                 Stats::Scope& stats_scope,
@@ -608,26 +676,37 @@ private:
     using Managers = std::array<ResourceManagerImplPtr, NumResourcePriorities>;
 
     Managers managers_;
+    const ClusterCircuitBreakersStatNames& circuit_breakers_stat_names_;
+  };
+
+  struct OptionalClusterStats {
+    OptionalClusterStats(const envoy::config::cluster::v3::Cluster& config,
+                         Stats::Scope& stats_scope, const ClusterManager& manager);
+    const ClusterTimeoutBudgetStatsPtr timeout_budget_stats_;
+    const ClusterRequestResponseSizeStatsPtr request_response_size_stats_;
   };
 
   Runtime::Loader& runtime_;
   const std::string name_;
+  const std::string observability_name_;
   const envoy::config::cluster::v3::Cluster::DiscoveryType type_;
+  const absl::flat_hash_map<std::string, ProtocolOptionsConfigConstSharedPtr>
+      extension_protocol_options_;
+  const std::shared_ptr<const HttpProtocolOptionsConfigImpl> http_protocol_options_;
   const uint64_t max_requests_per_connection_;
   const uint32_t max_response_headers_count_;
   const std::chrono::milliseconds connect_timeout_;
   absl::optional<std::chrono::milliseconds> idle_timeout_;
+  const float per_upstream_preconnect_ratio_;
+  const float peekahead_ratio_;
   const uint32_t per_connection_buffer_limit_bytes_;
   TransportSocketMatcherPtr socket_matcher_;
   Stats::ScopePtr stats_scope_;
   mutable ClusterStats stats_;
   Stats::IsolatedStoreImpl load_report_stats_store_;
   mutable ClusterLoadReportStats load_report_stats_;
-  const absl::optional<ClusterTimeoutBudgetStats> timeout_budget_stats_;
+  const std::unique_ptr<OptionalClusterStats> optional_cluster_stats_;
   const uint64_t features_;
-  const Http::Http1Settings http1_settings_;
-  const envoy::config::core::v3::Http2ProtocolOptions http2_options_;
-  const std::map<std::string, ProtocolOptionsConfigConstSharedPtr> extension_protocol_options_;
   mutable ResourceManagers resource_managers_;
   const std::string maintenance_mode_runtime_key_;
   const Network::Address::InstanceConstSharedPtr source_address_;
@@ -635,7 +714,9 @@ private:
   absl::optional<envoy::config::cluster::v3::Cluster::LeastRequestLbConfig>
       lb_least_request_config_;
   absl::optional<envoy::config::cluster::v3::Cluster::RingHashLbConfig> lb_ring_hash_config_;
+  absl::optional<envoy::config::cluster::v3::Cluster::MaglevLbConfig> lb_maglev_config_;
   absl::optional<envoy::config::cluster::v3::Cluster::OriginalDstLbConfig> lb_original_dst_config_;
+  absl::optional<envoy::config::core::v3::TypedExtensionConfig> upstream_config_;
   const bool added_via_api_;
   LoadBalancerSubsetInfoImpl lb_subset_;
   const envoy::config::core::v3::Metadata metadata_;
@@ -643,6 +724,7 @@ private:
   const envoy::config::cluster::v3::Cluster::CommonLbConfig common_lb_config_;
   const Network::ConnectionSocket::OptionsSharedPtr cluster_socket_options_;
   const bool drain_connections_on_host_removal_;
+  const bool connection_pool_per_downstream_connection_;
   const bool warm_hosts_;
   const absl::optional<envoy::config::core::v3::UpstreamHttpProtocolOptions>
       upstream_http_protocol_options_;
@@ -650,6 +732,9 @@ private:
   const absl::optional<envoy::config::cluster::v3::Cluster::CustomClusterType> cluster_type_;
   const std::unique_ptr<Server::Configuration::CommonFactoryContext> factory_context_;
   std::vector<Network::FilterFactoryCb> filter_factories_;
+  mutable Http::Http1::CodecStats::AtomicPtr http1_codec_stats_;
+  mutable Http::Http2::CodecStats::AtomicPtr http2_codec_stats_;
+  mutable Http::Http3::CodecStats::AtomicPtr http3_codec_stats_;
 };
 
 /**
@@ -704,7 +789,6 @@ public:
   static std::tuple<HostsPerLocalityConstSharedPtr, HostsPerLocalityConstSharedPtr,
                     HostsPerLocalityConstSharedPtr>
   partitionHostsPerLocality(const HostsPerLocality& hosts);
-  Stats::SymbolTable& symbolTable() { return symbol_table_; }
   Config::ConstMetadataSharedPoolSharedPtr constMetadataSharedPool() {
     return const_metadata_shared_pool_;
   }
@@ -719,7 +803,7 @@ public:
 protected:
   ClusterImplBase(const envoy::config::cluster::v3::Cluster& cluster, Runtime::Loader& runtime,
                   Server::Configuration::TransportSocketFactoryContextImpl& factory_context,
-                  Stats::ScopePtr&& stats_scope, bool added_via_api);
+                  Stats::ScopePtr&& stats_scope, bool added_via_api, TimeSource& time_source);
 
   /**
    * Overridden by every concrete cluster. The cluster should do whatever pre-init is needed. E.g.,
@@ -759,6 +843,7 @@ protected:
   Outlier::DetectorSharedPtr outlier_detector_;
 
 protected:
+  TimeSource& time_source_;
   PrioritySetImpl priority_set_;
 
   void validateEndpointsForZoneAwareRouting(
@@ -772,8 +857,8 @@ private:
   std::function<void()> initialization_complete_callback_;
   uint64_t pending_initialize_health_checks_{};
   const bool local_cluster_;
-  Stats::SymbolTable& symbol_table_;
   Config::ConstMetadataSharedPoolSharedPtr const_metadata_shared_pool_;
+  Common::CallbackHandlePtr priority_update_cb_;
 };
 
 using ClusterImplBaseSharedPtr = std::shared_ptr<ClusterImplBase>;
@@ -800,7 +885,7 @@ public:
   void registerHostForPriority(
       const std::string& hostname, Network::Address::InstanceConstSharedPtr address,
       const envoy::config::endpoint::v3::LocalityLbEndpoints& locality_lb_endpoint,
-      const envoy::config::endpoint::v3::LbEndpoint& lb_endpoint);
+      const envoy::config::endpoint::v3::LbEndpoint& lb_endpoint, TimeSource& time_source);
 
   void registerHostForPriority(
       const HostSharedPtr& host,
@@ -812,9 +897,6 @@ public:
                            const absl::optional<HostVector>& hosts_removed,
                            const absl::optional<Upstream::Host::HealthFlag> health_checker_flag,
                            absl::optional<uint32_t> overprovisioning_factor = absl::nullopt);
-
-  // Returns the size of the current cluster priority state.
-  size_t size() const { return priority_state_.size(); }
 
   // Returns the saved priority state.
   PriorityState& priorityState() { return priority_state_; }
@@ -847,13 +929,15 @@ protected:
    * priority.
    * @param updated_hosts is used to aggregate the new state of all hosts across priority, and will
    * be updated with the hosts that remain in this priority after the update.
-   * @param all_hosts all known hosts prior to this host update.
+   * @param all_hosts all known hosts prior to this host update across all priorities.
+   * @param all_new_hosts addresses of all hosts in the new configuration across all priorities.
    * @return whether the hosts for the priority changed.
    */
   bool updateDynamicHostList(const HostVector& new_hosts, HostVector& current_priority_hosts,
                              HostVector& hosts_added_to_current_priority,
                              HostVector& hosts_removed_from_current_priority,
-                             HostMap& updated_hosts, const HostMap& all_hosts);
+                             HostMap& updated_hosts, const HostMap& all_hosts,
+                             const absl::flat_hash_set<std::string>& all_new_hosts);
 };
 
 /**

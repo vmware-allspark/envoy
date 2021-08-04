@@ -61,9 +61,9 @@ TEST_P(BufferIntegrationTest, RouterRequestPopulateContentLength) {
   ASSERT_NE(content_length, nullptr);
   EXPECT_EQ(content_length->value().getStringView(), "9");
 
-  response->waitForEndStream();
+  ASSERT_TRUE(response->waitForEndStream());
   ASSERT_TRUE(response->complete());
-  EXPECT_EQ("200", response->headers().Status()->value().getStringView());
+  EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
 TEST_P(BufferIntegrationTest, RouterRequestPopulateContentLengthOnTrailers) {
@@ -90,12 +90,19 @@ TEST_P(BufferIntegrationTest, RouterRequestPopulateContentLengthOnTrailers) {
   ASSERT_NE(content_length, nullptr);
   EXPECT_EQ(content_length->value().getStringView(), "10");
 
-  response->waitForEndStream();
+  ASSERT_TRUE(response->waitForEndStream());
   ASSERT_TRUE(response->complete());
-  EXPECT_EQ("200", response->headers().Status()->value().getStringView());
+  EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
 TEST_P(BufferIntegrationTest, RouterRequestBufferLimitExceeded) {
+  // Make sure the connection isn't closed during request upload.
+  // Without a large drain-close it's possible that the local reply will be sent
+  // during request upload, and continued upload will result in TCP reset before
+  // the response is read.
+  config_helper_.addConfigModifier(
+      [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+             hcm) { hcm.mutable_delayed_close_timeout()->set_seconds(2000 * 1000); });
   config_helper_.addFilter(ConfigHelper::smallBufferFilter());
   initialize();
 
@@ -110,9 +117,9 @@ TEST_P(BufferIntegrationTest, RouterRequestBufferLimitExceeded) {
                                      {"x-envoy-retry-on", "5xx"}},
       1024 * 65);
 
-  response->waitForEndStream();
+  ASSERT_TRUE(response->waitForEndStream());
   ASSERT_TRUE(response->complete());
-  EXPECT_EQ("413", response->headers().Status()->value().getStringView());
+  EXPECT_EQ("413", response->headers().getStatusValue());
 }
 
 ConfigHelper::HttpModifierFunction overrideConfig(const std::string& json_config) {
@@ -152,9 +159,9 @@ TEST_P(BufferIntegrationTest, RouteDisabled) {
   waitForNextUpstreamRequest();
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
 
-  response->waitForEndStream();
+  ASSERT_TRUE(response->waitForEndStream());
   ASSERT_TRUE(response->complete());
-  EXPECT_EQ("200", response->headers().Status()->value().getStringView());
+  EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
 TEST_P(BufferIntegrationTest, RouteOverride) {
@@ -178,9 +185,9 @@ TEST_P(BufferIntegrationTest, RouteOverride) {
   waitForNextUpstreamRequest();
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
 
-  response->waitForEndStream();
+  ASSERT_TRUE(response->waitForEndStream());
   ASSERT_TRUE(response->complete());
-  EXPECT_EQ("200", response->headers().Status()->value().getStringView());
+  EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
 } // namespace

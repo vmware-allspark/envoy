@@ -9,6 +9,7 @@
 #include "extensions/access_loggers/well_known_names.h"
 #include "extensions/common/wasm/wasm.h"
 
+#include "test/extensions/common/wasm/wasm_runtime.h"
 #include "test/mocks/server/mocks.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/printers.h"
@@ -22,30 +23,21 @@ namespace Extensions {
 namespace AccessLoggers {
 namespace Wasm {
 
-class TestFactoryContext : public NiceMock<Server::Configuration::MockFactoryContext> {
+class TestFactoryContext : public NiceMock<Server::Configuration::MockServerFactoryContext> {
 public:
   TestFactoryContext(Api::Api& api, Stats::Scope& scope) : api_(api), scope_(scope) {}
   Api::Api& api() override { return api_; }
   Stats::Scope& scope() override { return scope_; }
-  const envoy::config::core::v3::Metadata& listenerMetadata() const override {
-    return listener_metadata_;
-  }
 
 private:
   Api::Api& api_;
   Stats::Scope& scope_;
-  envoy::config::core::v3::Metadata listener_metadata_;
 };
 
 class WasmAccessLogConfigTest : public testing::TestWithParam<std::string> {};
 
 INSTANTIATE_TEST_SUITE_P(Runtimes, WasmAccessLogConfigTest,
-                         testing::Values("v8"
-#if defined(ENVOY_WASM_WAVM)
-                                         ,
-                                         "wavm"
-#endif
-                                         ));
+                         Envoy::Extensions::Common::Wasm::runtime_values);
 
 TEST_P(WasmAccessLogConfigTest, CreateWasmFromEmpty) {
   auto factory =
@@ -57,15 +49,21 @@ TEST_P(WasmAccessLogConfigTest, CreateWasmFromEmpty) {
   ASSERT_NE(nullptr, message);
 
   AccessLog::FilterPtr filter;
-  NiceMock<Server::Configuration::MockFactoryContext> context;
+  NiceMock<Server::Configuration::MockServerFactoryContext> context;
 
   AccessLog::InstanceSharedPtr instance;
   EXPECT_THROW_WITH_MESSAGE(
       instance = factory->createAccessLogInstance(*message, std::move(filter), context),
-      Common::Wasm::WasmException, "Failed to load WASM code from ");
+      Common::Wasm::WasmException, "Unable to create Wasm access log ");
 }
 
 TEST_P(WasmAccessLogConfigTest, CreateWasmFromWASM) {
+#if defined(__aarch64__)
+  // TODO(PiotrSikora): There are no Emscripten releases for arm64.
+  if (GetParam() != "null") {
+    return;
+  }
+#endif
   auto factory =
       Registry::FactoryRegistry<Server::Configuration::AccessLogInstanceFactory>::getFactory(
           AccessLogNames::get().Wasm);
@@ -74,9 +72,18 @@ TEST_P(WasmAccessLogConfigTest, CreateWasmFromWASM) {
   envoy::extensions::access_loggers::wasm::v3::WasmAccessLog config;
   config.mutable_config()->mutable_vm_config()->set_runtime(
       absl::StrCat("envoy.wasm.runtime.", GetParam()));
-  config.mutable_config()->mutable_vm_config()->mutable_code()->mutable_local()->set_filename(
-      TestEnvironment::substitute(
-          "{{ test_rundir }}/test/extensions/access_loggers/wasm/test_data/logging.wasm"));
+  std::string code;
+  if (GetParam() != "null") {
+    code = TestEnvironment::readFileToStringForTest(TestEnvironment::substitute(
+        "{{ test_rundir }}/test/extensions/access_loggers/wasm/test_data/test_cpp.wasm"));
+  } else {
+    code = "AccessLoggerTestCpp";
+  }
+  config.mutable_config()->mutable_vm_config()->mutable_code()->mutable_local()->set_inline_bytes(
+      code);
+  // Test Any configuration.
+  ProtobufWkt::Struct some_proto;
+  config.mutable_config()->mutable_vm_config()->mutable_configuration()->PackFrom(some_proto);
 
   AccessLog::FilterPtr filter;
   Stats::IsolatedStoreImpl stats_store;
@@ -87,6 +94,16 @@ TEST_P(WasmAccessLogConfigTest, CreateWasmFromWASM) {
       factory->createAccessLogInstance(config, std::move(filter), context);
   EXPECT_NE(nullptr, instance);
   EXPECT_NE(nullptr, dynamic_cast<WasmAccessLog*>(instance.get()));
+  Http::TestRequestHeaderMapImpl request_header;
+  Http::TestResponseHeaderMapImpl response_header;
+  Http::TestResponseTrailerMapImpl response_trailer;
+  StreamInfo::MockStreamInfo log_stream_info;
+  instance->log(&request_header, &response_header, &response_trailer, log_stream_info);
+
+  filter = std::make_unique<NiceMock<AccessLog::MockFilter>>();
+  AccessLog::InstanceSharedPtr filter_instance =
+      factory->createAccessLogInstance(config, std::move(filter), context);
+  filter_instance->log(&request_header, &response_header, &response_trailer, log_stream_info);
 }
 
 } // namespace Wasm
