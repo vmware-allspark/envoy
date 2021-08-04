@@ -63,9 +63,11 @@ RouteConstSharedPtr RouteEntryImplBase::clusterEntry(uint64_t random_value,
   const auto& cluster_header = clusterHeader();
   if (!cluster_header.get().empty()) {
     const auto& headers = metadata.headers();
-    const auto* entry = headers.get(cluster_header);
-    if (entry != nullptr) {
-      return std::make_shared<DynamicRouteEntry>(*this, entry->value().getStringView());
+    const auto entry = headers.get(cluster_header);
+    if (!entry.empty()) {
+      // This is an implicitly untrusted header, so per the API documentation only the first
+      // value is used.
+      return std::make_shared<DynamicRouteEntry>(*this, entry[0]->value().getStringView());
     }
 
     return nullptr;
@@ -224,7 +226,7 @@ FilterStatus Router::messageBegin(MessageMetadataSharedPtr metadata) {
   route_entry_ = route_->routeEntry();
   const std::string& cluster_name = route_entry_->clusterName();
 
-  Upstream::ThreadLocalCluster* cluster = cluster_manager_.get(cluster_name);
+  Upstream::ThreadLocalCluster* cluster = cluster_manager_.getThreadLocalCluster(cluster_name);
   if (!cluster) {
     ENVOY_STREAM_LOG(debug, "unknown cluster '{}'", *callbacks_, cluster_name);
     stats_.unknown_cluster_.inc();
@@ -237,6 +239,19 @@ FilterStatus Router::messageBegin(MessageMetadataSharedPtr metadata) {
   cluster_ = cluster->info();
   ENVOY_STREAM_LOG(debug, "cluster '{}' match for method '{}'", *callbacks_, cluster_name,
                    metadata->methodName());
+  switch (metadata->messageType()) {
+  case MessageType::Call:
+    incClusterScopeCounter({upstream_rq_call_});
+    break;
+
+  case MessageType::Oneway:
+    incClusterScopeCounter({upstream_rq_oneway_});
+    break;
+
+  default:
+    incClusterScopeCounter({upstream_rq_invalid_type_});
+    break;
+  }
 
   if (cluster_->maintenanceMode()) {
     stats_.upstream_rq_maintenance_mode_.inc();
@@ -260,8 +275,14 @@ FilterStatus Router::messageBegin(MessageMetadataSharedPtr metadata) {
                                         : callbacks_->downstreamProtocolType();
   ASSERT(protocol != ProtocolType::Auto);
 
-  Tcp::ConnectionPool::Instance* conn_pool = cluster_manager_.tcpConnPoolForCluster(
-      cluster_name, Upstream::ResourcePriority::Default, this);
+  if (callbacks_->downstreamTransportType() == TransportType::Framed &&
+      transport == TransportType::Framed && callbacks_->downstreamProtocolType() == protocol &&
+      protocol != ProtocolType::Twitter) {
+    passthrough_supported_ = true;
+  }
+
+  Tcp::ConnectionPool::Instance* conn_pool =
+      cluster->tcpConnPool(Upstream::ResourcePriority::Default, this);
   if (!conn_pool) {
     stats_.no_healthy_upstream_.inc();
     callbacks_->sendLocalReply(
@@ -330,6 +351,24 @@ void Router::onUpstreamData(Buffer::Instance& data, bool end_stream) {
     ThriftFilters::ResponseStatus status = callbacks_->upstreamData(data);
     if (status == ThriftFilters::ResponseStatus::Complete) {
       ENVOY_STREAM_LOG(debug, "response complete", *callbacks_);
+      switch (callbacks_->responseMetadata()->messageType()) {
+      case MessageType::Reply:
+        incClusterScopeCounter({upstream_resp_reply_});
+        if (callbacks_->responseSuccess()) {
+          incClusterScopeCounter({upstream_resp_reply_success_});
+        } else {
+          incClusterScopeCounter({upstream_resp_reply_error_});
+        }
+        break;
+
+      case MessageType::Exception:
+        incClusterScopeCounter({upstream_resp_exception_});
+        break;
+
+      default:
+        incClusterScopeCounter({upstream_resp_invalid_type_});
+        break;
+      }
       upstream_request_->onResponseComplete();
       cleanup();
       return;
@@ -344,8 +383,7 @@ void Router::onUpstreamData(Buffer::Instance& data, bool end_stream) {
     // Response is incomplete, but no more data is coming.
     ENVOY_STREAM_LOG(debug, "response underflow", *callbacks_);
     upstream_request_->onResponseComplete();
-    upstream_request_->onResetStream(
-        Tcp::ConnectionPool::PoolFailureReason::RemoteConnectionFailure);
+    upstream_request_->onResetStream(ConnectionPool::PoolFailureReason::RemoteConnectionFailure);
     cleanup();
   }
 }
@@ -356,13 +394,11 @@ void Router::onEvent(Network::ConnectionEvent event) {
   switch (event) {
   case Network::ConnectionEvent::RemoteClose:
     ENVOY_STREAM_LOG(debug, "upstream remote close", *callbacks_);
-    upstream_request_->onResetStream(
-        Tcp::ConnectionPool::PoolFailureReason::RemoteConnectionFailure);
+    upstream_request_->onResetStream(ConnectionPool::PoolFailureReason::RemoteConnectionFailure);
     break;
   case Network::ConnectionEvent::LocalClose:
     ENVOY_STREAM_LOG(debug, "upstream local close", *callbacks_);
-    upstream_request_->onResetStream(
-        Tcp::ConnectionPool::PoolFailureReason::LocalConnectionFailure);
+    upstream_request_->onResetStream(ConnectionPool::PoolFailureReason::LocalConnectionFailure);
     break;
   default:
     // Connected is consumed by the connection pool.
@@ -413,6 +449,10 @@ FilterStatus Router::UpstreamRequest::start() {
     return FilterStatus::StopIteration;
   }
 
+  if (upstream_host_ == nullptr) {
+    return FilterStatus::StopIteration;
+  }
+
   return FilterStatus::Continue;
 }
 
@@ -434,7 +474,7 @@ void Router::UpstreamRequest::releaseConnection(const bool close) {
 
 void Router::UpstreamRequest::resetStream() { releaseConnection(true); }
 
-void Router::UpstreamRequest::onPoolFailure(Tcp::ConnectionPool::PoolFailureReason reason,
+void Router::UpstreamRequest::onPoolFailure(ConnectionPool::PoolFailureReason reason,
                                             Upstream::HostDescriptionConstSharedPtr host) {
   conn_pool_handle_ = nullptr;
 
@@ -482,9 +522,14 @@ void Router::UpstreamRequest::onRequestStart(bool continue_decoding) {
   }
 }
 
-void Router::UpstreamRequest::onRequestComplete() { request_complete_ = true; }
+void Router::UpstreamRequest::onRequestComplete() {
+  Event::Dispatcher& dispatcher = parent_.callbacks_->dispatcher();
+  downstream_request_complete_time_ = dispatcher.timeSource().monotonicTime();
+  request_complete_ = true;
+}
 
 void Router::UpstreamRequest::onResponseComplete() {
+  chargeResponseTiming();
   response_complete_ = true;
   conn_state_ = nullptr;
   conn_data_.reset();
@@ -494,7 +539,7 @@ void Router::UpstreamRequest::onUpstreamHostSelected(Upstream::HostDescriptionCo
   upstream_host_ = host;
 }
 
-void Router::UpstreamRequest::onResetStream(Tcp::ConnectionPool::PoolFailureReason reason) {
+void Router::UpstreamRequest::onResetStream(ConnectionPool::PoolFailureReason reason) {
   if (metadata_->messageType() == MessageType::Oneway) {
     // For oneway requests, we should not attempt a response. Reset the downstream to signal
     // an error.
@@ -502,27 +547,30 @@ void Router::UpstreamRequest::onResetStream(Tcp::ConnectionPool::PoolFailureReas
     return;
   }
 
+  chargeResponseTiming();
+
   switch (reason) {
-  case Tcp::ConnectionPool::PoolFailureReason::Overflow:
+  case ConnectionPool::PoolFailureReason::Overflow:
     parent_.callbacks_->sendLocalReply(
-        AppException(
-            AppExceptionType::InternalError,
-            fmt::format("too many connections to '{}'", upstream_host_->address()->asString())),
+        AppException(AppExceptionType::InternalError,
+                     "thrift upstream request: too many connections"),
         true);
     break;
-  case Tcp::ConnectionPool::PoolFailureReason::LocalConnectionFailure:
+  case ConnectionPool::PoolFailureReason::LocalConnectionFailure:
     // Should only happen if we closed the connection, due to an error condition, in which case
     // we've already handled any possible downstream response.
     parent_.callbacks_->resetDownstreamConnection();
     break;
-  case Tcp::ConnectionPool::PoolFailureReason::RemoteConnectionFailure:
-  case Tcp::ConnectionPool::PoolFailureReason::Timeout:
+  case ConnectionPool::PoolFailureReason::RemoteConnectionFailure:
+  case ConnectionPool::PoolFailureReason::Timeout:
     // TODO(zuercher): distinguish between these cases where appropriate (particularly timeout)
     if (!response_started_) {
       parent_.callbacks_->sendLocalReply(
           AppException(
               AppExceptionType::InternalError,
-              fmt::format("connection failure '{}'", upstream_host_->address()->asString())),
+              fmt::format("connection failure '{}'", (upstream_host_ != nullptr)
+                                                         ? upstream_host_->address()->asString()
+                                                         : "to upstream")),
           true);
       return;
     }
@@ -533,6 +581,20 @@ void Router::UpstreamRequest::onResetStream(Tcp::ConnectionPool::PoolFailureReas
   default:
     NOT_REACHED_GCOVR_EXCL_LINE;
   }
+}
+
+void Router::UpstreamRequest::chargeResponseTiming() {
+  if (charged_response_timing_) {
+    return;
+  }
+  charged_response_timing_ = true;
+  Event::Dispatcher& dispatcher = parent_.callbacks_->dispatcher();
+  const std::chrono::milliseconds response_time =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          dispatcher.timeSource().monotonicTime() - downstream_request_complete_time_);
+  const uint64_t count = response_time.count();
+  parent_.recordClusterScopeHistogram({parent_.upstream_rq_time_},
+                                      Stats::Histogram::Unit::Milliseconds, count);
 }
 
 } // namespace Router
