@@ -3,6 +3,7 @@
 #include <string>
 
 #include "envoy/config/listener/v3/listener.pb.h"
+#include "envoy/config/listener/v3/listener.pb.validate.h"
 
 #include "common/protobuf/utility.h"
 
@@ -12,9 +13,10 @@ namespace Envoy {
 namespace Server {
 namespace {
 
-inline envoy::config::listener::v3::Listener parseListenerFromV2Yaml(const std::string& yaml) {
+inline envoy::config::listener::v3::Listener parseListenerFromV3Yaml(const std::string& yaml,
+                                                                     bool avoid_boosting = true) {
   envoy::config::listener::v3::Listener listener;
-  TestUtility::loadFromYaml(yaml, listener, true);
+  TestUtility::loadFromYamlAndValidate(yaml, listener, true, avoid_boosting);
   return listener;
 }
 

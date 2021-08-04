@@ -1,10 +1,10 @@
-licenses(["notice"])  # Apache 2
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_library",
     "envoy_package",
 )
+
+licenses(["notice"])  # Apache 2
 
 envoy_package()
 
@@ -24,5 +24,8 @@ envoy_cc_library(
         "url_parse.h",
         "url_parse_internal.h",
     ],
-    deps = ["//source/common/common:assert_lib"],
+    deps = [
+        "//source/common/common:assert_lib",
+        "//source/common/common:mem_block_builder_lib",
+    ],
 )
