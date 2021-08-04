@@ -5,8 +5,11 @@
 
 #include "envoy/http/header_map.h"
 #include "envoy/network/connection.h"
+#include "envoy/tracing/trace_reason.h"
 
 #include "common/http/conn_manager_impl.h"
+#include "common/http/http1/codec_stats.h"
+#include "common/http/http2/codec_stats.h"
 
 namespace Envoy {
 namespace Http {
@@ -36,6 +39,8 @@ public:
   static ServerConnectionPtr
   autoCreateCodec(Network::Connection& connection, const Buffer::Instance& data,
                   ServerConnectionCallbacks& callbacks, Stats::Scope& scope,
+                  Random::RandomGenerator& random, Http1::CodecStats::AtomicPtr& http1_codec_stats,
+                  Http2::CodecStats::AtomicPtr& http2_codec_stats,
                   const Http1Settings& http1_settings,
                   const envoy::config::core::v3::Http2ProtocolOptions& http2_options,
                   uint32_t max_request_headers_kb, uint32_t max_request_headers_count,
@@ -60,21 +65,30 @@ public:
 
   static void mutateResponseHeaders(ResponseHeaderMap& response_headers,
                                     const RequestHeaderMap* request_headers,
-                                    const RequestIDExtensionSharedPtr& rid_extension,
-                                    const std::string& via);
+                                    ConnectionManagerConfig& config, const std::string& via);
 
-  // Sanitize the path in the header map if forced by config.
+  enum class NormalizePathAction {
+    Continue = 0,
+    Reject = 1,
+    Redirect = 2,
+  };
+
+  // Sanitize the path in the header map if the path exists and it is forced by config.
   // Side affect: the string view of Path header is invalidated.
-  // Return false if error happens during the sanitization.
-  static bool maybeNormalizePath(RequestHeaderMap& request_headers,
-                                 const ConnectionManagerConfig& config);
+  // Returns the action that should taken based on the results of path normalization.
+  static NormalizePathAction maybeNormalizePath(RequestHeaderMap& request_headers,
+                                                const ConnectionManagerConfig& config);
+
+  static void maybeNormalizeHost(RequestHeaderMap& request_headers,
+                                 const ConnectionManagerConfig& config, uint32_t port);
 
   /**
    * Mutate request headers if request needs to be traced.
+   * @return the trace reason selected after header mutation to be stored in stream info.
    */
-  static void mutateTracingRequestHeader(RequestHeaderMap& request_headers,
-                                         Runtime::Loader& runtime, ConnectionManagerConfig& config,
-                                         const Router::Route* route);
+  ABSL_MUST_USE_RESULT static Tracing::Reason
+  mutateTracingRequestHeader(RequestHeaderMap& request_headers, Runtime::Loader& runtime,
+                             ConnectionManagerConfig& config, const Router::Route* route);
 
 private:
   static void mutateXfccRequestHeader(RequestHeaderMap& request_headers,

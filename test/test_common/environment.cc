@@ -5,7 +5,6 @@
 #include <regex>
 #include <sstream>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "envoy/common/platform.h"
@@ -17,12 +16,20 @@
 #include "common/common/utility.h"
 #include "common/filesystem/directory.h"
 
+#include "absl/container/node_hash_map.h"
+
+#ifdef ENVOY_HANDLE_SIGNALS
+#include "common/signal/signal_action.h"
+#endif
+
 #include "server/options_impl.h"
 
 #include "test/test_common/file_system_for_test.h"
 #include "test/test_common/network_utility.h"
 
+#include "absl/debugging/symbolize.h"
 #include "absl/strings/match.h"
+#include "absl/strings/str_format.h"
 #include "gtest/gtest.h"
 #include "spdlog/spdlog.h"
 
@@ -38,13 +45,13 @@ std::string makeTempDir(std::string basename_template) {
   std::string name_template = "c:\\Windows\\TEMP\\" + basename_template;
   char* dirname = ::_mktemp(&name_template[0]);
   RELEASE_ASSERT(dirname != nullptr, fmt::format("failed to create tempdir from template: {} {}",
-                                                 name_template, strerror(errno)));
+                                                 name_template, errorDetails(errno)));
   TestEnvironment::createPath(dirname);
 #else
   std::string name_template = "/tmp/" + basename_template;
   char* dirname = ::mkdtemp(&name_template[0]);
   RELEASE_ASSERT(dirname != nullptr, fmt::format("failed to create tempdir from template: {} {}",
-                                                 name_template, strerror(errno)));
+                                                 name_template, errorDetails(errno)));
 #endif
   return std::string(dirname);
 }
@@ -146,16 +153,8 @@ void TestEnvironment::removePath(const std::string& path) {
 }
 
 void TestEnvironment::renameFile(const std::string& old_name, const std::string& new_name) {
-#ifdef WIN32
-  // use MoveFileEx, since ::rename will not overwrite an existing file. See
-  // https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/rename-wrename?view=vs-2017
-  const BOOL rc = ::MoveFileEx(old_name.c_str(), new_name.c_str(), MOVEFILE_REPLACE_EXISTING);
-  ASSERT_NE(0, rc);
-#else
-  const int rc = ::rename(old_name.c_str(), new_name.c_str());
-  ASSERT_EQ(0, rc);
-#endif
-};
+  Filesystem::fileSystemForTest().renameFile(old_name, new_name);
+}
 
 void TestEnvironment::createSymlink(const std::string& target, const std::string& link) {
 #ifdef WIN32
@@ -188,6 +187,31 @@ std::string TestEnvironment::getCheckedEnvVar(const std::string& var) {
   return optional.value();
 }
 
+void TestEnvironment::initializeTestMain(char* program_name) {
+#ifdef WIN32
+  _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+
+  _set_invalid_parameter_handler([](const wchar_t* expression, const wchar_t* function,
+                                    const wchar_t* file, unsigned int line,
+                                    uintptr_t pReserved) {});
+
+  WSADATA wsa_data;
+  const WORD version_requested = MAKEWORD(2, 2);
+  RELEASE_ASSERT(WSAStartup(version_requested, &wsa_data) == 0, "");
+#endif
+
+#ifdef __APPLE__
+  UNREFERENCED_PARAMETER(program_name);
+#else
+  absl::InitializeSymbolizer(program_name);
+#endif
+
+#ifdef ENVOY_HANDLE_SIGNALS
+  // Enabled by default. Control with "bazel --define=signal_trace=disabled"
+  static Envoy::SignalAction handle_sigs;
+#endif
+}
+
 void TestEnvironment::initializeOptions(int argc, char** argv) {
   argc_ = argc;
   argv_ = argv;
@@ -212,10 +236,12 @@ std::vector<Network::Address::IpVersion> TestEnvironment::getIpVersionsForTest()
     if (TestEnvironment::shouldRunTestForIpVersion(version)) {
       parameters.push_back(version);
       if (!Network::Test::supportsIpVersion(version)) {
-        ENVOY_LOG_TO_LOGGER(Logger::Registry::getLog(Logger::Id::testing), warn,
-                            "Testing with IP{} addresses may not be supported on this machine. If "
-                            "testing fails, set the environment variable ENVOY_IP_TEST_VERSIONS.",
-                            Network::Test::addressVersionAsString(version));
+        const auto version_string = Network::Test::addressVersionAsString(version);
+        ENVOY_LOG_TO_LOGGER(
+            Logger::Registry::getLog(Logger::Id::testing), warn,
+            "Testing with IP{} addresses may not be supported on this machine. If "
+            "testing fails, set the environment variable ENVOY_IP_TEST_VERSIONS to 'v{}only'.",
+            version_string, version_string);
       }
     }
   }
@@ -248,7 +274,7 @@ const std::string TestEnvironment::unixDomainSocketDirectory() {
 
 std::string TestEnvironment::substitute(const std::string& str,
                                         Network::Address::IpVersion version) {
-  const std::unordered_map<std::string, std::string> path_map = {
+  const absl::node_hash_map<std::string, std::string> path_map = {
       {"test_tmpdir", TestEnvironment::temporaryDirectory()},
       {"test_udsdir", TestEnvironment::unixDomainSocketDirectory()},
       {"test_rundir", runfiles_ != nullptr ? TestEnvironment::runfilesDirectory() : "invalid"},
@@ -259,6 +285,11 @@ std::string TestEnvironment::substitute(const std::string& str,
     const std::regex port_regex("\\{\\{ " + it.first + " \\}\\}");
     out_json_string = std::regex_replace(out_json_string, port_regex, it.second);
   }
+
+  // Substitute platform specific null device.
+  const std::regex null_device_regex(R"(\{\{ null_device_path \}\})");
+  out_json_string = std::regex_replace(out_json_string, null_device_regex,
+                                       std::string(Platform::null_device_path).c_str());
 
   // Substitute IP loopback addresses.
   const std::regex loopback_address_regex(R"(\{\{ ip_loopback_address \}\})");
@@ -301,19 +332,8 @@ std::string TestEnvironment::temporaryFileSubstitute(const std::string& path,
   return temporaryFileSubstitute(path, ParamMap(), port_map, version);
 }
 
-std::string TestEnvironment::readFileToStringForTest(const std::string& filename,
-                                                     bool require_existence) {
-  std::ifstream file(filename, std::ios::binary);
-  if (file.fail()) {
-    if (!require_existence) {
-      return "";
-    }
-    RELEASE_ASSERT(false, absl::StrCat("failed to open: ", filename));
-  }
-
-  std::stringstream file_string_stream;
-  file_string_stream << file.rdbuf();
-  return file_string_stream.str();
+std::string TestEnvironment::readFileToStringForTest(const std::string& filename) {
+  return Filesystem::fileSystemForTest().fileReadToEnd(filename);
 }
 
 std::string TestEnvironment::temporaryFileSubstitute(const std::string& path,
@@ -342,13 +362,13 @@ std::string TestEnvironment::temporaryFileSubstitute(const std::string& path,
   out_json_string = substitute(out_json_string, version);
 
   auto name = Filesystem::fileSystemForTest().splitPathFromFilename(path).file_;
-  const std::string extension = absl::EndsWith(name, ".yaml")
-                                    ? ".yaml"
-                                    : absl::EndsWith(name, ".pb_text") ? ".pb_text" : ".json";
+  const std::string extension = absl::EndsWith(name, ".yaml")      ? ".yaml"
+                                : absl::EndsWith(name, ".pb_text") ? ".pb_text"
+                                                                   : ".json";
   const std::string out_json_path =
       TestEnvironment::temporaryPath(name) + ".with.ports" + extension;
   {
-    std::ofstream out_json_file(out_json_path);
+    std::ofstream out_json_file(out_json_path, std::ios::binary);
     out_json_file << out_json_string;
   }
   return out_json_path;
@@ -380,11 +400,15 @@ std::string TestEnvironment::writeStringToFileForTest(const std::string& filenam
   const std::string out_path =
       fully_qualified_path ? filename : TestEnvironment::temporaryPath(filename);
   unlink(out_path.c_str());
-  {
-    std::ofstream out_file(out_path, std::ios_base::binary);
-    RELEASE_ASSERT(!out_file.fail(), "");
-    out_file << contents;
-  }
+
+  Filesystem::FilePathAndType out_file_info{Filesystem::DestinationType::File, out_path};
+  Filesystem::FilePtr file = Filesystem::fileSystemForTest().createFile(out_file_info);
+  const Filesystem::FlagSet flags{1 << Filesystem::File::Operation::Write |
+                                  1 << Filesystem::File::Operation::Create};
+  const Api::IoCallBoolResult open_result = file->open(flags);
+  EXPECT_TRUE(open_result.rc_);
+  const Api::IoCallSizeResult result = file->write(contents);
+  EXPECT_EQ(contents.length(), result.rc_);
   return out_path;
 }
 

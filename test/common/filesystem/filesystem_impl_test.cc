@@ -1,7 +1,9 @@
 #include <chrono>
+#include <filesystem>
 #include <string>
 
 #include "common/common/assert.h"
+#include "common/common/utility.h"
 #include "common/filesystem/filesystem_impl.h"
 
 #include "test/test_common/environment.h"
@@ -18,7 +20,7 @@ static constexpr FlagSet DefaultFlags{
 
 class FileSystemImplTest : public testing::Test {
 protected:
-  int getFd(File* file) {
+  filesystem_os_id_t getFd(File* file) {
 #ifdef WIN32
     auto file_impl = dynamic_cast<FileImplWin32*>(file);
 #else
@@ -62,11 +64,7 @@ TEST_F(FileSystemImplTest, DirectoryExists) {
 }
 
 TEST_F(FileSystemImplTest, FileSize) {
-#ifdef WIN32
-  EXPECT_EQ(0, file_system_.fileSize("NUL"));
-#else
-  EXPECT_EQ(0, file_system_.fileSize("/dev/null"));
-#endif
+  EXPECT_EQ(0, file_system_.fileSize(std::string(Platform::null_device_path)));
   EXPECT_EQ(-1, file_system_.fileSize("/dev/blahblahblah"));
   const std::string data = "test string\ntest";
   const std::string file_path = TestEnvironment::writeStringToFileForTest("test_envoy", data);
@@ -103,7 +101,17 @@ TEST_F(FileSystemImplTest, FileReadToEndDoesNotExist) {
                EnvoyException);
 }
 
-TEST_F(FileSystemImplTest, FileReadToEndBlacklisted) {
+TEST_F(FileSystemImplTest, FileReadToEndNotReadable) {
+  const std::string data = "test string\ntest";
+  const std::string file_path = TestEnvironment::writeStringToFileForTest("test_envoy", data);
+
+  std::filesystem::permissions(file_path, std::filesystem::perms::owner_all,
+                               std::filesystem::perm_options::remove);
+  EXPECT_THROW(file_system_.fileReadToEnd(TestEnvironment::temporaryPath("envoy_this_not_exist")),
+               EnvoyException);
+}
+
+TEST_F(FileSystemImplTest, FileReadToEndDenylisted) {
   EXPECT_THROW(file_system_.fileReadToEnd("/dev/urandom"), EnvoyException);
   EXPECT_THROW(file_system_.fileReadToEnd("/proc/cpuinfo"), EnvoyException);
   EXPECT_THROW(file_system_.fileReadToEnd("/sys/block/sda/dev"), EnvoyException);
@@ -117,7 +125,7 @@ TEST_F(FileSystemImplTest, CanonicalPathSuccess) { EXPECT_EQ("/", canonicalPath(
 TEST_F(FileSystemImplTest, CanonicalPathFail) {
   const Api::SysCallStringResult result = canonicalPath("/_some_non_existent_file");
   EXPECT_TRUE(result.rc_.empty());
-  EXPECT_STREQ("No such file or directory", ::strerror(result.errno_));
+  EXPECT_EQ("No such file or directory", errorDetails(result.errno_));
 }
 #endif
 
@@ -216,11 +224,40 @@ TEST_F(FileSystemImplTest, IllegalPath) {
 #endif
 }
 
+TEST_F(FileSystemImplTest, ConstructedFile) {
+  const std::string new_file_path = TestEnvironment::temporaryPath("envoy_this_not_exist");
+  ::unlink(new_file_path.c_str());
+  FilePathAndType new_file_info{Filesystem::DestinationType::File, new_file_path};
+
+  FilePtr file = file_system_.createFile(new_file_info);
+  EXPECT_EQ(file->path(), new_file_path);
+  EXPECT_EQ(file->destinationType(), Filesystem::DestinationType::File);
+}
+
+TEST_F(FileSystemImplTest, ConstructedStdErrFile) {
+  FilePathAndType new_file_info{Filesystem::DestinationType::Stderr, ""};
+
+  FilePtr file = file_system_.createFile(new_file_info);
+  EXPECT_FALSE(file->isOpen());
+  EXPECT_EQ(file->destinationType(), Filesystem::DestinationType::Stderr);
+  EXPECT_EQ(file->path(), "/dev/stderr");
+}
+
+TEST_F(FileSystemImplTest, ConstructedStdOutFile) {
+  FilePathAndType new_file_info{Filesystem::DestinationType::Stdout, ""};
+
+  FilePtr file = file_system_.createFile(new_file_info);
+  EXPECT_FALSE(file->isOpen());
+  EXPECT_EQ(file->destinationType(), Filesystem::DestinationType::Stdout);
+  EXPECT_EQ(file->path(), "/dev/stdout");
+}
+
 TEST_F(FileSystemImplTest, ConstructedFileNotOpen) {
   const std::string new_file_path = TestEnvironment::temporaryPath("envoy_this_not_exist");
   ::unlink(new_file_path.c_str());
 
-  FilePtr file = file_system_.createFile(new_file_path);
+  FilePathAndType new_file_info{Filesystem::DestinationType::File, new_file_path};
+  FilePtr file = file_system_.createFile(new_file_info);
   EXPECT_FALSE(file->isOpen());
 }
 
@@ -228,8 +265,23 @@ TEST_F(FileSystemImplTest, Open) {
   const std::string new_file_path = TestEnvironment::temporaryPath("envoy_this_not_exist");
   ::unlink(new_file_path.c_str());
 
-  FilePtr file = file_system_.createFile(new_file_path);
+  FilePathAndType new_file_info{Filesystem::DestinationType::File, new_file_path};
+  FilePtr file = file_system_.createFile(new_file_info);
   const Api::IoCallBoolResult result = file->open(DefaultFlags);
+  EXPECT_TRUE(result.rc_);
+  EXPECT_TRUE(file->isOpen());
+}
+
+TEST_F(FileSystemImplTest, OpenReadOnly) {
+  const std::string new_file_path = TestEnvironment::temporaryPath("envoy_this_not_exist");
+  ::unlink(new_file_path.c_str());
+  static constexpr FlagSet ReadOnlyFlags{1 << Filesystem::File::Operation::Read |
+                                         1 << Filesystem::File::Operation::Create |
+                                         1 << Filesystem::File::Operation::Append};
+
+  FilePathAndType new_file_info{Filesystem::DestinationType::File, new_file_path};
+  FilePtr file = file_system_.createFile(new_file_info);
+  const Api::IoCallBoolResult result = file->open(ReadOnlyFlags);
   EXPECT_TRUE(result.rc_);
   EXPECT_TRUE(file->isOpen());
 }
@@ -238,11 +290,12 @@ TEST_F(FileSystemImplTest, OpenTwice) {
   const std::string new_file_path = TestEnvironment::temporaryPath("envoy_this_not_exist");
   ::unlink(new_file_path.c_str());
 
-  FilePtr file = file_system_.createFile(new_file_path);
-  EXPECT_EQ(getFd(file.get()), -1);
+  FilePathAndType new_file_info{Filesystem::DestinationType::File, new_file_path};
+  FilePtr file = file_system_.createFile(new_file_info);
+  EXPECT_EQ(getFd(file.get()), INVALID_HANDLE);
 
   const Api::IoCallBoolResult result1 = file->open(DefaultFlags);
-  const int initial_fd = getFd(file.get());
+  const filesystem_os_id_t initial_fd = getFd(file.get());
   EXPECT_TRUE(result1.rc_);
   EXPECT_TRUE(file->isOpen());
 
@@ -254,7 +307,8 @@ TEST_F(FileSystemImplTest, OpenTwice) {
 }
 
 TEST_F(FileSystemImplTest, OpenBadFilePath) {
-  FilePtr file = file_system_.createFile("");
+  FilePathAndType new_file_info{Filesystem::DestinationType::File, ""};
+  FilePtr file = file_system_.createFile(new_file_info);
   const Api::IoCallBoolResult result = file->open(DefaultFlags);
   EXPECT_FALSE(result.rc_);
 }
@@ -264,7 +318,8 @@ TEST_F(FileSystemImplTest, ExistingFile) {
       TestEnvironment::writeStringToFileForTest("test_envoy", "existing file");
 
   {
-    FilePtr file = file_system_.createFile(file_path);
+    FilePathAndType new_file_info{Filesystem::DestinationType::File, file_path};
+    FilePtr file = file_system_.createFile(new_file_info);
     const Api::IoCallBoolResult open_result = file->open(DefaultFlags);
     EXPECT_TRUE(open_result.rc_);
     std::string data(" new data");
@@ -281,7 +336,8 @@ TEST_F(FileSystemImplTest, NonExistingFile) {
   ::unlink(new_file_path.c_str());
 
   {
-    FilePtr file = file_system_.createFile(new_file_path);
+    FilePathAndType new_file_info{Filesystem::DestinationType::File, new_file_path};
+    FilePtr file = file_system_.createFile(new_file_info);
     const Api::IoCallBoolResult open_result = file->open(DefaultFlags);
     EXPECT_TRUE(open_result.rc_);
     std::string data(" new data");
@@ -293,11 +349,49 @@ TEST_F(FileSystemImplTest, NonExistingFile) {
   EXPECT_EQ(" new data", contents);
 }
 
+TEST_F(FileSystemImplTest, StdOut) {
+  FilePathAndType file_info{Filesystem::DestinationType::Stdout, ""};
+  FilePtr file = file_system_.createFile(file_info);
+  const Api::IoCallBoolResult open_result = file->open(DefaultFlags);
+  EXPECT_TRUE(open_result.rc_);
+  EXPECT_TRUE(file->isOpen());
+  std::string data(" new data\n");
+  const Api::IoCallSizeResult result = file->write(data);
+  EXPECT_EQ(data.length(), result.rc_) << fmt::format("{}", result.err_->getErrorDetails());
+}
+
+TEST_F(FileSystemImplTest, StdErr) {
+  FilePathAndType file_info{Filesystem::DestinationType::Stderr, ""};
+  FilePtr file = file_system_.createFile(file_info);
+  const Api::IoCallBoolResult open_result = file->open(DefaultFlags);
+  EXPECT_TRUE(open_result.rc_) << fmt::format("{}", open_result.err_->getErrorDetails());
+  EXPECT_TRUE(file->isOpen());
+  std::string data(" new data\n");
+  const Api::IoCallSizeResult result = file->write(data);
+  EXPECT_EQ(data.length(), result.rc_) << fmt::format("{}", result.err_->getErrorDetails());
+}
+
+#ifdef WIN32
+TEST_F(FileSystemImplTest, Win32InvalidHandleThrows) {
+  FilePathAndType file_info{Filesystem::DestinationType::Stdout, ""};
+  FilePtr file = file_system_.createFile(file_info);
+  // We need to flush just to make sure that the write has been completed.
+  auto hh = GetStdHandle(STD_OUTPUT_HANDLE);
+  FlushFileBuffers(hh);
+  auto original_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+  EXPECT_TRUE(SetStdHandle(STD_OUTPUT_HANDLE, NULL));
+  const Api::IoCallBoolResult result = file->open(DefaultFlags);
+  EXPECT_FALSE(result.rc_);
+  EXPECT_TRUE(SetStdHandle(STD_OUTPUT_HANDLE, original_handle));
+}
+#endif
+
 TEST_F(FileSystemImplTest, Close) {
   const std::string new_file_path = TestEnvironment::temporaryPath("envoy_this_not_exist");
   ::unlink(new_file_path.c_str());
 
-  FilePtr file = file_system_.createFile(new_file_path);
+  FilePathAndType new_file_info{Filesystem::DestinationType::File, new_file_path};
+  FilePtr file = file_system_.createFile(new_file_info);
   const Api::IoCallBoolResult result1 = file->open(DefaultFlags);
   EXPECT_TRUE(result1.rc_);
   EXPECT_TRUE(file->isOpen());
@@ -311,15 +405,15 @@ TEST_F(FileSystemImplTest, WriteAfterClose) {
   const std::string new_file_path = TestEnvironment::temporaryPath("envoy_this_not_exist");
   ::unlink(new_file_path.c_str());
 
-  FilePtr file = file_system_.createFile(new_file_path);
+  FilePathAndType new_file_info{Filesystem::DestinationType::File, new_file_path};
+  FilePtr file = file_system_.createFile(new_file_info);
   const Api::IoCallBoolResult bool_result1 = file->open(DefaultFlags);
   EXPECT_TRUE(bool_result1.rc_);
   const Api::IoCallBoolResult bool_result2 = file->close();
   EXPECT_TRUE(bool_result2.rc_);
   const Api::IoCallSizeResult size_result = file->write(" new data");
   EXPECT_EQ(-1, size_result.rc_);
-  EXPECT_EQ(IoFileError::IoErrorCode::UnknownError, size_result.err_->getErrorCode());
-  EXPECT_EQ("Bad file descriptor", size_result.err_->getErrorDetails());
+  EXPECT_EQ(IoFileError::IoErrorCode::BadFd, size_result.err_->getErrorCode());
 }
 
 TEST_F(FileSystemImplTest, NonExistingFileAndReadOnly) {
@@ -327,7 +421,8 @@ TEST_F(FileSystemImplTest, NonExistingFileAndReadOnly) {
   ::unlink(new_file_path.c_str());
 
   static constexpr FlagSet flag(static_cast<size_t>(Filesystem::File::Operation::Read));
-  FilePtr file = file_system_.createFile(new_file_path);
+  FilePathAndType new_file_info{Filesystem::DestinationType::File, new_file_path};
+  FilePtr file = file_system_.createFile(new_file_info);
   const Api::IoCallBoolResult open_result = file->open(flag);
   EXPECT_FALSE(open_result.rc_);
 }
@@ -338,17 +433,36 @@ TEST_F(FileSystemImplTest, ExistingReadOnlyFileAndWrite) {
 
   {
     static constexpr FlagSet flag(static_cast<size_t>(Filesystem::File::Operation::Read));
-    FilePtr file = file_system_.createFile(file_path);
+    FilePathAndType new_file_info{Filesystem::DestinationType::File, file_path};
+    FilePtr file = file_system_.createFile(new_file_info);
     const Api::IoCallBoolResult open_result = file->open(flag);
     EXPECT_TRUE(open_result.rc_);
     std::string data(" new data");
     const Api::IoCallSizeResult result = file->write(data);
     EXPECT_TRUE(result.rc_ < 0);
-    EXPECT_EQ(result.err_->getErrorDetails(), "Bad file descriptor");
+#ifdef WIN32
+    EXPECT_EQ(IoFileError::IoErrorCode::Permission, result.err_->getErrorCode());
+#else
+    EXPECT_EQ(IoFileError::IoErrorCode::BadFd, result.err_->getErrorCode());
+#endif
   }
 
   auto contents = TestEnvironment::readFileToStringForTest(file_path);
   EXPECT_EQ("existing file", contents);
+}
+
+TEST_F(FileSystemImplTest, TestIoFileError) {
+  IoFileError error1(HANDLE_ERROR_PERM);
+  EXPECT_EQ(IoFileError::IoErrorCode::Permission, error1.getErrorCode());
+  EXPECT_EQ(errorDetails(HANDLE_ERROR_PERM), error1.getErrorDetails());
+
+  IoFileError error2(HANDLE_ERROR_INVALID);
+  EXPECT_EQ(IoFileError::IoErrorCode::BadFd, error2.getErrorCode());
+  EXPECT_EQ(errorDetails(HANDLE_ERROR_INVALID), error2.getErrorDetails());
+
+  int not_known_error = 42;
+  IoFileError error3(not_known_error);
+  EXPECT_EQ(IoFileError::IoErrorCode::UnknownError, error3.getErrorCode());
 }
 
 } // namespace Filesystem
