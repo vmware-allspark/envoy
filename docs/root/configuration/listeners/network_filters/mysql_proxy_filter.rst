@@ -7,7 +7,8 @@ The MySQL proxy filter decodes the wire protocol between the MySQL client
 and server. It decodes the SQL queries in the payload (SQL99 format only).
 The decoded info is emitted as dynamic metadata that can be combined with
 access log filters to get detailed information on tables accessed as well
-as operations performed on each table.
+as operations performed on each table. It's a transparent filter, so it
+won't affect the normal progress of client and server.
 
 .. attention::
 
@@ -17,8 +18,9 @@ as operations performed on each table.
 
 .. warning::
 
-   The mysql_proxy filter was tested with MySQL v5.5. The filter may not work
+   The mysql_proxy filter was tested with MySQL v5.7. The filter may not work
    with other versions of MySQL due to differences in the protocol implementation.
+   The filter won't work when client turns on ssl communication.
 
 .. _config_network_filters_mysql_proxy_config:
 
@@ -34,11 +36,11 @@ in the configuration snippet below:
   - filters:
     - name: envoy.filters.network.mysql_proxy
       typed_config:
-        "@type": type.googleapis.com/envoy.config.filter.network.mysql_proxy.v1alpha1.MySQLProxy
+        "@type": type.googleapis.com/envoy.extensions.filters.network.mysql_proxy.v3.MySQLProxy
         stat_prefix: mysql
     - name: envoy.filters.network.tcp_proxy
       typed_config:
-        "@type": type.googleapis.com/envoy.config.filter.network.tcp_proxy.v2.TcpProxy
+        "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
         stat_prefix: tcp
         cluster: ...
 
@@ -96,11 +98,11 @@ _catalog_ table in the _productdb_ database.
   - filters:
     - name: envoy.filters.network.mysql_proxy
       typed_config:
-        "@type": type.googleapis.com/envoy.config.filter.network.mysql_proxy.v1alpha1.MySQLProxy
+        "@type": type.googleapis.com/envoy.extensions.filters.network.mysql_proxy.v3.MySQLProxy
         stat_prefix: mysql
     - name: envoy.filters.network.rbac
       typed_config:
-        "@type": type.googleapis.com/envoy.config.filter.network.rbac.v2.RBAC
+        "@type": type.googleapis.com/envoy.extensions.filters.network.rbac.v3.RBAC
         stat_prefix: rbac
         rules:
           action: DENY
@@ -120,6 +122,6 @@ _catalog_ table in the _productdb_ database.
               - any: true
     - name: envoy.filters.network.tcp_proxy
       typed_config:
-        "@type": type.googleapis.com/envoy.config.filter.network.tcp_proxy.v2.TcpProxy
+        "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
         stat_prefix: tcp
         cluster: mysql

@@ -1,15 +1,15 @@
-licenses(["notice"])  # Apache 2
-
-# Public docs: docs/root/configuration/network_filters/wasm_filter.rst
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_extension",
     "envoy_cc_library",
-    "envoy_package",
+    "envoy_extension_package",
 )
 
-envoy_package()
+licenses(["notice"])  # Apache 2
+
+envoy_extension_package()
+
+# Public docs: docs/root/configuration/network_filters/wasm_filter.rst
 
 envoy_cc_library(
     name = "wasm_filter_lib",
@@ -28,7 +28,9 @@ envoy_cc_extension(
     name = "config",
     srcs = ["config.cc"],
     hdrs = ["config.h"],
+    category = "envoy.filters.network",
     security_posture = "unknown",
+    status = "alpha",
     deps = [
         ":wasm_filter_lib",
         "//include/envoy/registry",
