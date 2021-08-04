@@ -4,11 +4,12 @@
 
 #include "envoy/router/string_accessor.h"
 
-#include "common/access_log/access_log_formatter.h"
 #include "common/common/fmt.h"
 #include "common/common/logger.h"
+#include "common/common/thread.h"
 #include "common/common/utility.h"
 #include "common/config/metadata.h"
+#include "common/formatter/substitution_formatter.h"
 #include "common/http/header_map_impl.h"
 #include "common/json/json_loader.h"
 #include "common/stream_info/utility.h"
@@ -43,12 +44,31 @@ std::string formatPerRequestStateParseException(absl::string_view params) {
                       params);
 }
 
+// Parses a substitution format field and returns a function that formats it.
+std::function<std::string(const Envoy::StreamInfo::StreamInfo&)>
+parseSubstitutionFormatField(absl::string_view field_name,
+                             StreamInfoHeaderFormatter::FormatterPtrMap& formatter_map) {
+  const std::string pattern = fmt::format("%{}%", field_name);
+  if (formatter_map.find(pattern) == formatter_map.end()) {
+    formatter_map.emplace(
+        std::make_pair(pattern, Formatter::FormatterPtr(new Formatter::FormatterImpl(
+                                    pattern, /*omit_empty_values=*/true))));
+  }
+  return [&formatter_map, pattern](const Envoy::StreamInfo::StreamInfo& stream_info) {
+    const auto& formatter = formatter_map.at(pattern);
+    return formatter->format(*Http::StaticEmptyHeaders::get().request_headers,
+                             *Http::StaticEmptyHeaders::get().response_headers,
+                             *Http::StaticEmptyHeaders::get().response_trailers, stream_info,
+                             absl::string_view());
+  };
+}
+
 // Parses the parameters for UPSTREAM_METADATA and returns a function suitable for accessing the
 // specified metadata from an StreamInfo::StreamInfo. Expects a string formatted as:
 //   (["a", "b", "c"])
 // There must be at least 2 array elements (a metadata namespace and at least 1 key).
 std::function<std::string(const Envoy::StreamInfo::StreamInfo&)>
-parseUpstreamMetadataField(absl::string_view params_str) {
+parseMetadataField(absl::string_view params_str, bool upstream = true) {
   params_str = StringUtil::trim(params_str);
   if (params_str.empty() || params_str.front() != '(' || params_str.back() != ')') {
     throw EnvoyException(formatUpstreamMetadataParseException(params_str));
@@ -57,13 +77,15 @@ parseUpstreamMetadataField(absl::string_view params_str) {
   absl::string_view json = params_str.substr(1, params_str.size() - 2); // trim parens
 
   std::vector<std::string> params;
-  try {
+  TRY_ASSERT_MAIN_THREAD {
     Json::ObjectSharedPtr parsed_params = Json::Factory::loadFromString(std::string(json));
 
     for (const auto& param : parsed_params->asObjectArray()) {
       params.emplace_back(param->asString());
     }
-  } catch (Json::Exception& e) {
+  }
+  END_TRY
+  catch (Json::Exception& e) {
     throw EnvoyException(formatUpstreamMetadataParseException(params_str, &e));
   }
 
@@ -72,14 +94,20 @@ parseUpstreamMetadataField(absl::string_view params_str) {
     throw EnvoyException(formatUpstreamMetadataParseException(params_str));
   }
 
-  return [params](const Envoy::StreamInfo::StreamInfo& stream_info) -> std::string {
-    Upstream::HostDescriptionConstSharedPtr host = stream_info.upstreamHost();
-    if (!host) {
-      return std::string();
+  return [upstream, params](const Envoy::StreamInfo::StreamInfo& stream_info) -> std::string {
+    const envoy::config::core::v3::Metadata* metadata = nullptr;
+    if (upstream) {
+      Upstream::HostDescriptionConstSharedPtr host = stream_info.upstreamHost();
+      if (!host) {
+        return std::string();
+      }
+      metadata = host->metadata().get();
+    } else {
+      metadata = &(stream_info.dynamicMetadata());
     }
 
     const ProtobufWkt::Value* value =
-        &::Envoy::Config::Metadata::metadataValue(host->metadata().get(), params[0], params[1]);
+        &::Envoy::Config::Metadata::metadataValue(metadata, params[0], params[1]);
     if (value->kind_case() == ProtobufWkt::Value::KIND_NOT_SET) {
       // No kind indicates default ProtobufWkt::Value which means namespace or key not
       // found.
@@ -180,8 +208,11 @@ parseRequestHeader(absl::string_view param) {
   Http::LowerCaseString header_name{std::string(param)};
   return [header_name](const Envoy::StreamInfo::StreamInfo& stream_info) -> std::string {
     if (const auto* request_headers = stream_info.getRequestHeaders()) {
-      if (const auto* entry = request_headers->get(header_name)) {
-        return std::string(entry->value().getStringView());
+      const auto entry = request_headers->get(header_name);
+      if (!entry.empty()) {
+        // TODO(https://github.com/envoyproxy/envoy/issues/13454): Potentially use all header
+        // values.
+        return std::string(entry[0]->value().getStringView());
       }
     }
     return std::string();
@@ -201,51 +232,37 @@ StreamInfoHeaderFormatter::FieldExtractor sslConnectionInfoStringHeaderExtractor
   };
 }
 
-// Helper that handles the case when the desired time field is empty.
-StreamInfoHeaderFormatter::FieldExtractor sslConnectionInfoStringTimeHeaderExtractor(
-    std::function<absl::optional<SystemTime>(const Ssl::ConnectionInfo& connection_info)>
-        time_extractor) {
-  return sslConnectionInfoStringHeaderExtractor(
-      [time_extractor](const Ssl::ConnectionInfo& connection_info) {
-        absl::optional<SystemTime> time = time_extractor(connection_info);
-        if (!time.has_value()) {
-          return std::string();
-        }
-
-        return AccessLogDateTimeFormatter::fromTime(time.value());
-      });
-}
-
 } // namespace
 
 StreamInfoHeaderFormatter::StreamInfoHeaderFormatter(absl::string_view field_name, bool append)
     : append_(append) {
   if (field_name == "PROTOCOL") {
     field_extractor_ = [](const Envoy::StreamInfo::StreamInfo& stream_info) {
-      return Envoy::AccessLog::AccessLogFormatUtils::protocolToString(stream_info.protocol());
+      return Envoy::Formatter::SubstitutionFormatUtils::protocolToStringOrDefault(
+          stream_info.protocol());
     };
   } else if (field_name == "DOWNSTREAM_REMOTE_ADDRESS") {
     field_extractor_ = [](const StreamInfo::StreamInfo& stream_info) {
-      return stream_info.downstreamRemoteAddress()->asString();
+      return stream_info.downstreamAddressProvider().remoteAddress()->asString();
     };
   } else if (field_name == "DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT") {
     field_extractor_ = [](const Envoy::StreamInfo::StreamInfo& stream_info) {
       return StreamInfo::Utility::formatDownstreamAddressNoPort(
-          *stream_info.downstreamRemoteAddress());
+          *stream_info.downstreamAddressProvider().remoteAddress());
     };
   } else if (field_name == "DOWNSTREAM_LOCAL_ADDRESS") {
     field_extractor_ = [](const StreamInfo::StreamInfo& stream_info) {
-      return stream_info.downstreamLocalAddress()->asString();
+      return stream_info.downstreamAddressProvider().localAddress()->asString();
     };
   } else if (field_name == "DOWNSTREAM_LOCAL_ADDRESS_WITHOUT_PORT") {
     field_extractor_ = [](const Envoy::StreamInfo::StreamInfo& stream_info) {
       return StreamInfo::Utility::formatDownstreamAddressNoPort(
-          *stream_info.downstreamLocalAddress());
+          *stream_info.downstreamAddressProvider().localAddress());
     };
   } else if (field_name == "DOWNSTREAM_LOCAL_PORT") {
     field_extractor_ = [](const Envoy::StreamInfo::StreamInfo& stream_info) {
       return StreamInfo::Utility::formatDownstreamAddressJustPort(
-          *stream_info.downstreamLocalAddress());
+          *stream_info.downstreamAddressProvider().localAddress());
     };
   } else if (field_name == "DOWNSTREAM_PEER_URI_SAN") {
     field_extractor_ =
@@ -288,6 +305,11 @@ StreamInfoHeaderFormatter::StreamInfoHeaderFormatter(absl::string_view field_nam
         sslConnectionInfoStringHeaderExtractor([](const Ssl::ConnectionInfo& connection_info) {
           return connection_info.sha256PeerCertificateDigest();
         });
+  } else if (field_name == "DOWNSTREAM_PEER_FINGERPRINT_1") {
+    field_extractor_ =
+        sslConnectionInfoStringHeaderExtractor([](const Ssl::ConnectionInfo& connection_info) {
+          return connection_info.sha1PeerCertificateDigest();
+        });
   } else if (field_name == "DOWNSTREAM_PEER_SERIAL") {
     field_extractor_ =
         sslConnectionInfoStringHeaderExtractor([](const Ssl::ConnectionInfo& connection_info) {
@@ -298,16 +320,10 @@ StreamInfoHeaderFormatter::StreamInfoHeaderFormatter(absl::string_view field_nam
         sslConnectionInfoStringHeaderExtractor([](const Ssl::ConnectionInfo& connection_info) {
           return connection_info.urlEncodedPemEncodedPeerCertificate();
         });
-  } else if (field_name == "DOWNSTREAM_PEER_CERT_V_START") {
-    field_extractor_ =
-        sslConnectionInfoStringTimeHeaderExtractor([](const Ssl::ConnectionInfo& connection_info) {
-          return connection_info.validFromPeerCertificate();
-        });
-  } else if (field_name == "DOWNSTREAM_PEER_CERT_V_END") {
-    field_extractor_ =
-        sslConnectionInfoStringTimeHeaderExtractor([](const Ssl::ConnectionInfo& connection_info) {
-          return connection_info.expirationPeerCertificate();
-        });
+  } else if (absl::StartsWith(field_name, "DOWNSTREAM_PEER_CERT_V_START")) {
+    field_extractor_ = parseSubstitutionFormatField(field_name, formatter_map_);
+  } else if (absl::StartsWith(field_name, "DOWNSTREAM_PEER_CERT_V_END")) {
+    field_extractor_ = parseSubstitutionFormatField(field_name, formatter_map_);
   } else if (field_name == "UPSTREAM_REMOTE_ADDRESS") {
     field_extractor_ = [](const Envoy::StreamInfo::StreamInfo& stream_info) -> std::string {
       if (stream_info.upstreamHost()) {
@@ -316,34 +332,31 @@ StreamInfoHeaderFormatter::StreamInfoHeaderFormatter(absl::string_view field_nam
       return "";
     };
   } else if (absl::StartsWith(field_name, "START_TIME")) {
-    const std::string pattern = fmt::format("%{}%", field_name);
-    if (start_time_formatters_.find(pattern) == start_time_formatters_.end()) {
-      start_time_formatters_.emplace(
-          std::make_pair(pattern, AccessLog::AccessLogFormatParser::parse(pattern)));
-    }
-    field_extractor_ = [this, pattern](const Envoy::StreamInfo::StreamInfo& stream_info) {
-      const auto& formatters = start_time_formatters_.at(pattern);
-      static const Http::RequestHeaderMapImpl empty_request_headers;
-      static const Http::ResponseHeaderMapImpl empty_response_headers;
-      static const Http::ResponseTrailerMapImpl empty_response_trailers;
-      std::string formatted;
-      for (const auto& formatter : formatters) {
-        absl::StrAppend(&formatted, formatter->format(empty_request_headers, empty_response_headers,
-                                                      empty_response_trailers, stream_info));
-      }
-      return formatted;
-    };
+    field_extractor_ = parseSubstitutionFormatField(field_name, formatter_map_);
   } else if (absl::StartsWith(field_name, "UPSTREAM_METADATA")) {
+    field_extractor_ = parseMetadataField(field_name.substr(STATIC_STRLEN("UPSTREAM_METADATA")));
+  } else if (absl::StartsWith(field_name, "DYNAMIC_METADATA")) {
     field_extractor_ =
-        parseUpstreamMetadataField(field_name.substr(STATIC_STRLEN("UPSTREAM_METADATA")));
+        parseMetadataField(field_name.substr(STATIC_STRLEN("DYNAMIC_METADATA")), false);
   } else if (absl::StartsWith(field_name, "PER_REQUEST_STATE")) {
     field_extractor_ =
         parsePerRequestStateField(field_name.substr(STATIC_STRLEN("PER_REQUEST_STATE")));
   } else if (absl::StartsWith(field_name, "REQ")) {
     field_extractor_ = parseRequestHeader(field_name.substr(STATIC_STRLEN("REQ")));
   } else if (field_name == "HOSTNAME") {
-    std::string hostname = Envoy::AccessLog::AccessLogFormatUtils::getHostname();
+    std::string hostname = Envoy::Formatter::SubstitutionFormatUtils::getHostnameOrDefault();
     field_extractor_ = [hostname](const StreamInfo::StreamInfo&) { return hostname; };
+  } else if (field_name == "RESPONSE_FLAGS") {
+    field_extractor_ = [](const StreamInfo::StreamInfo& stream_info) {
+      return StreamInfo::ResponseFlagUtils::toShortString(stream_info);
+    };
+  } else if (field_name == "RESPONSE_CODE_DETAILS") {
+    field_extractor_ = [](const StreamInfo::StreamInfo& stream_info) -> std::string {
+      if (stream_info.responseCodeDetails().has_value()) {
+        return stream_info.responseCodeDetails().value();
+      }
+      return "";
+    };
   } else {
     throw EnvoyException(fmt::format("field '{}' not supported as custom header", field_name));
   }

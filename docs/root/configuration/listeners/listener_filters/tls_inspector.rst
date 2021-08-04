@@ -9,14 +9,16 @@ TLS or plaintext, and if it is TLS, it detects the
 and/or `Application-Layer Protocol Negotiation
 <https://en.wikipedia.org/wiki/Application-Layer_Protocol_Negotiation>`_
 from the client. This can be used to select a
-:ref:`FilterChain <envoy_api_msg_listener.FilterChain>` via the
-:ref:`server_names <envoy_api_field_listener.FilterChainMatch.server_names>` and/or
-:ref:`application_protocols <envoy_api_field_listener.FilterChainMatch.application_protocols>`
-of a :ref:`FilterChainMatch <envoy_api_msg_listener.FilterChainMatch>`.
+:ref:`FilterChain <envoy_v3_api_msg_config.listener.v3.FilterChain>` via the
+:ref:`server_names <envoy_v3_api_field_config.listener.v3.FilterChainMatch.server_names>` and/or
+:ref:`application_protocols <envoy_v3_api_field_config.listener.v3.FilterChainMatch.application_protocols>`
+of a :ref:`FilterChainMatch <envoy_v3_api_msg_config.listener.v3.FilterChainMatch>`.
 
 * :ref:`SNI <faq_how_to_setup_sni>`
-* :ref:`v2 API reference <envoy_api_field_listener.ListenerFilter.name>`
-* This filter should be configured with the name *envoy.filters.listener.tls_inspector*.
+* :ref:`v3 API reference <envoy_v3_api_field_config.listener.v3.ListenerFilter.name>`
+* This filter may be configured with the name *envoy.filters.listener.tls_inspector* or
+  *type.googleapis.com/envoy.extensions.listeners.tls_inspector.v3.TlsInspector* as the
+  `type_url <https://developers.google.com/protocol-buffers/docs/reference/google.protobuf#google.protobuf.Any.FIELDS.string.google.protobuf.Any.type_url>`_.
 
 Example
 -------
@@ -26,13 +28,23 @@ A sample filter configuration could be:
 .. code-block:: yaml
 
   listener_filters:
-    - name: "envoy.filters.listener.tls_inspector"
-      typed_config: {}
+  - name: "envoy.filters.listener.tls_inspector"
+    typed_config: {}
+
+Or by specifying the `type_url <https://developers.google.com/protocol-buffers/docs/reference/google.protobuf#google.protobuf.Any.FIELDS.string.google.protobuf.Any.type_url>`_
+of the *typed_config*:
+
+.. code-block:: yaml
+
+  listener_filters:
+  - name: "tls_inspector"
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.listeners.tls_inspector.v3.TlsInspector
 
 Statistics
 ----------
 
-This filter has a statistics tree rooted at *tls_inspector* with the following statistics: 
+This filter has a statistics tree rooted at *tls_inspector* with the following statistics:
 
 .. csv-table::
   :header: Name, Type, Description

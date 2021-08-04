@@ -14,6 +14,7 @@
 #include "common/common/assert.h"
 #include "common/common/fmt.h"
 #include "common/common/logger.h"
+#include "common/common/utility.h"
 #include "common/filesystem/filesystem_impl.h"
 
 #include "absl/strings/match.h"
@@ -29,13 +30,26 @@ FileImplPosix::~FileImplPosix() {
   }
 }
 
-void FileImplPosix::openFile(FlagSet in) {
+Api::IoCallBoolResult FileImplPosix::open(FlagSet in) {
+  if (isOpen()) {
+    return resultSuccess(true);
+  }
+
   const auto flags_and_mode = translateFlag(in);
-  fd_ = ::open(path_.c_str(), flags_and_mode.flags_, flags_and_mode.mode_);
+  fd_ = ::open(path().c_str(), flags_and_mode.flags_, flags_and_mode.mode_);
+  return fd_ != -1 ? resultSuccess(true) : resultFailure(false, errno);
 }
 
-ssize_t FileImplPosix::writeFile(absl::string_view buffer) {
-  return ::write(fd_, buffer.data(), buffer.size());
+Api::IoCallSizeResult FileImplPosix::write(absl::string_view buffer) {
+  const ssize_t rc = ::write(fd_, buffer.data(), buffer.size());
+  return rc != -1 ? resultSuccess(rc) : resultFailure(rc, errno);
+};
+
+Api::IoCallBoolResult FileImplPosix::close() {
+  ASSERT(isOpen());
+  int rc = ::close(fd_);
+  fd_ = -1;
+  return (rc != -1) ? resultSuccess(true) : resultFailure(false, errno);
 }
 
 FileImplPosix::FlagsAndMode FileImplPosix::translateFlag(FlagSet in) {
@@ -61,10 +75,16 @@ FileImplPosix::FlagsAndMode FileImplPosix::translateFlag(FlagSet in) {
   return {out, mode};
 }
 
-bool FileImplPosix::closeFile() { return ::close(fd_) != -1; }
-
-FilePtr InstanceImplPosix::createFile(const std::string& path) {
-  return std::make_unique<FileImplPosix>(path);
+FilePtr InstanceImplPosix::createFile(const FilePathAndType& file_info) {
+  switch (file_info.file_type_) {
+  case DestinationType::File:
+    return std::make_unique<FileImplPosix>(file_info);
+  case DestinationType::Stderr:
+    return std::make_unique<FileImplPosix>(FilePathAndType{DestinationType::Stderr, "/dev/stderr"});
+  case DestinationType::Stdout:
+    return std::make_unique<FileImplPosix>(FilePathAndType{DestinationType::Stdout, "/dev/stdout"});
+  }
+  NOT_REACHED_GCOVR_EXCL_LINE;
 }
 
 bool InstanceImplPosix::fileExists(const std::string& path) {
@@ -94,8 +114,6 @@ std::string InstanceImplPosix::fileReadToEnd(const std::string& path) {
   if (illegalPath(path)) {
     throw EnvoyException(absl::StrCat("Invalid path: ", path));
   }
-
-  std::ios::sync_with_stdio(false);
 
   std::ifstream file(path);
   if (file.fail()) {
@@ -127,7 +145,7 @@ bool InstanceImplPosix::illegalPath(const std::string& path) {
   // _before_ canonicalizing the path is that different unix flavors implement
   // /dev/fd/* differently, for example on linux they are symlinks to /dev/pts/*
   // which are symlinks to /proc/self/fds/. On BSD (and darwin) they are not
-  // symlinks at all. To avoid lots of platform, specifics, we whitelist
+  // symlinks at all. To avoid lots of platform, specifics, we allowlist
   // /dev/fd/* _before_ resolving the canonical path.
   if (absl::StartsWith(path, "/dev/fd/")) {
     return false;
@@ -136,7 +154,7 @@ bool InstanceImplPosix::illegalPath(const std::string& path) {
   const Api::SysCallStringResult canonical_path = canonicalPath(path);
   if (canonical_path.rc_.empty()) {
     ENVOY_LOG_MISC(debug, "Unable to determine canonical path for {}: {}", path,
-                   ::strerror(canonical_path.errno_));
+                   errorDetails(canonical_path.errno_));
     return true;
   }
 
