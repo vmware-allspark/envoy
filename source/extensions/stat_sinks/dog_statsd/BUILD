@@ -1,20 +1,21 @@
+load(
+    "//bazel:envoy_build_system.bzl",
+    "envoy_cc_extension",
+    "envoy_extension_package",
+)
+
 licenses(["notice"])  # Apache 2
 
 # Stats sink for the DataDog (https://www.datadoghq.com/) variant of the statsd protocol
 # (https://docs.datadoghq.com/developers/dogstatsd/).
 
-load(
-    "//bazel:envoy_build_system.bzl",
-    "envoy_cc_extension",
-    "envoy_package",
-)
-
-envoy_package()
+envoy_extension_package()
 
 envoy_cc_extension(
     name = "config",
     srcs = ["config.cc"],
     hdrs = ["config.h"],
+    category = "envoy.stats_sinks",
     security_posture = "data_plane_agnostic",
     deps = [
         "//include/envoy/registry",
