@@ -6,18 +6,35 @@
 
 #include "envoy/buffer/buffer.h"
 #include "envoy/common/pure.h"
+#include "envoy/grpc/status.h"
+#include "envoy/http/header_formatter.h"
 #include "envoy/http/header_map.h"
 #include "envoy/http/metadata_interface.h"
 #include "envoy/http/protocol.h"
 #include "envoy/network/address.h"
+#include "envoy/stream_info/stream_info.h"
+
+#include "common/http/status.h"
 
 namespace Envoy {
 namespace Http {
 
+namespace Http1 {
+struct CodecStats;
+}
+
+namespace Http2 {
+struct CodecStats;
+}
+
+namespace Http3 {
+struct CodecStats;
+}
+
 // Legacy default value of 60K is safely under both codec default limits.
-static const uint32_t DEFAULT_MAX_REQUEST_HEADERS_KB = 60;
+static constexpr uint32_t DEFAULT_MAX_REQUEST_HEADERS_KB = 60;
 // Default maximum number of headers.
-static const uint32_t DEFAULT_MAX_HEADERS_COUNT = 100;
+static constexpr uint32_t DEFAULT_MAX_HEADERS_COUNT = 100;
 
 const char MaxRequestHeadersCountOverrideKey[] =
     "envoy.reloadable_features.max_request_headers_count";
@@ -25,6 +42,14 @@ const char MaxResponseHeadersCountOverrideKey[] =
     "envoy.reloadable_features.max_response_headers_count";
 
 class Stream;
+
+/**
+ * Error codes used to convey the reason for a GOAWAY.
+ */
+enum class GoAwayErrorCode {
+  NoError,
+  Other,
+};
 
 /**
  * Stream encoder options specific to HTTP/1.
@@ -85,18 +110,24 @@ public:
 class RequestEncoder : public virtual StreamEncoder {
 public:
   /**
-   * Encode headers, optionally indicating end of stream. Response headers must
-   * have a valid :status set.
-   * @param headers supplies the header map to encode.
+   * Encode headers, optionally indicating end of stream.
+   * @param headers supplies the header map to encode. Must have required HTTP headers.
    * @param end_stream supplies whether this is a header only request.
+   * @return Status indicating whether encoding succeeded. Encoding will fail if request
+   * headers are missing required HTTP headers (method, path for non-CONNECT, host for CONNECT).
    */
-  virtual void encodeHeaders(const RequestHeaderMap& headers, bool end_stream) PURE;
+  virtual Status encodeHeaders(const RequestHeaderMap& headers, bool end_stream) PURE;
 
   /**
    * Encode trailers. This implicitly ends the stream.
    * @param trailers supplies the trailers to encode.
    */
   virtual void encodeTrailers(const RequestTrailerMap& trailers) PURE;
+
+  /**
+   * Enable TCP Tunneling.
+   */
+  virtual void enableTcpTunneling() PURE;
 };
 
 /**
@@ -124,6 +155,12 @@ public:
    * @param trailers supplies the trailers to encode.
    */
   virtual void encodeTrailers(const ResponseTrailerMap& trailers) PURE;
+
+  /**
+   * Indicates whether invalid HTTP messaging should be handled with a stream error or a connection
+   * error.
+   */
+  virtual bool streamErrorOnInvalidHttpMessage() const PURE;
 };
 
 /**
@@ -168,6 +205,25 @@ public:
    * @param trailers supplies the decoded trailers.
    */
   virtual void decodeTrailers(RequestTrailerMapPtr&& trailers) PURE;
+
+  /**
+   * Called if the codec needs to send a protocol error.
+   * @param is_grpc_request indicates if the request is a gRPC request
+   * @param code supplies the HTTP error code to send.
+   * @param body supplies an optional body to send with the local reply.
+   * @param modify_headers supplies a way to edit headers before they are sent downstream.
+   * @param grpc_status an optional gRPC status for gRPC requests
+   * @param details details about the source of the error, for debug purposes
+   */
+  virtual void sendLocalReply(bool is_grpc_request, Code code, absl::string_view body,
+                              const std::function<void(ResponseHeaderMap& headers)>& modify_headers,
+                              const absl::optional<Grpc::Status::GrpcStatus> grpc_status,
+                              absl::string_view details) PURE;
+
+  /**
+   * @return StreamInfo::StreamInfo& the stream_info for this stream.
+   */
+  virtual const StreamInfo::StreamInfo& streamInfo() const PURE;
 };
 
 /**
@@ -194,6 +250,16 @@ public:
    * @param trailers supplies the decoded trailers.
    */
   virtual void decodeTrailers(ResponseTrailerMapPtr&& trailers) PURE;
+
+  /**
+   * Dump the response decoder to the specified ostream.
+   *
+   * @param os the ostream to dump state to
+   * @param indent_level the depth, for pretty-printing.
+   *
+   * This function is called on Envoy fatal errors so should avoid memory allocation.
+   */
+  virtual void dumpState(std::ostream& os, int indent_level = 0) const PURE;
 };
 
 /**
@@ -213,7 +279,11 @@ enum class StreamResetReason {
   // If the stream was locally reset due to connection termination.
   ConnectionTermination,
   // The stream was reset because of a resource overflow.
-  Overflow
+  Overflow,
+  // Either there was an early TCP error for a CONNECT request or the peer reset with CONNECT_ERROR
+  ConnectError,
+  // Received payload did not conform to HTTP protocol.
+  ProtocolError
 };
 
 /**
@@ -303,6 +373,26 @@ public:
    * with the stream.
    */
   virtual const Network::Address::InstanceConstSharedPtr& connectionLocalAddress() PURE;
+
+  /**
+   * Set the flush timeout for the stream. At the codec level this is used to bound the amount of
+   * time the codec will wait to flush body data pending open stream window. It does *not* count
+   * small window updates as satisfying the idle timeout as this is a potential DoS vector.
+   */
+  virtual void setFlushTimeout(std::chrono::milliseconds timeout) PURE;
+};
+
+/**
+ * A class for sharing what HTTP/2 SETTINGS were received from the peer.
+ */
+class ReceivedSettings {
+public:
+  virtual ~ReceivedSettings() = default;
+
+  /**
+   * @return value of SETTINGS_MAX_CONCURRENT_STREAMS, or absl::nullopt if it was not present.
+   */
+  virtual const absl::optional<uint32_t>& maxConcurrentStreams() const PURE;
 };
 
 /**
@@ -315,7 +405,14 @@ public:
   /**
    * Fires when the remote indicates "go away." No new streams should be created.
    */
-  virtual void onGoAway() PURE;
+  virtual void onGoAway(GoAwayErrorCode error_code) PURE;
+
+  /**
+   * Fires when the peer settings frame is received from the peer.
+   * This may occur multiple times across the lifetime of the connection.
+   * @param ReceivedSettings the settings received from the peer.
+   */
+  virtual void onSettings(ReceivedSettings& settings) { UNREFERENCED_PARAMETER(settings); }
 };
 
 /**
@@ -335,6 +432,10 @@ struct Http1Settings {
   //  - Is neither a HEAD only request nor a HTTP Upgrade
   //  - Not a HEAD request
   bool enable_trailers_{false};
+  // Allows Envoy to process requests/responses with both `Content-Length` and `Transfer-Encoding`
+  // headers set. By default such messages are rejected, but if option is enabled - Envoy will
+  // remove Content-Length header and process message.
+  bool allow_chunked_length_{false};
 
   enum class HeaderKeyFormat {
     // By default no formatting is performed, presenting all headers in lowercase (as Envoy
@@ -343,10 +444,24 @@ struct Http1Settings {
     // Performs proper casing of header keys: the first and all alpha characters following a
     // non-alphanumeric character is capitalized.
     ProperCase,
+    // A stateful formatter extension has been configured.
+    StatefulFormatter,
   };
 
   // How header keys should be formatted when serializing HTTP/1.1 headers.
   HeaderKeyFormat header_key_format_{HeaderKeyFormat::Default};
+
+  // Non-null IFF header_key_format_ is configured to StatefulFormatter.
+  StatefulHeaderKeyFormatterFactorySharedPtr stateful_header_key_formatter_;
+
+  // Behaviour on invalid HTTP messaging:
+  // - if true, the HTTP/1.1 connection is left open (where possible)
+  // - if false, the HTTP/1.1 connection is terminated
+  bool stream_error_on_invalid_http_message_{false};
+
+  // True if this is an edge Envoy (using downstream address, no trusted hops)
+  // and https:// URLs should be rejected over unencrypted connections.
+  bool validate_scheme_{false};
 };
 
 /**
@@ -359,8 +474,10 @@ public:
   /**
    * Dispatch incoming connection data.
    * @param data supplies the data to dispatch. The codec will drain as many bytes as it processes.
+   * @return Status indicating the status of the codec. Holds any errors encountered while
+   * processing the incoming data.
    */
-  virtual void dispatch(Buffer::Instance& data) PURE;
+  virtual Status dispatch(Buffer::Instance& data) PURE;
 
   /**
    * Indicate "go away" to the remote. No new streams can be created beyond this point.
