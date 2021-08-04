@@ -1,13 +1,13 @@
-licenses(["notice"])  # Apache 2
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_extension",
     "envoy_cc_library",
-    "envoy_package",
+    "envoy_extension_package",
 )
 
-envoy_package()
+licenses(["notice"])  # Apache 2
+
+envoy_extension_package()
 
 envoy_cc_library(
     name = "sni_cluster",
@@ -26,6 +26,7 @@ envoy_cc_extension(
     name = "config",
     srcs = ["config.cc"],
     hdrs = ["config.h"],
+    category = "envoy.filters.network",
     security_posture = "unknown",
     deps = [
         ":sni_cluster",

@@ -35,3 +35,7 @@ user.bazelrc
 **/Cargo.lock
 CMakeLists.txt
 cmake-build-debug
+/linux
+bazel.output.txt
+*~
+.coverage

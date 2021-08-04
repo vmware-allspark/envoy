@@ -1,21 +1,24 @@
+load(
+    "//bazel:envoy_build_system.bzl",
+    "envoy_cc_extension",
+    "envoy_cc_library",
+    "envoy_extension_package",
+)
+load("@rules_python//python:defs.bzl", "py_binary", "py_library")
+load("@kafka_pip3//:requirements.bzl", "requirement")
+
 licenses(["notice"])  # Apache 2
 
 # Kafka network filter.
 # Broker filter public docs: docs/root/configuration/network_filters/kafka_broker_filter.rst
 
-load(
-    "//bazel:envoy_build_system.bzl",
-    "envoy_cc_extension",
-    "envoy_cc_library",
-    "envoy_package",
-)
-
-envoy_package()
+envoy_extension_package()
 
 envoy_cc_extension(
     name = "kafka_broker_config_lib",
     srcs = ["broker/config.cc"],
     hdrs = ["broker/config.h"],
+    category = "envoy.filters.network",
     security_posture = "requires_trusted_downstream_and_upstream",
     status = "wip",
     deps = [
@@ -96,6 +99,7 @@ envoy_cc_library(
     ],
     deps = [
         ":serialization_lib",
+        ":tagged_fields_lib",
     ],
 )
 
@@ -159,6 +163,7 @@ envoy_cc_library(
     ],
     deps = [
         ":serialization_lib",
+        ":tagged_fields_lib",
     ],
 )
 
@@ -189,7 +194,8 @@ py_binary(
     main = "protocol/launcher.py",
     deps = [
         ":kafka_protocol_generator_lib",
-        "@com_github_pallets_jinja//:jinja2",
+        requirement("Jinja2"),
+        requirement("MarkupSafe"),
     ],
 )
 
@@ -225,6 +231,7 @@ envoy_cc_library(
         ":kafka_types_lib",
         "//include/envoy/buffer:buffer_interface",
         "//source/common/common:byte_order_lib",
+        "//source/common/common:safe_memcpy_lib",
     ],
 )
 
@@ -250,7 +257,8 @@ py_binary(
     main = "serialization/launcher.py",
     deps = [
         ":serialization_composite_generator_lib",
-        "@com_github_pallets_jinja//:jinja2",
+        requirement("Jinja2"),
+        requirement("MarkupSafe"),
     ],
 )
 
