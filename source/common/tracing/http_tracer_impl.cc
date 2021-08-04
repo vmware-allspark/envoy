@@ -4,14 +4,15 @@
 
 #include "envoy/config/core/v3/base.pb.h"
 #include "envoy/network/address.h"
+#include "envoy/tracing/http_tracer.h"
 #include "envoy/type/metadata/v3/metadata.pb.h"
 #include "envoy/type/tracing/v3/custom_tag.pb.h"
 
-#include "common/access_log/access_log_formatter.h"
 #include "common/common/assert.h"
 #include "common/common/fmt.h"
 #include "common/common/macros.h"
 #include "common/common/utility.h"
+#include "common/formatter/substitution_formatter.h"
 #include "common/grpc/common.h"
 #include "common/http/codes.h"
 #include "common/http/header_map_impl.h"
@@ -25,27 +26,31 @@
 namespace Envoy {
 namespace Tracing {
 
-// TODO(mattklein123) PERF: Avoid string creations/copies in this entire file.
+// TODO(perf): Avoid string creations/copies in this entire file.
 static std::string buildResponseCode(const StreamInfo::StreamInfo& info) {
   return info.responseCode() ? std::to_string(info.responseCode().value()) : "0";
 }
 
-static std::string valueOrDefault(const Http::HeaderEntry* header, const char* default_value) {
-  return header ? std::string(header->value().getStringView()) : default_value;
+static absl::string_view valueOrDefault(const Http::HeaderEntry* header,
+                                        const char* default_value) {
+  return header ? header->value().getStringView() : default_value;
 }
 
 static std::string buildUrl(const Http::RequestHeaderMap& request_headers,
                             const uint32_t max_path_length) {
-  std::string path(request_headers.EnvoyOriginalPath()
-                       ? request_headers.EnvoyOriginalPath()->value().getStringView()
-                       : request_headers.Path()->value().getStringView());
+  if (!request_headers.Path()) {
+    return "";
+  }
+  absl::string_view path(request_headers.EnvoyOriginalPath()
+                             ? request_headers.getEnvoyOriginalPathValue()
+                             : request_headers.getPathValue());
 
   if (path.length() > max_path_length) {
     path = path.substr(0, max_path_length);
   }
 
-  return absl::StrCat(valueOrDefault(request_headers.ForwardedProto(), ""), "://",
-                      valueOrDefault(request_headers.Host(), ""), path);
+  return absl::StrCat(request_headers.getForwardedProtoValue(), "://",
+                      request_headers.getHostValue(), path);
 }
 
 const std::string HttpTracerUtility::IngressOperation = "ingress";
@@ -62,25 +67,20 @@ const std::string& HttpTracerUtility::toString(OperationName operation_name) {
   NOT_REACHED_GCOVR_EXCL_LINE;
 }
 
-Decision HttpTracerUtility::isTracing(const StreamInfo::StreamInfo& stream_info,
-                                      const Http::RequestHeaderMap& request_headers) {
+Decision HttpTracerUtility::shouldTraceRequest(const StreamInfo::StreamInfo& stream_info) {
   // Exclude health check requests immediately.
   if (stream_info.healthCheck()) {
     return {Reason::HealthCheck, false};
   }
 
-  Http::TraceStatus trace_status =
-      stream_info.getRequestIDExtension()->getTraceStatus(request_headers);
-
-  switch (trace_status) {
-  case Http::TraceStatus::Client:
-    return {Reason::ClientForced, true};
-  case Http::TraceStatus::Forced:
-    return {Reason::ServiceForced, true};
-  case Http::TraceStatus::Sampled:
-    return {Reason::Sampling, true};
-  case Http::TraceStatus::NoTrace:
-    return {Reason::NotTraceableRequestId, false};
+  const Tracing::Reason trace_reason = stream_info.traceReason();
+  switch (trace_reason) {
+  case Reason::ClientForced:
+  case Reason::ServiceForced:
+  case Reason::Sampling:
+    return {trace_reason, true};
+  default:
+    return {trace_reason, false};
   }
 
   NOT_REACHED_GCOVR_EXCL_LINE;
@@ -157,20 +157,19 @@ void HttpTracerUtility::finalizeDownstreamSpan(Span& span,
   // Pre response data.
   if (request_headers) {
     if (request_headers->RequestId()) {
-      span.setTag(Tracing::Tags::get().GuidXRequestId,
-                  std::string(request_headers->RequestId()->value().getStringView()));
+      span.setTag(Tracing::Tags::get().GuidXRequestId, request_headers->getRequestIdValue());
     }
     span.setTag(Tracing::Tags::get().HttpUrl,
                 buildUrl(*request_headers, tracing_config.maxPathTagLength()));
-    span.setTag(Tracing::Tags::get().HttpMethod,
-                std::string(request_headers->Method()->value().getStringView()));
+    span.setTag(Tracing::Tags::get().HttpMethod, request_headers->getMethodValue());
     span.setTag(Tracing::Tags::get().DownstreamCluster,
                 valueOrDefault(request_headers->EnvoyDownstreamServiceCluster(), "-"));
     span.setTag(Tracing::Tags::get().UserAgent, valueOrDefault(request_headers->UserAgent(), "-"));
-    span.setTag(Tracing::Tags::get().HttpProtocol,
-                AccessLog::AccessLogFormatUtils::protocolToString(stream_info.protocol()));
+    span.setTag(
+        Tracing::Tags::get().HttpProtocol,
+        Formatter::SubstitutionFormatUtils::protocolToStringOrDefault(stream_info.protocol()));
 
-    const auto& remote_address = stream_info.downstreamDirectRemoteAddress();
+    const auto& remote_address = stream_info.downstreamAddressProvider().directRemoteAddress();
 
     if (remote_address->type() == Network::Address::Type::Ip) {
       const auto remote_ip = remote_address->ip();
@@ -181,10 +180,10 @@ void HttpTracerUtility::finalizeDownstreamSpan(Span& span,
 
     if (request_headers->ClientTraceId()) {
       span.setTag(Tracing::Tags::get().GuidXClientTraceId,
-                  std::string(request_headers->ClientTraceId()->value().getStringView()));
+                  request_headers->getClientTraceIdValue());
     }
 
-    if (Grpc::Common::hasGrpcContentType(*request_headers)) {
+    if (Grpc::Common::isGrpcRequestHeaders(*request_headers)) {
       addGrpcRequestTags(span, *request_headers);
     }
   }
@@ -209,8 +208,9 @@ void HttpTracerUtility::finalizeUpstreamSpan(Span& span,
                                              const Http::ResponseTrailerMap* response_trailers,
                                              const StreamInfo::StreamInfo& stream_info,
                                              const Config& tracing_config) {
-  span.setTag(Tracing::Tags::get().HttpProtocol,
-              AccessLog::AccessLogFormatUtils::protocolToString(stream_info.protocol()));
+  span.setTag(
+      Tracing::Tags::get().HttpProtocol,
+      Formatter::SubstitutionFormatUtils::protocolToStringOrDefault(stream_info.protocol()));
 
   if (stream_info.upstreamHost()) {
     span.setTag(Tracing::Tags::get().UpstreamAddress,
@@ -231,6 +231,8 @@ void HttpTracerUtility::setCommonTags(Span& span, const Http::ResponseHeaderMap*
 
   if (nullptr != stream_info.upstreamHost()) {
     span.setTag(Tracing::Tags::get().UpstreamCluster, stream_info.upstreamHost()->cluster().name());
+    span.setTag(Tracing::Tags::get().UpstreamClusterName,
+                stream_info.upstreamHost()->cluster().observabilityName());
   }
 
   // Post response data.
@@ -280,7 +282,7 @@ SpanPtr HttpTracerImpl::startSpan(const Config& config, Http::RequestHeaderMap& 
 
   if (config.operationName() == OperationName::Egress) {
     span_name.append(" ");
-    span_name.append(std::string(request_headers.Host()->value().getStringView()));
+    span_name.append(std::string(request_headers.getHostValue()));
   }
 
   SpanPtr active_span = driver_->startSpan(config, request_headers, span_name,
@@ -318,8 +320,9 @@ absl::string_view RequestHeaderCustomTag::value(const CustomTagContext& ctx) con
   if (!ctx.request_headers) {
     return default_value_;
   }
-  const Http::HeaderEntry* entry = ctx.request_headers->get(name_);
-  return entry ? entry->value().getStringView() : default_value_;
+  // TODO(https://github.com/envoyproxy/envoy/issues/13454): Potentially populate all header values.
+  const auto entry = ctx.request_headers->get(name_);
+  return !entry.empty() ? entry[0]->value().getStringView() : default_value_;
 }
 
 MetadataCustomTag::MetadataCustomTag(const std::string& tag,
@@ -347,10 +350,10 @@ void MetadataCustomTag::apply(Span& span, const CustomTagContext& ctx) const {
     span.setTag(tag(), value.string_value());
     return;
   case ProtobufWkt::Value::kListValue:
-    span.setTag(tag(), MessageUtil::getJsonStringFromMessage(value.list_value()));
+    span.setTag(tag(), MessageUtil::getJsonStringFromMessageOrDie(value.list_value()));
     return;
   case ProtobufWkt::Value::kStructValue:
-    span.setTag(tag(), MessageUtil::getJsonStringFromMessage(value.struct_value()));
+    span.setTag(tag(), MessageUtil::getJsonStringFromMessageOrDie(value.struct_value()));
     return;
   default:
     break;
