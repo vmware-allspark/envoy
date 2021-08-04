@@ -37,24 +37,18 @@ template <typename T> Api::IoCallResult<T> resultSuccess(T result) {
 
 class FileSharedImpl : public File {
 public:
-  FileSharedImpl(std::string path) : fd_(-1), path_(std::move(path)) {}
+  FileSharedImpl(const FilePathAndType& filepath_and_type)
+      : fd_(INVALID_HANDLE), filepath_and_type_(filepath_and_type) {}
 
   ~FileSharedImpl() override = default;
 
-  // Filesystem::File
-  Api::IoCallBoolResult open(FlagSet flag) override;
-  Api::IoCallSizeResult write(absl::string_view buffer) override;
-  Api::IoCallBoolResult close() override;
   bool isOpen() const override;
   std::string path() const override;
+  DestinationType destinationType() const override;
 
 protected:
-  virtual void openFile(FlagSet in) PURE;
-  virtual ssize_t writeFile(absl::string_view buffer) PURE;
-  virtual bool closeFile() PURE;
-
-  int fd_;
-  const std::string path_;
+  filesystem_os_id_t fd_;
+  const FilePathAndType filepath_and_type_;
 };
 
 } // namespace Filesystem
