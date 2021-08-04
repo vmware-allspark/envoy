@@ -4,7 +4,7 @@
 
 #include "common/common/assert.h"
 
-#include "server/http/config_tracker_impl.h"
+#include "server/admin/config_tracker_impl.h"
 
 namespace Envoy {
 namespace Server {
@@ -20,13 +20,15 @@ public:
   bool removeHandler(const std::string&) override;
   const Network::Socket& socket() override;
   ConfigTracker& getConfigTracker() override;
-  void startHttpListener(const std::string& access_log_path, const std::string& address_out_path,
+  void startHttpListener(const std::list<AccessLog::InstanceSharedPtr>& access_logs,
+                         const std::string& address_out_path,
                          Network::Address::InstanceConstSharedPtr address,
                          const Network::Socket::OptionsSharedPtr&,
                          Stats::ScopePtr&& listener_scope) override;
   Http::Code request(absl::string_view path_and_query, absl::string_view method,
                      Http::ResponseHeaderMap& response_headers, std::string& body) override;
   void addListenerToHandler(Network::ConnectionHandler* handler) override;
+  uint32_t concurrency() const override { return 1; }
 
 private:
   ConfigTrackerImpl config_tracker_;
