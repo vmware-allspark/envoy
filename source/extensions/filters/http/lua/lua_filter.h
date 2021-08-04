@@ -1,12 +1,15 @@
 #pragma once
 
+#include "envoy/extensions/filters/http/lua/v3/lua.pb.h"
 #include "envoy/http/filter.h"
 #include "envoy/upstream/cluster_manager.h"
 
 #include "common/crypto/utility.h"
+#include "common/http/utility.h"
 
 #include "extensions/common/utility.h"
 #include "extensions/filters/common/lua/wrappers.h"
+#include "extensions/filters/http/common/factory_base.h"
 #include "extensions/filters/http/lua/wrappers.h"
 #include "extensions/filters/http/well_known_names.h"
 
@@ -14,6 +17,31 @@ namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
 namespace Lua {
+
+constexpr char GLOBAL_SCRIPT_NAME[] = "GLOBAL";
+
+class PerLuaCodeSetup : Logger::Loggable<Logger::Id::lua> {
+public:
+  PerLuaCodeSetup(const std::string& lua_code, ThreadLocal::SlotAllocator& tls);
+
+  Extensions::Filters::Common::Lua::CoroutinePtr createCoroutine() {
+    return lua_state_.createCoroutine();
+  }
+
+  int requestFunctionRef() { return lua_state_.getGlobalRef(request_function_slot_); }
+  int responseFunctionRef() { return lua_state_.getGlobalRef(response_function_slot_); }
+
+  uint64_t runtimeBytesUsed() { return lua_state_.runtimeBytesUsed(); }
+  void runtimeGC() { return lua_state_.runtimeGC(); }
+
+private:
+  uint64_t request_function_slot_{};
+  uint64_t response_function_slot_{};
+
+  Filters::Common::Lua::ThreadLocalState lua_state_;
+};
+
+using PerLuaCodeSetupPtr = std::unique_ptr<PerLuaCodeSetup>;
 
 /**
  * Callbacks used by a stream handler to access the filter.
@@ -69,6 +97,11 @@ public:
    * @return const Network::Connection* the current network connection handle.
    */
   virtual const Network::Connection* connection() const PURE;
+
+  /**
+   * @return const Tracing::Span& the current tracing active span.
+   */
+  virtual Tracing::Span& activeSpan() PURE;
 };
 
 class Filter;
@@ -103,7 +136,8 @@ public:
   };
 
   StreamHandleWrapper(Filters::Common::Lua::Coroutine& coroutine, Http::HeaderMap& headers,
-                      bool end_stream, Filter& filter, FilterCallbacks& callbacks);
+                      bool end_stream, Filter& filter, FilterCallbacks& callbacks,
+                      TimeSource& time_source);
 
   Http::FilterHeadersStatus start(int function_ref);
   Http::FilterDataStatus onData(Buffer::Instance& data, bool end_stream);
@@ -133,7 +167,9 @@ public:
             {"streamInfo", static_luaStreamInfo},
             {"connection", static_luaConnection},
             {"importPublicKey", static_luaImportPublicKey},
-            {"verifySignature", static_luaVerifySignature}};
+            {"verifySignature", static_luaVerifySignature},
+            {"base64Escape", static_luaBase64Escape},
+            {"timestamp", static_luaTimestamp}};
   }
 
 private:
@@ -236,8 +272,25 @@ private:
    */
   DECLARE_LUA_CLOSURE(StreamHandleWrapper, luaBodyIterator);
 
-  int luaHttpCallSynchronous(lua_State* state);
-  int luaHttpCallAsynchronous(lua_State* state);
+  /**
+   * Base64 escape a string.
+   * @param1 (string) string to be base64 escaped.
+   * @return (string) base64 escaped string.
+   */
+  DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaBase64Escape);
+
+  /**
+   * Timestamp.
+   * @param1 (string) optional format (e.g. milliseconds_from_epoch, nanoseconds_from_epoch).
+   * Defaults to milliseconds_from_epoch.
+   * @return timestamp
+   */
+  DECLARE_LUA_FUNCTION(StreamHandleWrapper, luaTimestamp);
+
+  int doSynchronousHttpCall(lua_State* state, Tracing::Span& span);
+  int doAsynchronousHttpCall(lua_State* state, Tracing::Span& span);
+
+  int timestamp(int timestamp, absl::uint128 resolution);
 
   // Filters::Common::Lua::BaseLuaObject
   void onMarkDead() override {
@@ -255,6 +308,7 @@ private:
   // Http::AsyncClient::Callbacks
   void onSuccess(const Http::AsyncClient::Request&, Http::ResponseMessagePtr&&) override;
   void onFailure(const Http::AsyncClient::Request&, Http::AsyncClient::FailureReason) override;
+  void onBeforeFinalizeUpstreamSpan(Tracing::Span&, const Http::ResponseHeaderMap*) override {}
 
   Filters::Common::Lua::Coroutine& coroutine_;
   Http::HeaderMap& headers_;
@@ -275,6 +329,10 @@ private:
   State state_{State::Running};
   std::function<void()> yield_callback_;
   Http::AsyncClient::Request* http_request_{};
+  TimeSource& time_source_;
+
+  // The inserted crypto object pointers will not be removed from this map.
+  absl::flat_hash_map<std::string, Envoy::Common::Crypto::CryptoObjectPtr> public_key_storage_;
 };
 
 /**
@@ -285,6 +343,7 @@ public:
   // Http::AsyncClient::Callbacks
   void onSuccess(const Http::AsyncClient::Request&, Http::ResponseMessagePtr&&) override {}
   void onFailure(const Http::AsyncClient::Request&, Http::AsyncClient::FailureReason) override {}
+  void onBeforeFinalizeUpstreamSpan(Tracing::Span&, const Http::ResponseHeaderMap*) override {}
 };
 
 /**
@@ -292,23 +351,85 @@ public:
  */
 class FilterConfig : Logger::Loggable<Logger::Id::lua> {
 public:
-  FilterConfig(const std::string& lua_code, ThreadLocal::SlotAllocator& tls,
-               Upstream::ClusterManager& cluster_manager);
-  Filters::Common::Lua::CoroutinePtr createCoroutine() { return lua_state_.createCoroutine(); }
-  int requestFunctionRef() { return lua_state_.getGlobalRef(request_function_slot_); }
-  int responseFunctionRef() { return lua_state_.getGlobalRef(response_function_slot_); }
-  uint64_t runtimeBytesUsed() { return lua_state_.runtimeBytesUsed(); }
-  void runtimeGC() { return lua_state_.runtimeGC(); }
+  FilterConfig(const envoy::extensions::filters::http::lua::v3::Lua& proto_config,
+               ThreadLocal::SlotAllocator& tls, Upstream::ClusterManager& cluster_manager,
+               Api::Api& api);
+
+  PerLuaCodeSetup* perLuaCodeSetup(const std::string& name) const {
+    const auto iter = per_lua_code_setups_map_.find(name);
+    if (iter != per_lua_code_setups_map_.end()) {
+      return iter->second.get();
+    }
+    return nullptr;
+  }
 
   Upstream::ClusterManager& cluster_manager_;
 
 private:
-  Filters::Common::Lua::ThreadLocalState lua_state_;
-  uint64_t request_function_slot_;
-  uint64_t response_function_slot_;
+  absl::flat_hash_map<std::string, PerLuaCodeSetupPtr> per_lua_code_setups_map_;
 };
 
 using FilterConfigConstSharedPtr = std::shared_ptr<FilterConfig>;
+
+/**
+ * Route configuration for the filter.
+ */
+class FilterConfigPerRoute : public Router::RouteSpecificFilterConfig {
+public:
+  FilterConfigPerRoute(const envoy::extensions::filters::http::lua::v3::LuaPerRoute& config,
+                       Server::Configuration::ServerFactoryContext& context);
+
+  ~FilterConfigPerRoute() override {
+    // The design of the TLS system does not allow TLS state to be modified in worker threads.
+    // However, when the route configuration is dynamically updated via RDS, the old
+    // FilterConfigPerRoute object may be destructed in a random worker thread. Therefore, to
+    // ensure thread safety, ownership of per_lua_code_setup_ptr_ must be transferred to the main
+    // thread and destroyed when the FilterConfigPerRoute object is not destructed in the main
+    // thread.
+    if (per_lua_code_setup_ptr_ && !main_thread_dispatcher_.isThreadSafe()) {
+      auto shared_ptr_wrapper =
+          std::make_shared<PerLuaCodeSetupPtr>(std::move(per_lua_code_setup_ptr_));
+      main_thread_dispatcher_.post([shared_ptr_wrapper] { shared_ptr_wrapper->reset(); });
+    }
+  }
+
+  bool disabled() const { return disabled_; }
+  const std::string& name() const { return name_; }
+  PerLuaCodeSetup* perLuaCodeSetup() const { return per_lua_code_setup_ptr_.get(); }
+
+private:
+  Event::Dispatcher& main_thread_dispatcher_;
+
+  const bool disabled_;
+  const std::string name_;
+  PerLuaCodeSetupPtr per_lua_code_setup_ptr_;
+};
+
+namespace {
+
+PerLuaCodeSetup* getPerLuaCodeSetup(const FilterConfig* filter_config,
+                                    Http::StreamFilterCallbacks* callbacks) {
+  const FilterConfigPerRoute* config_per_route = nullptr;
+  if (callbacks && callbacks->route()) {
+    config_per_route = Http::Utility::resolveMostSpecificPerFilterConfig<FilterConfigPerRoute>(
+        HttpFilterNames::get().Lua, callbacks->route());
+  }
+
+  if (config_per_route != nullptr) {
+    if (config_per_route->disabled()) {
+      return nullptr;
+    }
+    if (!config_per_route->name().empty()) {
+      ASSERT(filter_config);
+      return filter_config->perLuaCodeSetup(config_per_route->name());
+    }
+    return config_per_route->perLuaCodeSetup();
+  }
+  ASSERT(filter_config);
+  return filter_config->perLuaCodeSetup(GLOBAL_SCRIPT_NAME);
+}
+
+} // namespace
 
 // TODO(mattklein123): Filter stats.
 
@@ -317,7 +438,8 @@ using FilterConfigConstSharedPtr = std::shared_ptr<FilterConfig>;
  */
 class Filter : public Http::StreamFilter, Logger::Loggable<Logger::Id::lua> {
 public:
-  Filter(FilterConfigConstSharedPtr config) : config_(config) {}
+  Filter(FilterConfigConstSharedPtr config, TimeSource& time_source)
+      : config_(config), time_source_(time_source) {}
 
   Upstream::ClusterManager& clusterManager() { return config_->cluster_manager_; }
   void scriptError(const Filters::Common::Lua::LuaException& e);
@@ -329,8 +451,10 @@ public:
   // Http::StreamDecoderFilter
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& headers,
                                           bool end_stream) override {
-    return doHeaders(request_stream_wrapper_, request_coroutine_, decoder_callbacks_,
-                     config_->requestFunctionRef(), headers, end_stream);
+    PerLuaCodeSetup* setup = getPerLuaCodeSetup(config_.get(), decoder_callbacks_.callbacks_);
+    const int function_ref = setup ? setup->requestFunctionRef() : LUA_REFNIL;
+    return doHeaders(request_stream_wrapper_, request_coroutine_, decoder_callbacks_, function_ref,
+                     setup, headers, end_stream);
   }
   Http::FilterDataStatus decodeData(Buffer::Instance& data, bool end_stream) override {
     return doData(request_stream_wrapper_, data, end_stream);
@@ -348,8 +472,10 @@ public:
   }
   Http::FilterHeadersStatus encodeHeaders(Http::ResponseHeaderMap& headers,
                                           bool end_stream) override {
+    PerLuaCodeSetup* setup = getPerLuaCodeSetup(config_.get(), decoder_callbacks_.callbacks_);
+    const int function_ref = setup ? setup->responseFunctionRef() : LUA_REFNIL;
     return doHeaders(response_stream_wrapper_, response_coroutine_, encoder_callbacks_,
-                     config_->responseFunctionRef(), headers, end_stream);
+                     function_ref, setup, headers, end_stream);
   }
   Http::FilterDataStatus encodeData(Buffer::Instance& data, bool end_stream) override {
     return doData(response_stream_wrapper_, data, end_stream);
@@ -381,6 +507,7 @@ private:
     const ProtobufWkt::Struct& metadata() const override;
     StreamInfo::StreamInfo& streamInfo() override { return callbacks_->streamInfo(); }
     const Network::Connection* connection() const override { return callbacks_->connection(); }
+    Tracing::Span& activeSpan() override { return callbacks_->activeSpan(); }
 
     Filter& parent_;
     Http::StreamDecoderFilterCallbacks* callbacks_{};
@@ -402,6 +529,7 @@ private:
     const ProtobufWkt::Struct& metadata() const override;
     StreamInfo::StreamInfo& streamInfo() override { return callbacks_->streamInfo(); }
     const Network::Connection* connection() const override { return callbacks_->connection(); }
+    Tracing::Span& activeSpan() override { return callbacks_->activeSpan(); }
 
     Filter& parent_;
     Http::StreamEncoderFilterCallbacks* callbacks_{};
@@ -412,7 +540,8 @@ private:
   Http::FilterHeadersStatus doHeaders(StreamHandleRef& handle,
                                       Filters::Common::Lua::CoroutinePtr& coroutine,
                                       FilterCallbacks& callbacks, int function_ref,
-                                      Http::HeaderMap& headers, bool end_stream);
+                                      PerLuaCodeSetup* setup, Http::HeaderMap& headers,
+                                      bool end_stream);
   Http::FilterDataStatus doData(StreamHandleRef& handle, Buffer::Instance& data, bool end_stream);
   Http::FilterTrailersStatus doTrailers(StreamHandleRef& handle, Http::HeaderMap& trailers);
 
@@ -422,6 +551,7 @@ private:
   StreamHandleRef request_stream_wrapper_;
   StreamHandleRef response_stream_wrapper_;
   bool destroyed_{};
+  TimeSource& time_source_;
 
   // These coroutines used to be owned by the stream handles. After investigating #3570, it
   // became clear that there is a circular memory reference when a coroutine yields. Basically,

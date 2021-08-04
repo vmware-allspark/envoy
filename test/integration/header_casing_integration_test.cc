@@ -30,11 +30,13 @@ public:
         });
 
     config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
-      bootstrap.mutable_static_resources()
-          ->mutable_clusters(0)
+      ConfigHelper::HttpProtocolOptions protocol_options;
+      protocol_options.mutable_explicit_http_config()
           ->mutable_http_protocol_options()
           ->mutable_header_key_format()
           ->mutable_proper_case_words();
+      ConfigHelper::setProtocolOptions(*bootstrap.mutable_static_resources()->mutable_clusters(0),
+                                       protocol_options);
     });
 
     HttpIntegrationTest::initialize();
@@ -50,7 +52,7 @@ TEST_P(HeaderCasingIntegrationTest, VerifyCasedHeaders) {
 
   IntegrationTcpClientPtr tcp_client = makeTcpConnection(lookupPort("http"));
   auto request = "GET / HTTP/1.1\r\nhost: host\r\nmy-header: foo\r\n\r\n";
-  tcp_client->write(request, false);
+  ASSERT_TRUE(tcp_client->write(request, false));
 
   Envoy::FakeRawConnectionPtr upstream_connection;
   ASSERT_TRUE(fake_upstreams_[0]->waitForRawConnection(upstream_connection));
@@ -62,7 +64,6 @@ TEST_P(HeaderCasingIntegrationTest, VerifyCasedHeaders) {
 
   EXPECT_TRUE(absl::StrContains(upstream_request, "My-Header: foo"));
   EXPECT_TRUE(absl::StrContains(upstream_request, "Host: host"));
-  EXPECT_TRUE(absl::StrContains(upstream_request, "Content-Length: 0"));
 
   // Verify that the downstream response has proper cased headers.
   auto response =
