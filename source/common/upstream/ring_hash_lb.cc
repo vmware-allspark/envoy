@@ -18,7 +18,7 @@ namespace Upstream {
 
 RingHashLoadBalancer::RingHashLoadBalancer(
     const PrioritySet& priority_set, ClusterStats& stats, Stats::Scope& scope,
-    Runtime::Loader& runtime, Runtime::RandomGenerator& random,
+    Runtime::Loader& runtime, Random::RandomGenerator& random,
     const absl::optional<envoy::config::cluster::v3::Cluster::RingHashLbConfig>& config,
     const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config)
     : ThreadAwareLoadBalancerBase(priority_set, stats, runtime, random, common_config),
@@ -34,7 +34,9 @@ RingHashLoadBalancer::RingHashLoadBalancer(
       use_hostname_for_hashing_(
           common_config.has_consistent_hashing_lb_config()
               ? common_config.consistent_hashing_lb_config().use_hostname_for_hashing()
-              : false) {
+              : false),
+      hash_balance_factor_(PROTOBUF_GET_WRAPPED_OR_DEFAULT(
+          common_config.consistent_hashing_lb_config(), hash_balance_factor, 0)) {
   // It's important to do any config validation here, rather than deferring to Ring's ctor,
   // because any exceptions thrown here will be caught and handled properly.
   if (min_ring_size_ > max_ring_size_) {
@@ -147,11 +149,10 @@ RingHashLoadBalancer::Ring::Ring(const NormalizedHostWeightVector& normalized_ho
   uint64_t max_hashes_per_host = 0;
   for (const auto& entry : normalized_host_weights) {
     const auto& host = entry.first;
-    const std::string& address_string =
-        use_hostname_for_hashing ? host->hostname() : host->address()->asString();
-    ASSERT(!address_string.empty());
+    const absl::string_view key_to_hash = hashKey(host, use_hostname_for_hashing);
+    ASSERT(!key_to_hash.empty());
 
-    hash_key_buffer.assign(address_string.begin(), address_string.end());
+    hash_key_buffer.assign(key_to_hash.begin(), key_to_hash.end());
     hash_key_buffer.emplace_back('_');
     auto offset_start = hash_key_buffer.end();
 
@@ -168,7 +169,7 @@ RingHashLoadBalancer::Ring::Ring(const NormalizedHostWeightVector& normalized_ho
 
       const uint64_t hash =
           (hash_function == HashFunction::Cluster_RingHashLbConfig_HashFunction_MURMUR_HASH_2)
-              ? MurmurHash::murmurHash2_64(hash_key, MurmurHash::STD_HASH_SEED)
+              ? MurmurHash::murmurHash2(hash_key, MurmurHash::STD_HASH_SEED)
               : HashUtil::xxHash64(hash_key);
 
       ENVOY_LOG(trace, "ring hash: hash_key={} hash={}", hash_key.data(), hash);
@@ -186,10 +187,8 @@ RingHashLoadBalancer::Ring::Ring(const NormalizedHostWeightVector& normalized_ho
   });
   if (ENVOY_LOG_CHECK_LEVEL(trace)) {
     for (const auto& entry : ring_) {
-      ENVOY_LOG(trace, "ring hash: host={} hash={}",
-                use_hostname_for_hashing ? entry.host_->hostname()
-                                         : entry.host_->address()->asString(),
-                entry.hash_);
+      const absl::string_view key_to_hash = hashKey(entry.host_, use_hostname_for_hashing);
+      ENVOY_LOG(trace, "ring hash: host={} hash={}", key_to_hash, entry.hash_);
     }
   }
 
