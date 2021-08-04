@@ -52,7 +52,8 @@ private:
 
   Upstream::ProtocolOptionsConfigConstSharedPtr createProtocolOptionsTyped(
       const envoy::extensions::filters::network::thrift_proxy::v3::ThriftProtocolOptions&
-          proto_config) override {
+          proto_config,
+      Server::Configuration::ProtocolOptionsFactoryContext&) override {
     return std::make_shared<ProtocolOptionsConfigImpl>(proto_config);
   }
 };
@@ -80,6 +81,8 @@ public:
   TransportPtr createTransport() override;
   ProtocolPtr createProtocol() override;
   Router::Config& routerConfig() override { return *this; }
+  bool payloadPassthrough() const override { return payload_passthrough_; }
+  uint64_t maxRequestsPerConnection() const override { return max_requests_per_connection_; }
 
 private:
   void processFilter(
@@ -93,6 +96,9 @@ private:
   std::unique_ptr<Router::RouteMatcher> route_matcher_;
 
   std::list<ThriftFilters::FilterFactoryCb> filter_factories_;
+  const bool payload_passthrough_;
+
+  const uint64_t max_requests_per_connection_{};
 };
 
 } // namespace ThriftProxy
