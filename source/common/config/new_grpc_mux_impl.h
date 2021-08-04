@@ -1,6 +1,9 @@
 #pragma once
 
+#include <memory>
+
 #include "envoy/api/v2/discovery.pb.h"
+#include "envoy/common/random_generator.h"
 #include "envoy/common/token_bucket.h"
 #include "envoy/config/grpc_mux.h"
 #include "envoy/config/subscription.h"
@@ -13,6 +16,7 @@
 #include "common/config/pausable_ack_queue.h"
 #include "common/config/watch_map.h"
 #include "common/grpc/common.h"
+#include "common/runtime/runtime_features.h"
 
 namespace Envoy {
 namespace Config {
@@ -30,18 +34,27 @@ public:
   NewGrpcMuxImpl(Grpc::RawAsyncClientPtr&& async_client, Event::Dispatcher& dispatcher,
                  const Protobuf::MethodDescriptor& service_method,
                  envoy::config::core::v3::ApiVersion transport_api_version,
-                 Runtime::RandomGenerator& random, Stats::Scope& scope,
+                 Random::RandomGenerator& random, Stats::Scope& scope,
                  const RateLimitSettings& rate_limit_settings,
                  const LocalInfo::LocalInfo& local_info);
 
-  GrpcMuxWatchPtr addWatch(const std::string& type_url, const std::set<std::string>& resources,
-                           SubscriptionCallbacks& callbacks) override;
+  GrpcMuxWatchPtr addWatch(const std::string& type_url,
+                           const absl::flat_hash_set<std::string>& resources,
+                           SubscriptionCallbacks& callbacks,
+                           OpaqueResourceDecoder& resource_decoder,
+                           const SubscriptionOptions& options) override;
 
-  void pause(const std::string& type_url) override;
-  void resume(const std::string& type_url) override;
-  bool paused(const std::string& type_url) const override;
+  void requestOnDemandUpdate(const std::string& type_url,
+                             const absl::flat_hash_set<std::string>& for_update) override;
+
+  ScopedResume pause(const std::string& type_url) override;
+  ScopedResume pause(const std::vector<std::string> type_urls) override;
+
+  void registerVersionedTypeUrl(const std::string& type_url);
+
   void onDiscoveryResponse(
-      std::unique_ptr<envoy::service::discovery::v3::DeltaDiscoveryResponse>&& message) override;
+      std::unique_ptr<envoy::service::discovery::v3::DeltaDiscoveryResponse>&& message,
+      ControlPlaneStats& control_plane_stats) override;
 
   void onStreamEstablished() override;
 
@@ -55,8 +68,10 @@ public:
   void start() override;
 
   struct SubscriptionStuff {
-    SubscriptionStuff(const std::string& type_url, const LocalInfo::LocalInfo& local_info)
-        : sub_state_(type_url, watch_map_, local_info) {}
+    SubscriptionStuff(const std::string& type_url, const LocalInfo::LocalInfo& local_info,
+                      const bool use_namespace_matching, Event::Dispatcher& dispatcher)
+        : watch_map_(use_namespace_matching),
+          sub_state_(type_url, watch_map_, local_info, dispatcher) {}
 
     WatchMap watch_map_;
     DeltaSubscriptionState sub_state_;
@@ -65,16 +80,19 @@ public:
     SubscriptionStuff& operator=(const SubscriptionStuff&) = delete;
   };
 
+  using SubscriptionStuffPtr = std::unique_ptr<SubscriptionStuff>;
+
   // for use in tests only
-  const absl::flat_hash_map<std::string, std::unique_ptr<SubscriptionStuff>>& subscriptions() {
+  const absl::flat_hash_map<std::string, SubscriptionStuffPtr>& subscriptions() {
     return subscriptions_;
   }
 
 private:
   class WatchImpl : public GrpcMuxWatch {
   public:
-    WatchImpl(const std::string& type_url, Watch* watch, NewGrpcMuxImpl& parent)
-        : type_url_(type_url), watch_(watch), parent_(parent) {}
+    WatchImpl(const std::string& type_url, Watch* watch, NewGrpcMuxImpl& parent,
+              const SubscriptionOptions& options)
+        : type_url_(type_url), watch_(watch), parent_(parent), options_(options) {}
 
     ~WatchImpl() override { remove(); }
 
@@ -85,14 +103,15 @@ private:
       }
     }
 
-    void update(const std::set<std::string>& resources) override {
-      parent_.updateWatch(type_url_, watch_, resources);
+    void update(const absl::flat_hash_set<std::string>& resources) override {
+      parent_.updateWatch(type_url_, watch_, resources, options_);
     }
 
   private:
     const std::string type_url_;
     Watch* watch_;
     NewGrpcMuxImpl& parent_;
+    const SubscriptionOptions options_;
   };
 
   void removeWatch(const std::string& type_url, Watch* watch);
@@ -101,9 +120,10 @@ private:
   // the whole subscription, or if a removed name has no other watch interested in it, then the
   // subscription will enqueue and attempt to send an appropriate discovery request.
   void updateWatch(const std::string& type_url, Watch* watch,
-                   const std::set<std::string>& resources);
+                   const absl::flat_hash_set<std::string>& resources,
+                   const SubscriptionOptions& options);
 
-  void addSubscription(const std::string& type_url);
+  void addSubscription(const std::string& type_url, bool use_namespace_matching);
 
   void trySendDiscoveryRequests();
 
@@ -119,13 +139,16 @@ private:
   // of subscriptions were activated.
   absl::optional<std::string> whoWantsToSendDiscoveryRequest();
 
+  // Invoked when dynamic context parameters change for a resource type.
+  void onDynamicContextUpdate(absl::string_view resource_type_url);
+
   // Resource (N)ACKs we're waiting to send, stored in the order that they should be sent in. All
   // of our different resource types' ACKs are mixed together in this queue. See class for
   // description of how it interacts with pause() and resume().
   PausableAckQueue pausable_ack_queue_;
 
   // Map key is type_url.
-  absl::flat_hash_map<std::string, std::unique_ptr<SubscriptionStuff>> subscriptions_;
+  absl::flat_hash_map<std::string, SubscriptionStuffPtr> subscriptions_;
 
   // Determines the order of initial discovery requests. (Assumes that subscriptions are added in
   // the order of Envoy's dependency ordering).
@@ -136,10 +159,14 @@ private:
       grpc_stream_;
 
   const LocalInfo::LocalInfo& local_info_;
-
+  Common::CallbackHandlePtr dynamic_update_callback_handle_;
   const envoy::config::core::v3::ApiVersion transport_api_version_;
+  Event::Dispatcher& dispatcher_;
+
+  const bool enable_type_url_downgrade_and_upgrade_;
 };
 
+using NewGrpcMuxImplPtr = std::unique_ptr<NewGrpcMuxImpl>;
 using NewGrpcMuxImplSharedPtr = std::shared_ptr<NewGrpcMuxImpl>;
 
 } // namespace Config

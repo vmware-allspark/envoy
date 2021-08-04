@@ -11,6 +11,8 @@
 
 #include "common/common/byte_order.h"
 #include "common/common/fmt.h"
+#include "common/common/safe_memcpy.h"
+#include "common/common/utility.h"
 
 #include "extensions/filters/network/kafka/kafka_types.h"
 
@@ -66,11 +68,9 @@ public:
  */
 template <typename T> class IntDeserializer : public Deserializer<T> {
 public:
-  IntDeserializer() : written_{0} {};
-
   uint32_t feed(absl::string_view& data) override {
     const uint32_t available = std::min<uint32_t>(sizeof(buf_) - written_, data.size());
-    memcpy(buf_ + written_, data.data(), available);
+    memcpy(buf_ + written_, data.data(), available); // NOLINT(safe-memcpy)
     written_ += available;
 
     if (written_ == sizeof(buf_)) {
@@ -86,7 +86,7 @@ public:
 
 protected:
   char buf_[sizeof(T) / sizeof(char)];
-  uint32_t written_;
+  uint32_t written_{0};
   bool ready_{false};
 };
 
@@ -96,8 +96,7 @@ protected:
 class Int8Deserializer : public IntDeserializer<int8_t> {
 public:
   int8_t get() const override {
-    int8_t result;
-    memcpy(&result, buf_, sizeof(result));
+    int8_t result = buf_[0];
     return result;
   }
 };
@@ -109,7 +108,7 @@ class Int16Deserializer : public IntDeserializer<int16_t> {
 public:
   int16_t get() const override {
     int16_t result;
-    memcpy(&result, buf_, sizeof(result));
+    safeMemcpyUnsafeSrc(&result, buf_);
     return be16toh(result);
   }
 };
@@ -121,7 +120,7 @@ class Int32Deserializer : public IntDeserializer<int32_t> {
 public:
   int32_t get() const override {
     int32_t result;
-    memcpy(&result, buf_, sizeof(result));
+    safeMemcpyUnsafeSrc(&result, buf_);
     return be32toh(result);
   }
 };
@@ -133,7 +132,7 @@ class UInt32Deserializer : public IntDeserializer<uint32_t> {
 public:
   uint32_t get() const override {
     uint32_t result;
-    memcpy(&result, buf_, sizeof(result));
+    safeMemcpyUnsafeSrc(&result, buf_);
     return be32toh(result);
   }
 };
@@ -145,7 +144,7 @@ class Int64Deserializer : public IntDeserializer<int64_t> {
 public:
   int64_t get() const override {
     int64_t result;
-    memcpy(&result, buf_, sizeof(result));
+    safeMemcpyUnsafeSrc(&result, buf_);
     return be64toh(result);
   }
 };
@@ -190,7 +189,7 @@ public:
 
       // Read next byte from input.
       uint8_t el;
-      memcpy(&el, data.data(), sizeof(uint8_t));
+      safeMemcpy(&el, data.data());
       data = {data.data() + 1, data.size() - 1};
       processed++;
 
@@ -208,7 +207,8 @@ public:
         offset_ += 7;
         // Valid input can have at most 5 bytes.
         if (offset_ >= 5 * 7) {
-          throw EnvoyException("VarUInt32 is too long (5th byte has highest bit set)");
+          ExceptionUtil::throwEnvoyException(
+              "VarUInt32 is too long (5th byte has highest bit set)");
         }
       }
     }
@@ -465,7 +465,7 @@ public:
       if (required_ >= 0) {
         children_ = std::vector<DeserializerType>(required_);
       } else {
-        throw EnvoyException(absl::StrCat("invalid ARRAY length: ", required_));
+        ExceptionUtil::throwEnvoyException(absl::StrCat("invalid ARRAY length: ", required_));
       }
       length_consumed_ = true;
     }
@@ -544,7 +544,8 @@ public:
       if (required >= 1) {
         children_ = std::vector<DeserializerType>(required - 1);
       } else {
-        throw EnvoyException(absl::StrCat("invalid COMPACT_ARRAY length: ", required));
+        ExceptionUtil::throwEnvoyException(
+            absl::StrCat("invalid COMPACT_ARRAY length: ", required));
       }
       length_consumed_ = true;
     }
@@ -627,7 +628,8 @@ public:
         ready_ = true;
       }
       if (required_ < NULL_ARRAY_LENGTH) {
-        throw EnvoyException(fmt::format("invalid NULLABLE_ARRAY length: {}", required_));
+        ExceptionUtil::throwEnvoyException(
+            fmt::format("invalid NULLABLE_ARRAY length: {}", required_));
       }
 
       length_consumed_ = true;
