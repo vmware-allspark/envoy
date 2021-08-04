@@ -10,6 +10,7 @@
 #include "envoy/type/v3/percent.pb.h"
 
 #include "common/http/date_provider.h"
+#include "common/local_reply/local_reply.h"
 #include "common/network/utility.h"
 #include "common/stats/symbol_table_impl.h"
 
@@ -48,15 +49,18 @@ namespace Http {
   COUNTER(downstream_rq_4xx)                                                                       \
   COUNTER(downstream_rq_5xx)                                                                       \
   COUNTER(downstream_rq_completed)                                                                 \
+  COUNTER(downstream_rq_failed_path_normalization)                                                 \
   COUNTER(downstream_rq_http1_total)                                                               \
   COUNTER(downstream_rq_http2_total)                                                               \
   COUNTER(downstream_rq_http3_total)                                                               \
   COUNTER(downstream_rq_idle_timeout)                                                              \
   COUNTER(downstream_rq_non_relative_path)                                                         \
   COUNTER(downstream_rq_overload_close)                                                            \
+  COUNTER(downstream_rq_redirected_with_normalized_path)                                           \
   COUNTER(downstream_rq_response_before_rq_complete)                                               \
   COUNTER(downstream_rq_rx_reset)                                                                  \
   COUNTER(downstream_rq_timeout)                                                                   \
+  COUNTER(downstream_rq_header_timeout)                                                            \
   COUNTER(downstream_rq_too_large)                                                                 \
   COUNTER(downstream_rq_total)                                                                     \
   COUNTER(downstream_rq_tx_reset)                                                                  \
@@ -166,6 +170,18 @@ enum class ForwardClientCertType {
 enum class ClientCertDetailsType { Cert, Chain, Subject, URI, DNS };
 
 /**
+ * Type that indicates how port should be stripped from Host header.
+ */
+enum class StripPortType {
+  // Removes the port from host/authority header only if the port matches with the listener port.
+  MatchingHost,
+  // Removes any port from host/authority header.
+  Any,
+  // Keeps the port in host/authority header as is.
+  None
+};
+
+/**
  * Configuration for what addresses should be considered internal beyond the defaults.
  */
 class InternalAddressConfig {
@@ -195,9 +211,9 @@ public:
   virtual ~ConnectionManagerConfig() = default;
 
   /**
-   * @return RequestIDExtensionSharedPtr The request id utilities instance to use
+   * @return RequestIDExtensionSharedPtr The request id utilities instance to use.
    */
-  virtual RequestIDExtensionSharedPtr requestIDExtension() PURE;
+  virtual const RequestIDExtensionSharedPtr& requestIDExtension() PURE;
 
   /**
    *  @return const std::list<AccessLog::InstanceSharedPtr>& the access logs to write to.
@@ -246,6 +262,11 @@ public:
   virtual bool preserveExternalRequestId() const PURE;
 
   /**
+   * @return whether the x-request-id should always be set in the response.
+   */
+  virtual bool alwaysSetRequestIdInResponse() const PURE;
+
+  /**
    * @return optional idle timeout for incoming connection manager connections.
    */
   virtual absl::optional<std::chrono::milliseconds> idleTimeout() const PURE;
@@ -282,6 +303,12 @@ public:
    *         a disabled request timeout.
    */
   virtual std::chrono::milliseconds requestTimeout() const PURE;
+
+  /**
+   * @return request header timeout for incoming connection manager connections. Zero indicates a
+   *         disabled request header timeout.
+   */
+  virtual std::chrono::milliseconds requestHeadersTimeout() const PURE;
 
   /**
    * @return delayed close timeout for downstream HTTP connections. Zero indicates a disabled
@@ -404,6 +431,12 @@ public:
   virtual bool proxy100Continue() const PURE;
 
   /**
+   * @return bool supplies if the HttpConnectionManager should handle invalid HTTP with a stream
+   * error or connection error.
+   */
+  virtual bool streamErrorOnInvalidHttpMessaging() const PURE;
+
+  /**
    * @return supplies the http1 settings.
    */
   virtual const Http::Http1Settings& http1Settings() const PURE;
@@ -420,11 +453,29 @@ public:
   virtual bool shouldMergeSlashes() const PURE;
 
   /**
+   * @return port strip type from host/authority header.
+   */
+  virtual StripPortType stripPortType() const PURE;
+
+  /**
    * @return the action HttpConnectionManager should take when receiving client request
    * headers containing underscore characters.
    */
   virtual envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
   headersWithUnderscoresAction() const PURE;
+
+  /**
+   * @return LocalReply configuration which supplies mapping for local reply generated by Envoy.
+   */
+  virtual const LocalReply::LocalReply& localReply() const PURE;
+
+  /**
+   * @return the action HttpConnectionManager should take when receiving client request
+   * with URI path containing %2F, %2f, %5c or %5C sequences.
+   */
+  virtual envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager::
+      PathWithEscapedSlashesAction
+      pathWithEscapedSlashesAction() const PURE;
 };
 } // namespace Http
 } // namespace Envoy

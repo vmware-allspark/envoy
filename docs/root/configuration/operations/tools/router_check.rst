@@ -10,7 +10,7 @@ Route table check tool
   file.
 
 The following specifies input to the route table check tool. The route table check tool checks if
-the route returned by a :ref:`router <envoy_api_msg_RouteConfiguration>` matches what is expected.
+the route returned by a :ref:`router <envoy_v3_api_msg_config.route.v3.RouteConfiguration>` matches what is expected.
 The tool can be used to check cluster name, virtual cluster name,
 virtual host name, manual path rewrite, manual host rewrite, path redirect, and
 header field matches. Extensions for other test cases can be added. Details about installing the tool
@@ -67,12 +67,14 @@ expects a cluster name match of "instant-server".::
       host_rewrite: ...,
       path_rewrite: ...,
       path_redirect: ...,
-      request_header_fields:
-        - key: ...,
-          value: ...
-      response_header_fields:
-        - key: ...,
-          value: ...
+      request_header_matches:
+        - name: ...,
+          exact_match: ...
+      response_header_matches:
+        - name: ...,
+          exact_match: ...
+        - name: ...,
+          presence_match: ...
 
 test_name
   *(required, string)* The name of a test object.
@@ -98,7 +100,7 @@ input
   random_value
     *(optional, integer)* An integer used to identify the target for weighted cluster selection
     and as a factor for the routing engine to decide whether a runtime based route takes effect.
-    The default value of random_value is 0. For routes with runtime fraction numerators of 0, 
+    The default value of random_value is 0. For routes with runtime fraction numerators of 0,
     the route checker tool changes the numerators to 1 so they can be tested with random_value
     set to 0 to simulate the route being enabled and random_value set to any int >= 1 to
     simulate the route being disabled.
@@ -150,15 +152,23 @@ validate
     *(optional, string)* Match the returned redirect path.
 
   request_header_fields, response_header_fields
-    *(optional, array)*  Match the listed header fields. Examples header fields include the "path", "cookie",
+    *(optional, array, deprecated)*  Match the listed header fields. Example header fields include the "path", "cookie",
     and "date" fields. The header fields are checked after all other test cases. Thus, the header fields checked
     will be those of the redirected or rewritten routes when applicable.
+    These fields are deprecated. Use request_header_matches, response_header_matches instead.
 
     key
       *(required, string)* The name of the header field to match.
 
     value
       *(required, string)* The value of the header field to match.
+
+  request_header_matches, response_header_matches
+    *(optional, array)*  Matchers for the listed headers. Example header fields include the "path", "cookie",
+    and "date" fields, as well as custom headers set in the input or by the route. The header fields are checked
+    after all other test cases. Thus, the header fields checked will be those of the redirected or rewritten
+    routes when applicable.
+    - Matchers are specified as :ref:`HeaderMatchers <envoy_api_msg_route.HeaderMatcher>`, and behave the same way.
 
 Coverage
 --------

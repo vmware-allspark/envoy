@@ -127,8 +127,6 @@ public:
   MethodNameRouteEntryImpl(
       const envoy::extensions::filters::network::thrift_proxy::v3::Route& route);
 
-  const std::string& methodName() const { return method_name_; }
-
   // RouteEntryImplBase
   RouteConstSharedPtr matches(const MessageMetadata& metadata,
                               uint64_t random_value) const override;
@@ -142,8 +140,6 @@ class ServiceNameRouteEntryImpl : public RouteEntryImplBase {
 public:
   ServiceNameRouteEntryImpl(
       const envoy::extensions::filters::network::thrift_proxy::v3::Route& route);
-
-  const std::string& serviceName() const { return service_name_; }
 
   // RouteEntryImplBase
   RouteConstSharedPtr matches(const MessageMetadata& metadata,
@@ -182,13 +178,26 @@ class Router : public Tcp::ConnectionPool::UpstreamCallbacks,
 public:
   Router(Upstream::ClusterManager& cluster_manager, const std::string& stat_prefix,
          Stats::Scope& scope)
-      : cluster_manager_(cluster_manager), stats_(generateStats(stat_prefix, scope)) {}
+      : cluster_manager_(cluster_manager), stats_(generateStats(stat_prefix, scope)),
+        stat_name_set_(scope.symbolTable().makeSet("thrift_proxy")),
+        symbol_table_(scope.symbolTable()),
+        upstream_rq_call_(stat_name_set_->add("thrift.upstream_rq_call")),
+        upstream_rq_oneway_(stat_name_set_->add("thrift.upstream_rq_oneway")),
+        upstream_rq_invalid_type_(stat_name_set_->add("thrift.upstream_rq_invalid_type")),
+        upstream_resp_reply_(stat_name_set_->add("thrift.upstream_resp_reply")),
+        upstream_resp_reply_success_(stat_name_set_->add("thrift.upstream_resp_success")),
+        upstream_resp_reply_error_(stat_name_set_->add("thrift.upstream_resp_error")),
+        upstream_resp_exception_(stat_name_set_->add("thrift.upstream_resp_exception")),
+        upstream_resp_invalid_type_(stat_name_set_->add("thrift.upstream_resp_invalid_type")),
+        upstream_rq_time_(stat_name_set_->add("thrift.upstream_rq_time")),
+        passthrough_supported_(false) {}
 
   ~Router() override = default;
 
   // ThriftFilters::DecoderFilter
   void onDestroy() override;
   void setDecoderFilterCallbacks(ThriftFilters::DecoderFilterCallbacks& callbacks) override;
+  bool passthroughSupported() const override { return passthrough_supported_; }
 
   // ProtocolConverter
   FilterStatus transportBegin(MessageMetadataSharedPtr metadata) override;
@@ -223,7 +232,7 @@ private:
     void releaseConnection(bool close);
 
     // Tcp::ConnectionPool::Callbacks
-    void onPoolFailure(Tcp::ConnectionPool::PoolFailureReason reason,
+    void onPoolFailure(ConnectionPool::PoolFailureReason reason,
                        Upstream::HostDescriptionConstSharedPtr host) override;
     void onPoolReady(Tcp::ConnectionPool::ConnectionDataPtr&& conn,
                      Upstream::HostDescriptionConstSharedPtr host) override;
@@ -232,7 +241,8 @@ private:
     void onRequestComplete();
     void onResponseComplete();
     void onUpstreamHostSelected(Upstream::HostDescriptionConstSharedPtr host);
-    void onResetStream(Tcp::ConnectionPool::PoolFailureReason reason);
+    void onResetStream(ConnectionPool::PoolFailureReason reason);
+    void chargeResponseTiming();
 
     Router& parent_;
     Tcp::ConnectionPool::Instance& conn_pool_;
@@ -249,7 +259,24 @@ private:
     bool request_complete_ : 1;
     bool response_started_ : 1;
     bool response_complete_ : 1;
+
+    bool charged_response_timing_{false};
+    MonotonicTime downstream_request_complete_time_;
   };
+
+  // Stats
+  void incClusterScopeCounter(const Stats::StatNameVec& names) const {
+    const Stats::SymbolTable::StoragePtr stat_name_storage = symbol_table_.join(names);
+    cluster_->statsScope().counterFromStatName(Stats::StatName(stat_name_storage.get())).inc();
+  }
+
+  void recordClusterScopeHistogram(const Stats::StatNameVec& names, Stats::Histogram::Unit unit,
+                                   uint64_t count) const {
+    const Stats::SymbolTable::StoragePtr stat_name_storage = symbol_table_.join(names);
+    cluster_->statsScope()
+        .histogramFromStatName(Stats::StatName(stat_name_storage.get()), unit)
+        .recordValue(count);
+  }
 
   void convertMessageBegin(MessageMetadataSharedPtr metadata);
   void cleanup();
@@ -261,6 +288,17 @@ private:
 
   Upstream::ClusterManager& cluster_manager_;
   RouterStats stats_;
+  Stats::StatNameSetPtr stat_name_set_;
+  Stats::SymbolTable& symbol_table_;
+  const Stats::StatName upstream_rq_call_;
+  const Stats::StatName upstream_rq_oneway_;
+  const Stats::StatName upstream_rq_invalid_type_;
+  const Stats::StatName upstream_resp_reply_;
+  const Stats::StatName upstream_resp_reply_success_;
+  const Stats::StatName upstream_resp_reply_error_;
+  const Stats::StatName upstream_resp_exception_;
+  const Stats::StatName upstream_resp_invalid_type_;
+  const Stats::StatName upstream_rq_time_;
 
   ThriftFilters::DecoderFilterCallbacks* callbacks_{};
   RouteConstSharedPtr route_{};
@@ -269,6 +307,8 @@ private:
 
   std::unique_ptr<UpstreamRequest> upstream_request_;
   Buffer::OwnedImpl upstream_request_buffer_;
+
+  bool passthrough_supported_ : 1;
 };
 
 } // namespace Router

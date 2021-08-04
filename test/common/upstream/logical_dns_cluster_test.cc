@@ -4,9 +4,11 @@
 #include <tuple>
 #include <vector>
 
+#include "envoy/common/callback.h"
 #include "envoy/config/cluster/v3/cluster.pb.h"
 #include "envoy/config/core/v3/base.pb.h"
 #include "envoy/stats/scope.h"
+#include "envoy/upstream/health_check_host_monitor.h"
 
 #include "common/network/utility.h"
 #include "common/singleton/manager_impl.h"
@@ -20,10 +22,11 @@
 #include "test/mocks/network/mocks.h"
 #include "test/mocks/protobuf/mocks.h"
 #include "test/mocks/runtime/mocks.h"
-#include "test/mocks/server/mocks.h"
+#include "test/mocks/server/admin.h"
+#include "test/mocks/server/instance.h"
 #include "test/mocks/ssl/mocks.h"
 #include "test/mocks/thread_local/mocks.h"
-#include "test/mocks/upstream/mocks.h"
+#include "test/mocks/upstream/cluster_manager.h"
 #include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
@@ -38,23 +41,24 @@ namespace Envoy {
 namespace Upstream {
 namespace {
 
-class LogicalDnsClusterTest : public testing::Test {
+class LogicalDnsClusterTest : public Event::TestUsingSimulatedTime, public testing::Test {
 protected:
-  LogicalDnsClusterTest() : api_(Api::createApiForTest(stats_store_)) {}
+  LogicalDnsClusterTest() : api_(Api::createApiForTest(stats_store_, random_)) {}
 
-  void setupFromV2Yaml(const std::string& yaml) {
+  void setupFromV3Yaml(const std::string& yaml, bool avoid_boosting = true) {
     resolve_timer_ = new Event::MockTimer(&dispatcher_);
     NiceMock<MockClusterManager> cm;
-    envoy::config::cluster::v3::Cluster cluster_config = parseClusterFromV2Yaml(yaml);
+    envoy::config::cluster::v3::Cluster cluster_config =
+        parseClusterFromV3Yaml(yaml, avoid_boosting);
     Envoy::Stats::ScopePtr scope = stats_store_.createScope(fmt::format(
         "cluster.{}.", cluster_config.alt_stat_name().empty() ? cluster_config.name()
                                                               : cluster_config.alt_stat_name()));
     Envoy::Server::Configuration::TransportSocketFactoryContextImpl factory_context(
-        admin_, ssl_context_manager_, *scope, cm, local_info_, dispatcher_, random_, stats_store_,
-        singleton_manager_, tls_, validation_visitor_, *api_);
+        admin_, ssl_context_manager_, *scope, cm, local_info_, dispatcher_, stats_store_,
+        singleton_manager_, tls_, validation_visitor_, *api_, options_);
     cluster_ = std::make_shared<LogicalDnsCluster>(cluster_config, runtime_, dns_resolver_,
                                                    factory_context, std::move(scope), false);
-    cluster_->prioritySet().addPriorityUpdateCb(
+    priority_update_cb_ = cluster_->prioritySet().addPriorityUpdateCb(
         [&](uint32_t, const HostVector&, const HostVector&) -> void {
           membership_updated_.ready();
         });
@@ -74,7 +78,7 @@ protected:
   void testBasicSetup(const std::string& config, const std::string& expected_address,
                       uint32_t expected_port, uint32_t expected_hc_port) {
     expectResolve(Network::DnsLookupFamily::V4Only, expected_address);
-    setupFromV2Yaml(config);
+    setupFromV3Yaml(config);
 
     EXPECT_CALL(membership_updated_, ready());
     EXPECT_CALL(initialized_, ready());
@@ -135,7 +139,8 @@ protected:
     EXPECT_TRUE(TestUtility::protoEqual(envoy::config::core::v3::Metadata::default_instance(),
                                         *data.host_description_->metadata()));
     data.host_description_->outlierDetector().putHttpResponseCode(200);
-    data.host_description_->healthChecker().setUnhealthy();
+    data.host_description_->healthChecker().setUnhealthy(
+        HealthCheckHostMonitor::UnhealthyType::ImmediateHealthCheckFail);
 
     expectResolve(Network::DnsLookupFamily::V4Only, expected_address);
     resolve_timer_->invokeCallback();
@@ -191,25 +196,27 @@ protected:
     tls_.shutdownThread();
   }
 
-  Stats::IsolatedStoreImpl stats_store_;
+  Stats::TestUtil::TestStore stats_store_;
   Ssl::MockContextManager ssl_context_manager_;
   std::shared_ptr<NiceMock<Network::MockDnsResolver>> dns_resolver_{
       new NiceMock<Network::MockDnsResolver>};
   Network::MockActiveDnsQuery active_dns_query_;
-  NiceMock<Runtime::MockRandomGenerator> random_;
+  NiceMock<Random::MockRandomGenerator> random_;
   Network::DnsResolver::ResolveCb dns_callback_;
   NiceMock<ThreadLocal::MockInstance> tls_;
   Event::MockTimer* resolve_timer_;
-  std::shared_ptr<LogicalDnsCluster> cluster_;
   ReadyWatcher membership_updated_;
   ReadyWatcher initialized_;
   NiceMock<Runtime::MockLoader> runtime_;
   NiceMock<Event::MockDispatcher> dispatcher_;
+  std::shared_ptr<LogicalDnsCluster> cluster_;
   NiceMock<LocalInfo::MockLocalInfo> local_info_;
   NiceMock<Server::MockAdmin> admin_;
   Singleton::ManagerImpl singleton_manager_{Thread::threadFactoryForTest()};
   NiceMock<ProtobufMessage::MockValidationVisitor> validation_visitor_;
   Api::ApiPtr api_;
+  Server::MockOptions options_;
+  Common::CallbackHandlePtr priority_update_cb_;
 };
 
 using LogicalDnsConfigTuple =
@@ -263,10 +270,14 @@ TEST_P(LogicalDnsParamTest, ImmediateResolve) {
   lb_policy: round_robin
   )EOF" + std::get<0>(GetParam()) +
                            R"EOF(
-  hosts:
-  - socket_address:
-      address: foo.bar.com
-      port_value: 443
+  load_assignment:
+        endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: foo.bar.com
+                    port_value: 443
   )EOF";
 
   EXPECT_CALL(membership_updated_, ready());
@@ -279,12 +290,13 @@ TEST_P(LogicalDnsParamTest, ImmediateResolve) {
            TestUtility::makeDnsResponse(std::get<2>(GetParam())));
         return nullptr;
       }));
-  setupFromV2Yaml(yaml);
+  setupFromV3Yaml(yaml);
   EXPECT_EQ(1UL, cluster_->prioritySet().hostSetsPerPriority()[0]->hosts().size());
   EXPECT_EQ(1UL, cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHosts().size());
   EXPECT_EQ("foo.bar.com",
             cluster_->prioritySet().hostSetsPerPriority()[0]->hosts()[0]->hostname());
-  cluster_->prioritySet().hostSetsPerPriority()[0]->hosts()[0]->healthChecker().setUnhealthy();
+  cluster_->prioritySet().hostSetsPerPriority()[0]->hosts()[0]->healthChecker().setUnhealthy(
+      HealthCheckHostMonitor::UnhealthyType::ImmediateHealthCheckFail);
   tls_.shutdownThread();
 }
 
@@ -301,14 +313,19 @@ TEST_F(LogicalDnsParamTest, FailureRefreshRateBackoffResetsWhenSuccessHappens) {
   # Since the following expectResolve() requires Network::DnsLookupFamily::V4Only we need to set
   # dns_lookup_family to V4_ONLY explicitly for v2 .yaml config.
   dns_lookup_family: V4_ONLY
-  hosts:
-  - socket_address:
-      address: foo.bar.com
-      port_value: 443
+  load_assignment:
+        endpoints:
+          - lb_endpoints:
+            - endpoint:
+                hostname: foo
+                address:
+                  socket_address:
+                    address: foo.bar.com
+                    port_value: 443
   )EOF";
 
   expectResolve(Network::DnsLookupFamily::V4Only, "foo.bar.com");
-  setupFromV2Yaml(yaml);
+  setupFromV3Yaml(yaml);
 
   // Failing response kicks the failure refresh backoff strategy.
   ON_CALL(random_, random()).WillByDefault(Return(8000));
@@ -321,6 +338,9 @@ TEST_F(LogicalDnsParamTest, FailureRefreshRateBackoffResetsWhenSuccessHappens) {
   EXPECT_CALL(*resolve_timer_, enableTimer(std::chrono::milliseconds(4000), _));
   dns_callback_(Network::DnsResolver::ResolutionStatus::Success,
                 TestUtility::makeDnsResponse({"127.0.0.1", "127.0.0.2"}));
+  EXPECT_EQ(1UL, cluster_->prioritySet().hostSetsPerPriority()[0]->hosts().size());
+  EXPECT_EQ(1UL, cluster_->prioritySet().hostSetsPerPriority()[0]->healthyHosts().size());
+  EXPECT_EQ("foo", cluster_->prioritySet().hostSetsPerPriority()[0]->hosts()[0]->hostname());
 
   // Therefore, a subsequent failure should get a [0,base * 1] refresh.
   ON_CALL(random_, random()).WillByDefault(Return(8000));
@@ -341,14 +361,18 @@ TEST_F(LogicalDnsParamTest, TtlAsDnsRefreshRate) {
   # Since the following expectResolve() requires Network::DnsLookupFamily::V4Only we need to set
   # dns_lookup_family to V4_ONLY explicitly for v2 .yaml config.
   dns_lookup_family: V4_ONLY
-  hosts:
-  - socket_address:
-      address: foo.bar.com
-      port_value: 443
+  load_assignment:
+        endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                     address: foo.bar.com
+                     port_value: 443
   )EOF";
 
   expectResolve(Network::DnsLookupFamily::V4Only, "foo.bar.com");
-  setupFromV2Yaml(yaml);
+  setupFromV3Yaml(yaml);
 
   // TTL is recorded when the DNS response is successful and not empty
   EXPECT_CALL(membership_updated_, ready());
@@ -377,17 +401,25 @@ TEST_F(LogicalDnsClusterTest, BadConfig) {
   dns_refresh_rate: 4s
   connect_timeout: 0.25s
   lb_policy: ROUND_ROBIN
-  hosts:
-  - socket_address:
-      address: foo.bar.com
-      port_value: 443
-  - socket_address:
-      address: foo2.bar.com
-      port_value: 443
+  load_assignment:
+        cluster_name: name
+        endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: foo.bar.com
+                    port_value: 443
+            - endpoint:
+                address:
+                  socket_address:
+                    address: foo2.bar.com
+                    port_value: 443
   )EOF";
 
-  EXPECT_THROW_WITH_MESSAGE(setupFromV2Yaml(multiple_hosts_yaml), EnvoyException,
-                            "LOGICAL_DNS clusters must have a single host");
+  EXPECT_THROW_WITH_MESSAGE(
+      setupFromV3Yaml(multiple_hosts_yaml), EnvoyException,
+      "LOGICAL_DNS clusters must have a single locality_lb_endpoint and a single lb_endpoint");
 
   const std::string multiple_lb_endpoints_yaml = R"EOF(
   name: name
@@ -417,7 +449,7 @@ TEST_F(LogicalDnsClusterTest, BadConfig) {
   )EOF";
 
   EXPECT_THROW_WITH_MESSAGE(
-      setupFromV2Yaml(multiple_lb_endpoints_yaml), EnvoyException,
+      setupFromV3Yaml(multiple_lb_endpoints_yaml), EnvoyException,
       "LOGICAL_DNS clusters must have a single locality_lb_endpoint and a single lb_endpoint");
 
   const std::string multiple_endpoints_yaml = R"EOF(
@@ -450,7 +482,7 @@ TEST_F(LogicalDnsClusterTest, BadConfig) {
   )EOF";
 
   EXPECT_THROW_WITH_MESSAGE(
-      setupFromV2Yaml(multiple_endpoints_yaml), EnvoyException,
+      setupFromV3Yaml(multiple_endpoints_yaml), EnvoyException,
       "LOGICAL_DNS clusters must have a single locality_lb_endpoint and a single lb_endpoint");
 
   const std::string custom_resolver_yaml = R"EOF(
@@ -474,7 +506,7 @@ TEST_F(LogicalDnsClusterTest, BadConfig) {
               port_value: 8000
   )EOF";
 
-  EXPECT_THROW_WITH_MESSAGE(setupFromV2Yaml(custom_resolver_yaml), EnvoyException,
+  EXPECT_THROW_WITH_MESSAGE(setupFromV3Yaml(custom_resolver_yaml), EnvoyException,
                             "LOGICAL_DNS clusters must NOT have a custom resolver name set");
 }
 
@@ -491,10 +523,14 @@ TEST_F(LogicalDnsClusterTest, Basic) {
   # Since the following expectResolve() requires Network::DnsLookupFamily::V4Only we need to set
   # dns_lookup_family to V4_ONLY explicitly for v2 .yaml config.
   dns_lookup_family: V4_ONLY
-  hosts:
-  - socket_address:
-      address: foo.bar.com
-      port_value: 443
+  load_assignment:
+        endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: foo.bar.com
+                    port_value: 443
   )EOF";
 
   const std::string basic_yaml_load_assignment = R"EOF(

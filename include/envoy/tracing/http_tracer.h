@@ -7,6 +7,7 @@
 #include "envoy/access_log/access_log.h"
 #include "envoy/common/pure.h"
 #include "envoy/http/header_map.h"
+#include "envoy/tracing/trace_reason.h"
 
 namespace Envoy {
 namespace Tracing {
@@ -17,30 +18,6 @@ using SpanPtr = std::unique_ptr<Span>;
 constexpr uint32_t DefaultMaxPathTagLength = 256;
 
 enum class OperationName { Ingress, Egress };
-
-/**
- * The reasons why trace sampling may or may not be performed.
- */
-enum class Reason {
-  // Not sampled based on supplied request id.
-  NotTraceableRequestId,
-  // Not sampled due to being a health check.
-  HealthCheck,
-  // Sampling enabled.
-  Sampling,
-  // Sampling forced by the service.
-  ServiceForced,
-  // Sampling forced by the client.
-  ClientForced,
-};
-
-/**
- * The decision regarding whether traces should be sampled, and the reason for it.
- */
-struct Decision {
-  Reason reason;
-  bool traced;
-};
 
 /**
  * The context for the custom tag to obtain the tag value.
@@ -158,6 +135,30 @@ public:
    * @param sampled whether the span and any subsequent child spans should be sampled
    */
   virtual void setSampled(bool sampled) PURE;
+
+  /**
+   * Retrieve a key's value from the span's baggage.
+   * This baggage data could've been set by this span or any parent spans.
+   * @param key baggage key
+   * @return the baggage's value for the given input key
+   */
+  virtual std::string getBaggage(absl::string_view key) PURE;
+
+  /**
+   * Set a key/value pair in the current span's baggage.
+   * All subsequent child spans will have access to this baggage.
+   * @param key baggage key
+   * @param key baggage value
+   */
+  virtual void setBaggage(absl::string_view key, absl::string_view value) PURE;
+
+  /**
+   * Retrieve the trace ID associated with this span.
+   * The trace id may be generated for this span, propagated by parent spans, or
+   * not created yet.
+   * @return trace ID as a hex string
+   */
+  virtual std::string getTraceIdAsHex() const PURE;
 };
 
 /**
