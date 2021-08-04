@@ -1,5 +1,3 @@
-licenses(["notice"])  # Apache 2
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_benchmark_test",
@@ -8,6 +6,8 @@ load(
     "envoy_cc_test",
     "envoy_package",
 )
+
+licenses(["notice"])  # Apache 2
 
 envoy_package()
 
@@ -26,6 +26,39 @@ envoy_cc_test(
     deps = [
         "//source/common/common:assert_lib",
         "//test/test_common:logging_lib",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "containers_test",
+    srcs = ["containers_test.cc"],
+    deps = [
+        "//source/common/common:containers_lib",
+        "//test/test_common:logging_lib",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_cc_test(
+    # Same as assert_test above, but with ENVOY_LOG_DEBUG_ASSERT_IN_RELEASE
+    name = "assert_enabled_in_release_test",
+    srcs = ["assert_test.cc"],
+    copts = ["-DENVOY_LOG_DEBUG_ASSERT_IN_RELEASE"],
+    deps = [
+        "//source/common/common:assert_lib",
+        "//test/test_common:logging_lib",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "assert2_test",
+    srcs = ["assert2_test.cc"],
+    deps = [
+        "//source/common/common:assert_lib",
+        "//test/test_common:logging_lib",
+        "//test/test_common:utility_lib",
     ],
 )
 
@@ -76,6 +109,12 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "safe_memcpy_test",
+    srcs = ["safe_memcpy_test.cc"],
+    deps = ["//source/common/common:safe_memcpy_lib"],
+)
+
+envoy_cc_test(
     name = "phantom_test",
     srcs = ["phantom_test.cc"],
     deps = ["//source/common/common:phantom"],
@@ -103,6 +142,14 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "linked_object_test",
+    srcs = ["linked_object_test.cc"],
+    deps = [
+        "//source/common/common:linked_object",
+    ],
+)
+
+envoy_cc_test(
     name = "log_macros_test",
     srcs = ["log_macros_test.cc"],
     deps = [
@@ -112,6 +159,31 @@ envoy_cc_test(
         "//test/mocks/upstream:upstream_mocks",
         "//test/test_common:logging_lib",
     ],
+)
+
+envoy_cc_test(
+    name = "fancy_log_macros_test",
+    srcs = ["log_macros_test.cc"],
+    args = ["--enable-fine-grain-logging"],
+    deps = [
+        "//source/common/common:minimal_logger_lib",
+        "//test/mocks/http:http_mocks",
+        "//test/mocks/network:network_mocks",
+        "//test/mocks/upstream:upstream_mocks",
+        "//test/test_common:logging_lib",
+    ],
+)
+
+envoy_cc_benchmark_binary(
+    name = "logger_speed_test",
+    srcs = ["logger_speed_test.cc"],
+    external_deps = ["benchmark"],
+    deps = ["//source/common/common:minimal_logger_lib"],
+)
+
+envoy_benchmark_test(
+    name = "logger_speed_test_benchmark_test",
+    benchmark_binary = "logger_speed_test",
 )
 
 envoy_cc_test(
@@ -155,6 +227,22 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "optref_test",
+    srcs = ["optref_test.cc"],
+)
+
+envoy_cc_test(
+    name = "random_generator_test",
+    srcs = ["random_generator_test.cc"],
+    deps = [
+        "//source/common/common:interval_value",
+        "//source/common/common:random_generator_lib",
+        "//test/mocks/runtime:runtime_mocks",
+        "//test/test_common:environment_lib",
+    ],
+)
+
+envoy_cc_test(
     name = "utility_test",
     srcs = ["utility_test.cc"],
     external_deps = [
@@ -162,6 +250,7 @@ envoy_cc_test(
     ],
     deps = [
         "//source/common/common:utility_lib",
+        "//test/common/stats:stat_test_utility_lib",
         "//test/test_common:simulated_time_system_lib",
         "//test/test_common:test_time_lib",
         "//test/test_common:utility_lib",
@@ -173,6 +262,8 @@ envoy_cc_test(
     srcs = ["regex_test.cc"],
     deps = [
         "//source/common/common:regex_lib",
+        "//test/test_common:logging_lib",
+        "//test/test_common:test_runtime_lib",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/type/matcher/v3:pkg_cc_proto",
     ],
@@ -195,6 +286,15 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "basic_resource_impl_test",
+    srcs = ["basic_resource_impl_test.cc"],
+    deps = [
+        "//source/common/common:basic_resource_lib",
+        "//test/mocks/runtime:runtime_mocks",
+    ],
+)
+
+envoy_cc_test(
     name = "token_bucket_impl_test",
     srcs = ["token_bucket_impl_test.cc"],
     deps = [
@@ -205,9 +305,30 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "shared_token_bucket_impl_test",
+    srcs = ["shared_token_bucket_impl_test.cc"],
+    deps = [
+        "//source/common/common:shared_token_bucket_impl_lib",
+        "//test/test_common:simulated_time_system_lib",
+        "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_cc_test(
     name = "callback_impl_test",
     srcs = ["callback_impl_test.cc"],
     deps = ["//source/common/common:callback_impl_lib"],
+)
+
+envoy_cc_benchmark_binary(
+    name = "re_speed_test",
+    srcs = ["re_speed_test.cc"],
+    external_deps = ["benchmark"],
+    deps = [
+        "//source/common/common:assert_lib",
+        "//source/common/common:utility_lib",
+        "@com_googlesource_code_re2//:re2",
+    ],
 )
 
 envoy_cc_benchmark_binary(
@@ -248,6 +369,16 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "thread_test",
+    srcs = ["thread_test.cc"],
+    deps = [
+        "//source/common/common:thread_lib",
+        "//source/common/common:thread_synchronizer_lib",
+        "//test/test_common:thread_factory_for_test_lib",
+    ],
+)
+
+envoy_cc_test(
     name = "stl_helpers_test",
     srcs = ["stl_helpers_test.cc"],
     deps = [
@@ -262,6 +393,39 @@ envoy_cc_test(
         "abseil_strings",
     ],
     deps = [
-        "//source/common/common:version_lib",
+        "//source/common/version:version_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "api_version_test",
+    srcs = ["api_version_test.cc"],
+    deps = ["//source/common/version:api_version_lib"],
+)
+
+envoy_cc_test(
+    name = "statusor_test",
+    srcs = ["statusor_test.cc"],
+    deps = [
+        "//source/common/common:statusor_lib",
+        "//source/common/http:status_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "interval_value_test",
+    srcs = ["interval_value_test.cc"],
+    deps = ["//source/common/common:interval_value"],
+)
+
+envoy_cc_test(
+    name = "scope_tracker_test",
+    srcs = ["scope_tracker_test.cc"],
+    deps = [
+        "//source/common/api:api_lib",
+        "//source/common/common:scope_tracker",
+        "//source/common/event:dispatcher_lib",
+        "//test/mocks:common_lib",
+        "//test/test_common:utility_lib",
     ],
 )
