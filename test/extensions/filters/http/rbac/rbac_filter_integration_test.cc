@@ -13,7 +13,7 @@ namespace {
 const std::string RBAC_CONFIG = R"EOF(
 name: rbac
 typed_config:
-  "@type": type.googleapis.com/envoy.config.filter.http.rbac.v2.RBAC
+  "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
   rules:
     policies:
       foo:
@@ -23,10 +23,24 @@ typed_config:
           - any: true
 )EOF";
 
+const std::string RBAC_CONFIG_WITH_DENY_ACTION = R"EOF(
+name: rbac
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+  rules:
+    action: DENY
+    policies:
+      "deny policy":
+        permissions:
+          - header: { name: ":method", exact_match: "GET" }
+        principals:
+          - any: true
+)EOF";
+
 const std::string RBAC_CONFIG_WITH_PREFIX_MATCH = R"EOF(
 name: rbac
 typed_config:
-  "@type": type.googleapis.com/envoy.config.filter.http.rbac.v2.RBAC
+  "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
   rules:
     policies:
       foo:
@@ -39,7 +53,7 @@ typed_config:
 const std::string RBAC_CONFIG_WITH_PATH_EXACT_MATCH = R"EOF(
 name: rbac
 typed_config:
-  "@type": type.googleapis.com/envoy.config.filter.http.rbac.v2.RBAC
+  "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
   rules:
     policies:
       foo:
@@ -53,7 +67,7 @@ typed_config:
 const std::string RBAC_CONFIG_WITH_PATH_IGNORE_CASE_MATCH = R"EOF(
 name: rbac
 typed_config:
-  "@type": type.googleapis.com/envoy.config.filter.http.rbac.v2.RBAC
+  "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
   rules:
     policies:
       foo:
@@ -64,6 +78,47 @@ typed_config:
           - any: true
 )EOF";
 
+const std::string RBAC_CONFIG_WITH_LOG_ACTION = R"EOF(
+name: rbac
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+  rules:
+    action: LOG
+    policies:
+      foo:
+        permissions:
+          - header: { name: ":method", exact_match: "GET" }
+        principals:
+          - any: true
+)EOF";
+
+const std::string RBAC_CONFIG_HEADER_MATCH_CONDITION = R"EOF(
+name: rbac
+typed_config:
+  "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+  rules:
+    policies:
+      foo:
+        permissions:
+          - any: true
+        principals:
+          - any: true
+        condition:
+          call_expr:
+            function: _==_
+            args:
+            - select_expr:
+                operand:
+                  select_expr:
+                    operand:
+                      ident_expr:
+                        name: request
+                    field: headers
+                field: xxx
+            - const_expr:
+               string_value: {}
+)EOF";
+
 using RBACIntegrationTest = HttpProtocolIntegrationTest;
 
 INSTANTIATE_TEST_SUITE_P(Protocols, RBACIntegrationTest,
@@ -71,6 +126,7 @@ INSTANTIATE_TEST_SUITE_P(Protocols, RBACIntegrationTest,
                          HttpProtocolIntegrationTest::protocolTestParamsToString);
 
 TEST_P(RBACIntegrationTest, Allowed) {
+  useAccessLog("%RESPONSE_CODE_DETAILS%");
   config_helper_.addFilter(RBAC_CONFIG);
   initialize();
 
@@ -88,12 +144,14 @@ TEST_P(RBACIntegrationTest, Allowed) {
   waitForNextUpstreamRequest();
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
 
-  response->waitForEndStream();
+  ASSERT_TRUE(response->waitForEndStream());
   ASSERT_TRUE(response->complete());
-  EXPECT_EQ("200", response->headers().Status()->value().getStringView());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_THAT(waitForAccessLog(access_log_name_), testing::HasSubstr("via_upstream"));
 }
 
 TEST_P(RBACIntegrationTest, Denied) {
+  useAccessLog("%RESPONSE_CODE_DETAILS%");
   config_helper_.addFilter(RBAC_CONFIG);
   initialize();
 
@@ -108,9 +166,35 @@ TEST_P(RBACIntegrationTest, Denied) {
           {"x-forwarded-for", "10.0.0.1"},
       },
       1024);
-  response->waitForEndStream();
+  ASSERT_TRUE(response->waitForEndStream());
   ASSERT_TRUE(response->complete());
-  EXPECT_EQ("403", response->headers().Status()->value().getStringView());
+  EXPECT_EQ("403", response->headers().getStatusValue());
+  EXPECT_THAT(waitForAccessLog(access_log_name_),
+              testing::HasSubstr("rbac_access_denied_matched_policy[none]"));
+}
+
+TEST_P(RBACIntegrationTest, DeniedWithDenyAction) {
+  useAccessLog("%RESPONSE_CODE_DETAILS%");
+  config_helper_.addFilter(RBAC_CONFIG_WITH_DENY_ACTION);
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{
+          {":method", "GET"},
+          {":path", "/"},
+          {":scheme", "http"},
+          {":authority", "host"},
+          {"x-forwarded-for", "10.0.0.1"},
+      },
+      1024);
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("403", response->headers().getStatusValue());
+  // Note the whitespace in the policy id is replaced by '_'.
+  EXPECT_THAT(waitForAccessLog(access_log_name_),
+              testing::HasSubstr("rbac_access_denied_matched_policy[deny_policy]"));
 }
 
 TEST_P(RBACIntegrationTest, DeniedWithPrefixRule) {
@@ -134,9 +218,9 @@ TEST_P(RBACIntegrationTest, DeniedWithPrefixRule) {
   waitForNextUpstreamRequest();
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
 
-  response->waitForEndStream();
+  ASSERT_TRUE(response->waitForEndStream());
   ASSERT_TRUE(response->complete());
-  EXPECT_EQ("200", response->headers().Status()->value().getStringView());
+  EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
 TEST_P(RBACIntegrationTest, RbacPrefixRuleUseNormalizePath) {
@@ -158,9 +242,9 @@ TEST_P(RBACIntegrationTest, RbacPrefixRuleUseNormalizePath) {
       },
       1024);
 
-  response->waitForEndStream();
+  ASSERT_TRUE(response->waitForEndStream());
   ASSERT_TRUE(response->complete());
-  EXPECT_EQ("403", response->headers().Status()->value().getStringView());
+  EXPECT_EQ("403", response->headers().getStatusValue());
 }
 
 TEST_P(RBACIntegrationTest, DeniedHeadReply) {
@@ -178,11 +262,11 @@ TEST_P(RBACIntegrationTest, DeniedHeadReply) {
           {"x-forwarded-for", "10.0.0.1"},
       },
       1024);
-  response->waitForEndStream();
+  ASSERT_TRUE(response->waitForEndStream());
   ASSERT_TRUE(response->complete());
-  EXPECT_EQ("403", response->headers().Status()->value().getStringView());
+  EXPECT_EQ("403", response->headers().getStatusValue());
   ASSERT_TRUE(response->headers().ContentLength());
-  EXPECT_NE("0", response->headers().ContentLength()->value().getStringView());
+  EXPECT_NE("0", response->headers().getContentLengthValue());
   EXPECT_THAT(response->body(), ::testing::IsEmpty());
 }
 
@@ -218,9 +302,9 @@ TEST_P(RBACIntegrationTest, RouteOverride) {
   waitForNextUpstreamRequest();
   upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
 
-  response->waitForEndStream();
+  ASSERT_TRUE(response->waitForEndStream());
   ASSERT_TRUE(response->complete());
-  EXPECT_EQ("200", response->headers().Status()->value().getStringView());
+  EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
 TEST_P(RBACIntegrationTest, PathWithQueryAndFragment) {
@@ -244,9 +328,9 @@ TEST_P(RBACIntegrationTest, PathWithQueryAndFragment) {
     waitForNextUpstreamRequest();
     upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
 
-    response->waitForEndStream();
+    ASSERT_TRUE(response->waitForEndStream());
     ASSERT_TRUE(response->complete());
-    EXPECT_EQ("200", response->headers().Status()->value().getStringView());
+    EXPECT_EQ("200", response->headers().getStatusValue());
   }
 }
 
@@ -271,10 +355,106 @@ TEST_P(RBACIntegrationTest, PathIgnoreCase) {
     waitForNextUpstreamRequest();
     upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
 
-    response->waitForEndStream();
+    ASSERT_TRUE(response->waitForEndStream());
     ASSERT_TRUE(response->complete());
-    EXPECT_EQ("200", response->headers().Status()->value().getStringView());
+    EXPECT_EQ("200", response->headers().getStatusValue());
   }
+}
+
+TEST_P(RBACIntegrationTest, LogConnectionAllow) {
+  config_helper_.addFilter(RBAC_CONFIG_WITH_LOG_ACTION);
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{
+          {":method", "POST"},
+          {":path", "/"},
+          {":scheme", "http"},
+          {":authority", "host"},
+          {"x-forwarded-for", "10.0.0.1"},
+      },
+      1024);
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// Basic CEL match on a header value.
+TEST_P(RBACIntegrationTest, HeaderMatchCondition) {
+  config_helper_.addFilter(fmt::format(RBAC_CONFIG_HEADER_MATCH_CONDITION, "yyy"));
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{
+          {":method", "POST"},
+          {":path", "/path"},
+          {":scheme", "http"},
+          {":authority", "host"},
+          {"xxx", "yyy"},
+      },
+      1024);
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+}
+
+// CEL match on a header value in which the header is a duplicate. Verifies we handle string
+// copying correctly inside the CEL expression.
+TEST_P(RBACIntegrationTest, HeaderMatchConditionDuplicateHeaderNoMatch) {
+  config_helper_.addFilter(fmt::format(RBAC_CONFIG_HEADER_MATCH_CONDITION, "yyy"));
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{
+          {":method", "POST"},
+          {":path", "/path"},
+          {":scheme", "http"},
+          {":authority", "host"},
+          {"xxx", "yyy"},
+          {"xxx", "zzz"},
+      },
+      1024);
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("403", response->headers().getStatusValue());
+}
+
+// CEL match on a header value in which the header is a duplicate. Verifies we handle string
+// copying correctly inside the CEL expression.
+TEST_P(RBACIntegrationTest, HeaderMatchConditionDuplicateHeaderMatch) {
+  config_helper_.addFilter(fmt::format(RBAC_CONFIG_HEADER_MATCH_CONDITION, "yyy,zzz"));
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  auto response = codec_client_->makeRequestWithBody(
+      Http::TestRequestHeaderMapImpl{
+          {":method", "POST"},
+          {":path", "/path"},
+          {":scheme", "http"},
+          {":authority", "host"},
+          {"xxx", "yyy"},
+          {"xxx", "zzz"},
+      },
+      1024);
+  waitForNextUpstreamRequest();
+  upstream_request_->encodeHeaders(Http::TestResponseHeaderMapImpl{{":status", "200"}}, true);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
 }
 
 } // namespace

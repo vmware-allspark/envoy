@@ -20,10 +20,9 @@ namespace Extensions {
 namespace AccessLoggers {
 namespace TcpGrpc {
 
-AccessLog::InstanceSharedPtr
-TcpGrpcAccessLogFactory::createAccessLogInstance(const Protobuf::Message& config,
-                                                 AccessLog::FilterPtr&& filter,
-                                                 Server::Configuration::FactoryContext& context) {
+AccessLog::InstanceSharedPtr TcpGrpcAccessLogFactory::createAccessLogInstance(
+    const Protobuf::Message& config, AccessLog::FilterPtr&& filter,
+    Server::Configuration::CommonFactoryContext& context) {
   GrpcCommon::validateProtoDescriptors();
 
   const auto& proto_config = MessageUtil::downcastAndValidate<
@@ -31,7 +30,8 @@ TcpGrpcAccessLogFactory::createAccessLogInstance(const Protobuf::Message& config
       config, context.messageValidationVisitor());
 
   return std::make_shared<TcpGrpcAccessLog>(std::move(filter), proto_config, context.threadLocal(),
-                                            GrpcCommon::getGrpcAccessLoggerCacheSingleton(context));
+                                            GrpcCommon::getGrpcAccessLoggerCacheSingleton(context),
+                                            context.scope());
 }
 
 ProtobufTypes::MessagePtr TcpGrpcAccessLogFactory::createEmptyConfigProto() {
