@@ -1,12 +1,19 @@
 #pragma once
 
-#include "envoy/config/filter/udp/udp_proxy/v2alpha/udp_proxy.pb.h"
 #include "envoy/event/file_event.h"
 #include "envoy/event/timer.h"
+#include "envoy/extensions/filters/udp/udp_proxy/v3/udp_proxy.pb.h"
 #include "envoy/network/filter.h"
 #include "envoy/upstream/cluster_manager.h"
 
+#include "common/api/os_sys_calls_impl.h"
+#include "common/network/socket_impl.h"
+#include "common/network/socket_interface.h"
 #include "common/network/utility.h"
+#include "common/protobuf/utility.h"
+#include "common/upstream/load_balancer_impl.h"
+
+#include "extensions/filters/udp/udp_proxy/hash_policy_impl.h"
 
 #include "absl/container/flat_hash_set.h"
 
@@ -44,6 +51,7 @@ struct UdpProxyDownstreamStats {
  */
 #define ALL_UDP_PROXY_UPSTREAM_STATS(COUNTER)                                                      \
   COUNTER(sess_rx_datagrams)                                                                       \
+  COUNTER(sess_rx_datagrams_dropped)                                                               \
   COUNTER(sess_rx_errors)                                                                          \
   COUNTER(sess_tx_datagrams)                                                                       \
   COUNTER(sess_tx_errors)
@@ -59,16 +67,33 @@ class UdpProxyFilterConfig {
 public:
   UdpProxyFilterConfig(Upstream::ClusterManager& cluster_manager, TimeSource& time_source,
                        Stats::Scope& root_scope,
-                       const envoy::config::filter::udp::udp_proxy::v2alpha::UdpProxyConfig& config)
+                       const envoy::extensions::filters::udp::udp_proxy::v3::UdpProxyConfig& config)
       : cluster_manager_(cluster_manager), time_source_(time_source), cluster_(config.cluster()),
         session_timeout_(PROTOBUF_GET_MS_OR_DEFAULT(config, idle_timeout, 60 * 1000)),
-        stats_(generateStats(config.stat_prefix(), root_scope)) {}
+        use_original_src_ip_(config.use_original_src_ip()),
+        stats_(generateStats(config.stat_prefix(), root_scope)),
+        // Default prefer_gro to true for upstream client traffic.
+        upstream_socket_config_(config.upstream_socket_config(), true) {
+    if (use_original_src_ip_ && !Api::OsSysCallsSingleton::get().supportsIpTransparent()) {
+      ExceptionUtil::throwEnvoyException(
+          "The platform does not support either IP_TRANSPARENT or IPV6_TRANSPARENT. Or the envoy "
+          "is not running with the CAP_NET_ADMIN capability.");
+    }
+    if (!config.hash_policies().empty()) {
+      hash_policy_ = std::make_unique<HashPolicyImpl>(config.hash_policies());
+    }
+  }
 
   const std::string& cluster() const { return cluster_; }
   Upstream::ClusterManager& clusterManager() const { return cluster_manager_; }
   std::chrono::milliseconds sessionTimeout() const { return session_timeout_; }
+  bool usingOriginalSrcIp() const { return use_original_src_ip_; }
+  const Udp::HashPolicy* hashPolicy() const { return hash_policy_.get(); }
   UdpProxyDownstreamStats& stats() const { return stats_; }
   TimeSource& timeSource() const { return time_source_; }
+  const Network::ResolvedUdpSocketConfig& upstreamSocketConfig() const {
+    return upstream_socket_config_;
+  }
 
 private:
   static UdpProxyDownstreamStats generateStats(const std::string& stat_prefix,
@@ -82,10 +107,31 @@ private:
   TimeSource& time_source_;
   const std::string cluster_;
   const std::chrono::milliseconds session_timeout_;
+  const bool use_original_src_ip_;
+  std::unique_ptr<const HashPolicyImpl> hash_policy_;
   mutable UdpProxyDownstreamStats stats_;
+  const Network::ResolvedUdpSocketConfig upstream_socket_config_;
 };
 
 using UdpProxyFilterConfigSharedPtr = std::shared_ptr<const UdpProxyFilterConfig>;
+
+/**
+ * Currently, it only implements the hash based routing.
+ */
+class UdpLoadBalancerContext : public Upstream::LoadBalancerContextBase {
+public:
+  UdpLoadBalancerContext(const Udp::HashPolicy* hash_policy,
+                         const Network::Address::InstanceConstSharedPtr& peer_address) {
+    if (hash_policy) {
+      hash_ = hash_policy->generateHash(*peer_address);
+    }
+  }
+
+  absl::optional<uint64_t> computeHashKey() override { return hash_; }
+
+private:
+  absl::optional<uint64_t> hash_;
+};
 
 class UdpProxyFilter : public Network::UdpListenerReadFilter,
                        public Upstream::ClusterUpdateCallbacks,
@@ -126,14 +172,15 @@ private:
     void processPacket(Network::Address::InstanceConstSharedPtr local_address,
                        Network::Address::InstanceConstSharedPtr peer_address,
                        Buffer::InstancePtr buffer, MonotonicTime receive_time) override;
-    uint64_t maxPacketSize() const override {
-      // TODO(mattklein123): Support configurable/jumbo frames when proxying to upstream.
-      // Eventually we will want to support some type of PROXY header when doing L4 QUIC
-      // forwarding.
-      return Network::MAX_UDP_PACKET_SIZE;
+    uint64_t maxDatagramSize() const override {
+      return cluster_.filter_.config_->upstreamSocketConfig().max_rx_datagram_size_;
+    }
+    void onDatagramsDropped(uint32_t dropped) override {
+      cluster_.cluster_stats_.sess_rx_datagrams_dropped_.add(dropped);
     }
 
     ClusterInfo& cluster_;
+    const bool use_original_src_ip_;
     const Network::UdpRecvData::LocalPeerAddresses addresses_;
     const Upstream::HostConstSharedPtr host_;
     // TODO(mattklein123): Consider replacing an idle timer for each session with a last used
@@ -142,11 +189,10 @@ private:
     // idle timeouts work so we should consider unifying the implementation if we move to a time
     // stamp and scan approach.
     const Event::TimerPtr idle_timer_;
-    // The IO handle is used for writing packets to the selected upstream host as well as receiving
+    // The socket is used for writing packets to the selected upstream host as well as receiving
     // packets from the upstream host. Note that a a local ephemeral port is bound on the first
     // write to the upstream host.
-    const Network::IoHandlePtr io_handle_;
-    const Event::FileEventPtr socket_event_;
+    const Network::SocketPtr socket_;
   };
 
   using ActiveSessionPtr = std::unique_ptr<ActiveSession>;
@@ -211,7 +257,7 @@ private:
       return {ALL_UDP_PROXY_UPSTREAM_STATS(POOL_COUNTER_PREFIX(scope, final_prefix))};
     }
 
-    Envoy::Common::CallbackHandle* member_update_cb_handle_;
+    Envoy::Common::CallbackHandlePtr member_update_cb_handle_;
     absl::flat_hash_set<ActiveSessionPtr, HeterogeneousActiveSessionHash,
                         HeterogeneousActiveSessionEqual>
         sessions_;
@@ -219,13 +265,14 @@ private:
         host_to_sessions_;
   };
 
-  virtual Network::IoHandlePtr createIoHandle(const Upstream::HostConstSharedPtr& host) {
+  virtual Network::SocketPtr createSocket(const Upstream::HostConstSharedPtr& host) {
     // Virtual so this can be overridden in unit tests.
-    return host->address()->socket(Network::Address::SocketType::Datagram);
+    return std::make_unique<Network::SocketImpl>(Network::Socket::Type::Datagram, host->address(),
+                                                 nullptr);
   }
 
   // Upstream::ClusterUpdateCallbacks
-  void onClusterAddOrUpdate(Upstream::ThreadLocalCluster& cluster) override;
+  void onClusterAddOrUpdate(Upstream::ThreadLocalCluster& cluster) final;
   void onClusterRemoval(const std::string& cluster_name) override;
 
   const UdpProxyFilterConfigSharedPtr config_;

@@ -11,7 +11,9 @@ sources of latency. Envoy supports three features related to system wide tracing
 
 * **Request ID generation**: Envoy will generate UUIDs when needed and populate the
   :ref:`config_http_conn_man_headers_x-request-id` HTTP header. Applications can forward the
-  x-request-id header for unified logging as well as tracing. The behavior can be configured on per :ref:`HTTP connection manager<envoy_api_field_config.filter.network.http_connection_manager.v2.HttpConnectionManager.request_id_extension>` basis using an extension.
+  x-request-id header for unified logging as well as tracing. The behavior can be configured on a
+  per :ref:`HTTP connection manager<envoy_v3_api_field_extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.request_id_extension>`
+  basis using an extension.
 * **Client trace ID joining**: The :ref:`config_http_conn_man_headers_x-client-trace-id` header can
   be used to join untrusted request IDs to the trusted internal
   :ref:`config_http_conn_man_headers_x-request-id`.
@@ -19,16 +21,15 @@ sources of latency. Envoy supports three features related to system wide tracing
   providers, that are divided into two subgroups:
 
   - External tracers which are part of the Envoy code base, like `LightStep <https://lightstep.com/>`_,
-    `Zipkin <https://zipkin.io/>`_  or any Zipkin compatible backends (e.g. `Jaeger <https://github.com/jaegertracing/>`_), and
-    `Datadog <https://datadoghq.com>`_.
+    `Zipkin <https://zipkin.io/>`_  or any Zipkin compatible backends (e.g. `Jaeger <https://github.com/jaegertracing/>`_),
+    `Datadog <https://datadoghq.com>`_, `SkyWalking <http://skywalking.apache.org/>`_ and
+    `AWS X-Ray <https://docs.aws.amazon.com/xray/latest/devguide/xray-gettingstarted.html>`_.
   - External tracers which come as a third party plugin, like `Instana <https://www.instana.com/blog/monitoring-envoy-proxy-microservices/>`_.
-
-Support for other tracing providers would not be difficult to add.
 
 How to initiate a trace
 -----------------------
 The HTTP connection manager that handles the request must have the :ref:`tracing
-<envoy_api_msg_config.filter.network.http_connection_manager.v2.HttpConnectionManager.Tracing>` object set. There are several ways tracing can be
+<envoy_v3_api_msg_extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.Tracing>` object set. There are several ways tracing can be
 initiated:
 
 * By an external client via the :ref:`config_http_conn_man_headers_x-client-trace-id`
@@ -39,7 +40,9 @@ initiated:
   runtime setting.
 
 The router filter is also capable of creating a child span for egress calls via the
-:ref:`start_child_span <envoy_api_field_config.filter.http.router.v2.Router.start_child_span>` option.
+:ref:`start_child_span <envoy_v3_api_field_extensions.filters.http.router.v3.Router.start_child_span>` option.
+
+.. _arch_overview_tracing_context_propagation:
 
 Trace context propagation
 -------------------------
@@ -51,6 +54,20 @@ the inbound and outbound requests.
 Whichever tracing provider is being used, the service should propagate the
 :ref:`config_http_conn_man_headers_x-request-id` to enable logging across the invoked services
 to be correlated.
+
+.. attention::
+
+  Envoy's request ID implementation is extensible and defaults to the
+  :ref:`UuidRequestIdConfig <envoy_v3_api_msg_extensions.request_id.uuid.v3.UuidRequestIdConfig>`
+  implementation. Configuration for this extension can be provided within the
+  :ref:`HTTP connection manager<envoy_v3_api_field_extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.request_id_extension>`
+  field (see the documentation for that field for an example). The default implementation will
+  modify the request ID UUID4 to pack the final trace reason into the UUID. This feature allows
+  stable sampling across a fleet of Envoys as documented in the :ref:`x-request-id <config_http_conn_man_headers_x-request-id>`
+  header documentation. However, trace reason packing my break externally generated request IDs
+  that must be maintained. The :ref:`pack_trace_reason <envoy_v3_api_field_extensions.request_id.uuid.v3.UuidRequestIdConfig.pack_trace_reason>`
+  field can be used to disable this behavior at the expense of also disabling stable trace reason
+  propagation and associated features within a deployment.
 
 The tracing providers also require additional context, to enable the parent/child relationships
 between the spans (logical units of work) to be understood. This can be achieved by using the
@@ -82,6 +99,14 @@ Alternatively the trace context can be manually propagated by the service:
   :ref:`config_http_conn_man_headers_x-datadog-parent-id`,
   :ref:`config_http_conn_man_headers_x-datadog-sampling-priority`).
 
+* When using the SkyWalking tracer, Envoy relies on the service to propagate the
+  SkyWalking-specific HTTP headers (
+  :ref:`config_http_conn_man_headers_sw8`).
+
+* When using the AWS X-Ray tracer, Envoy relies on the service to propagate the
+  X-Ray-specific HTTP headers (
+  :ref:`config_http_conn_man_headers_x-amzn-trace-id`).
+
 What data each trace contains
 -----------------------------
 An end-to-end trace is comprised of one or more spans. A
@@ -95,15 +120,15 @@ associated with it. Each span generated by Envoy contains the following data:
   header.
 * HTTP request URL, method, protocol and user-agent.
 * Additional custom tags set via :ref:`custom_tags
-  <envoy_api_field_config.filter.network.http_connection_manager.v2.HttpConnectionManager.tracing.custom_tags>`.
-* Upstream cluster name and address.
+  <envoy_v3_api_field_extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.Tracing.custom_tags>`.
+* Upstream cluster name, observability name, and address.
 * HTTP response status code.
 * GRPC response status and message (if available).
 * An error tag when HTTP status is 5xx or GRPC status is not "OK".
 * Tracing system-specific metadata.
 
 The span also includes a name (or operation) which by default is defined as the host of the invoked
-service. However this can be customized using a :ref:`envoy_api_msg_route.Decorator` on
+service. However this can be customized using a :ref:`envoy_v3_api_msg_config.route.v3.Decorator` on
 the route. The name can also be overridden using the
 :ref:`config_http_filters_router_x-envoy-decorator-operation` header.
 
@@ -111,5 +136,19 @@ Envoy automatically sends spans to tracing collectors. Depending on the tracing 
 multiple spans are stitched together using common information such as the globally unique
 request ID :ref:`config_http_conn_man_headers_x-request-id` (LightStep) or
 the trace ID configuration (Zipkin and Datadog). See
-:ref:`v2 API reference <envoy_api_msg_config.trace.v2.Tracing>`
+:ref:`v3 API reference <envoy_v3_api_msg_config.trace.v3.Tracing>`
 for more information on how to setup tracing in Envoy.
+
+Baggage
+-----------------------------
+Baggage provides a mechanism for data to be available throughout the entirety of a trace.
+While metadata such as tags are usually communicated to collectors out-of-band, baggage data is injected into the actual
+request context and available to applications during the duration of the request. This enables metadata to transparently
+travel from the beginning of the request throughout your entire mesh without relying on application-specific modifications for
+propagation. See `OpenTracing's documentation <https://opentracing.io/docs/overview/tags-logs-baggage/>`_ for more information about baggage.
+
+Tracing providers have varying level of support for getting and setting baggage:
+
+* Lightstep (and any OpenTracing-compliant tracer) can read/write baggage
+* Zipkin support is not yet implemented
+* X-Ray and OpenCensus don't support baggage
