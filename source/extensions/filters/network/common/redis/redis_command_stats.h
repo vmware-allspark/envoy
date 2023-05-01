@@ -6,9 +6,8 @@
 #include "envoy/stats/scope.h"
 #include "envoy/stats/timespan.h"
 
-#include "common/stats/symbol_table_impl.h"
-
-#include "extensions/filters/network/common/redis/codec.h"
+#include "source/common/stats/symbol_table.h"
+#include "source/extensions/filters/network/common/redis/codec.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -28,9 +27,6 @@ public:
     return std::make_shared<Common::Redis::RedisCommandStats>(symbol_table, "upstream_commands");
   }
 
-  Stats::Counter& counter(Stats::Scope& scope, const Stats::StatNameVec& stat_names);
-  Stats::Histogram& histogram(Stats::Scope& scope, const Stats::StatNameVec& stat_names,
-                              Stats::Histogram::Unit unit);
   Stats::TimespanPtr createCommandTimer(Stats::Scope& scope, Stats::StatName command,
                                         Envoy::TimeSource& time_source);
   Stats::TimespanPtr createAggregateTimer(Stats::Scope& scope, Envoy::TimeSource& time_source);

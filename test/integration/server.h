@@ -6,18 +6,21 @@
 #include <memory>
 #include <string>
 
+#include "envoy/config/listener/v3/listener.pb.h"
 #include "envoy/server/options.h"
 #include "envoy/server/process_context.h"
+#include "envoy/stats/histogram.h"
 #include "envoy/stats/stats.h"
 
-#include "common/common/assert.h"
-#include "common/common/lock_guard.h"
-#include "common/common/logger.h"
-#include "common/common/thread.h"
-
-#include "server/listener_hooks.h"
-#include "server/options_impl.h"
-#include "server/server.h"
+#include "source/common/common/assert.h"
+#include "source/common/common/lock_guard.h"
+#include "source/common/common/logger.h"
+#include "source/common/common/thread.h"
+#include "source/common/stats/allocator_impl.h"
+#include "source/server/drain_manager_impl.h"
+#include "source/server/listener_hooks.h"
+#include "source/server/options_impl.h"
+#include "source/server/server.h"
 
 #include "test/integration/server_stats.h"
 #include "test/integration/tcp_dump.h"
@@ -30,27 +33,27 @@
 namespace Envoy {
 namespace Server {
 
-// Create OptionsImpl structures suitable for tests.
-OptionsImpl createTestOptionsImpl(const std::string& config_path, const std::string& config_yaml,
-                                  Network::Address::IpVersion ip_version,
-                                  bool allow_unknown_static_fields = false,
-                                  bool reject_unknown_dynamic_fields = false,
-                                  uint32_t concurrency = 1);
-
-class TestDrainManager : public DrainManager {
-public:
-  // Server::DrainManager
-  bool drainClose() const override { return draining_; }
-  void startDrainSequence(std::function<void()>) override {}
-  void startParentShutdownSequence() override {}
-
-  bool draining_{};
+struct FieldValidationConfig {
+  bool allow_unknown_static_fields = false;
+  bool reject_unknown_dynamic_fields = false;
+  bool ignore_unknown_dynamic_fields = false;
 };
+
+// Create OptionsImpl structures suitable for tests. Disables hot restart.
+OptionsImpl
+createTestOptionsImpl(const std::string& config_path, const std::string& config_yaml,
+                      Network::Address::IpVersion ip_version,
+                      FieldValidationConfig validation_config = FieldValidationConfig(),
+                      uint32_t concurrency = 1,
+                      std::chrono::seconds drain_time = std::chrono::seconds(1),
+                      Server::DrainStrategy drain_strategy = Server::DrainStrategy::Gradual,
+                      bool use_bootstrap_node_metadata = false);
 
 class TestComponentFactory : public ComponentFactory {
 public:
-  Server::DrainManagerPtr createDrainManager(Server::Instance&) override {
-    return Server::DrainManagerPtr{new Server::TestDrainManager()};
+  Server::DrainManagerPtr createDrainManager(Server::Instance& server) override {
+    return Server::DrainManagerPtr{new Server::DrainManagerImpl(
+        server, envoy::config::listener::v3::Listener::MODIFY_ONLY, server.dispatcher())};
   }
   Runtime::LoaderPtr createRuntime(Server::Instance& server,
                                    Server::Configuration::Initial& config) override {
@@ -68,12 +71,17 @@ namespace Stats {
  */
 class TestScopeWrapper : public Scope {
 public:
-  TestScopeWrapper(Thread::MutexBasicLockable& lock, ScopePtr wrapped_scope)
+  TestScopeWrapper(Thread::MutexBasicLockable& lock, ScopeSharedPtr wrapped_scope)
       : lock_(lock), wrapped_scope_(std::move(wrapped_scope)) {}
 
-  ScopePtr createScope(const std::string& name) override {
+  ScopeSharedPtr createScope(const std::string& name) override {
     Thread::LockGuard lock(lock_);
-    return ScopePtr{new TestScopeWrapper(lock_, wrapped_scope_->createScope(name))};
+    return ScopeSharedPtr{new TestScopeWrapper(lock_, wrapped_scope_->createScope(name))};
+  }
+
+  ScopeSharedPtr scopeFromStatName(StatName name) override {
+    Thread::LockGuard lock(lock_);
+    return ScopeSharedPtr{new TestScopeWrapper(lock_, wrapped_scope_->scopeFromStatName(name))};
   }
 
   void deliverHistogramToSinks(const Histogram& histogram, uint64_t value) override {
@@ -98,6 +106,13 @@ public:
     Thread::LockGuard lock(lock_);
     return wrapped_scope_->histogramFromStatNameWithTags(name, tags, unit);
   }
+
+  TextReadout& textReadoutFromStatNameWithTags(const StatName& name,
+                                               StatNameTagVectorOptConstRef tags) override {
+    Thread::LockGuard lock(lock_);
+    return wrapped_scope_->textReadoutFromStatNameWithTags(name, tags);
+  }
+
   NullGaugeImpl& nullGauge(const std::string& str) override {
     return wrapped_scope_->nullGauge(str);
   }
@@ -114,6 +129,10 @@ public:
     StatNameManagedStorage storage(name, symbolTable());
     return histogramFromStatName(storage.statName(), unit);
   }
+  TextReadout& textReadoutFromString(const std::string& name) override {
+    StatNameManagedStorage storage(name, symbolTable());
+    return textReadoutFromStatName(storage.statName());
+  }
 
   CounterOptConstRef findCounter(StatName name) const override {
     Thread::LockGuard lock(lock_);
@@ -127,15 +146,130 @@ public:
     Thread::LockGuard lock(lock_);
     return wrapped_scope_->findHistogram(name);
   }
+  TextReadoutOptConstRef findTextReadout(StatName name) const override {
+    Thread::LockGuard lock(lock_);
+    return wrapped_scope_->findTextReadout(name);
+  }
 
   const SymbolTable& constSymbolTable() const override {
     return wrapped_scope_->constSymbolTable();
   }
   SymbolTable& symbolTable() override { return wrapped_scope_->symbolTable(); }
 
+  bool iterate(const IterateFn<Counter>& fn) const override { return wrapped_scope_->iterate(fn); }
+  bool iterate(const IterateFn<Gauge>& fn) const override { return wrapped_scope_->iterate(fn); }
+  bool iterate(const IterateFn<Histogram>& fn) const override {
+    return wrapped_scope_->iterate(fn);
+  }
+  bool iterate(const IterateFn<TextReadout>& fn) const override {
+    return wrapped_scope_->iterate(fn);
+  }
+  StatName prefix() const override { return wrapped_scope_->prefix(); }
+
 private:
   Thread::MutexBasicLockable& lock_;
-  ScopePtr wrapped_scope_;
+  ScopeSharedPtr wrapped_scope_;
+};
+
+// A counter which signals on a condition variable when it is incremented.
+class NotifyingCounter : public Stats::Counter {
+public:
+  NotifyingCounter(Stats::Counter* counter, absl::Mutex& mutex, absl::CondVar& condvar)
+      : counter_(counter), mutex_(mutex), condvar_(condvar) {}
+
+  std::string name() const override { return counter_->name(); }
+  StatName statName() const override { return counter_->statName(); }
+  TagVector tags() const override { return counter_->tags(); }
+  std::string tagExtractedName() const override { return counter_->tagExtractedName(); }
+  void iterateTagStatNames(const TagStatNameIterFn& fn) const override {
+    counter_->iterateTagStatNames(fn);
+  }
+  void add(uint64_t amount) override {
+    counter_->add(amount);
+    absl::MutexLock l(&mutex_);
+    condvar_.Signal();
+  }
+  void inc() override { add(1); }
+  uint64_t latch() override { return counter_->latch(); }
+  void reset() override { return counter_->reset(); }
+  uint64_t value() const override { return counter_->value(); }
+  void incRefCount() override { counter_->incRefCount(); }
+  bool decRefCount() override { return counter_->decRefCount(); }
+  uint32_t use_count() const override { return counter_->use_count(); }
+  StatName tagExtractedStatName() const override { return counter_->tagExtractedStatName(); }
+  bool used() const override { return counter_->used(); }
+  SymbolTable& symbolTable() override { return counter_->symbolTable(); }
+  const SymbolTable& constSymbolTable() const override { return counter_->constSymbolTable(); }
+
+private:
+  std::unique_ptr<Stats::Counter> counter_;
+  absl::Mutex& mutex_;
+  absl::CondVar& condvar_;
+};
+
+// A stats allocator which creates NotifyingCounters rather than regular CounterImpls.
+class NotifyingAllocatorImpl : public Stats::AllocatorImpl {
+public:
+  using Stats::AllocatorImpl::AllocatorImpl;
+
+  void waitForCounterFromStringEq(const std::string& name, uint64_t value) {
+    absl::MutexLock l(&mutex_);
+    ENVOY_LOG_MISC(trace, "waiting for {} to be {}", name, value);
+    while (getCounterLockHeld(name) == nullptr || getCounterLockHeld(name)->value() != value) {
+      condvar_.Wait(&mutex_);
+    }
+    ENVOY_LOG_MISC(trace, "done waiting for {} to be {}", name, value);
+  }
+
+  void waitForCounterFromStringGe(const std::string& name, uint64_t value) {
+    absl::MutexLock l(&mutex_);
+    ENVOY_LOG_MISC(trace, "waiting for {} to be {}", name, value);
+    while (getCounterLockHeld(name) == nullptr || getCounterLockHeld(name)->value() < value) {
+      condvar_.Wait(&mutex_);
+    }
+    ENVOY_LOG_MISC(trace, "done waiting for {} to be {}", name, value);
+  }
+
+  void waitForCounterExists(const std::string& name) {
+    absl::MutexLock l(&mutex_);
+    ENVOY_LOG_MISC(trace, "waiting for {} to exist", name);
+    while (getCounterLockHeld(name) == nullptr) {
+      condvar_.Wait(&mutex_);
+    }
+    ENVOY_LOG_MISC(trace, "done waiting for {} to exist", name);
+  }
+
+protected:
+  Stats::Counter* makeCounterInternal(StatName name, StatName tag_extracted_name,
+                                      const StatNameTagVector& stat_name_tags) override {
+    Stats::Counter* counter = new NotifyingCounter(
+        Stats::AllocatorImpl::makeCounterInternal(name, tag_extracted_name, stat_name_tags), mutex_,
+        condvar_);
+    {
+      absl::MutexLock l(&mutex_);
+      // Allow getting the counter directly from the allocator, since it's harder to
+      // signal when the counter has been added to a given stats store.
+      counters_.emplace(counter->name(), counter);
+      if (counter->name() == "cluster_manager.cluster_removed") {
+      }
+      condvar_.Signal();
+    }
+    return counter;
+  }
+
+  virtual Stats::Counter* getCounterLockHeld(const std::string& name)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(mutex_) {
+    auto it = counters_.find(name);
+    if (it != counters_.end()) {
+      return it->second;
+    }
+    return nullptr;
+  }
+
+private:
+  absl::flat_hash_map<std::string, Stats::Counter*> counters_;
+  absl::Mutex mutex_;
+  absl::CondVar condvar_;
 };
 
 /**
@@ -150,13 +284,54 @@ public:
     Thread::LockGuard lock(lock_);
     return store_.counterFromStatNameWithTags(name, tags);
   }
+  void forEachCounter(Stats::SizeFn f_size, StatFn<Counter> f_stat) const override {
+    Thread::LockGuard lock(lock_);
+    store_.forEachCounter(f_size, f_stat);
+  }
+  void forEachGauge(Stats::SizeFn f_size, StatFn<Gauge> f_stat) const override {
+    Thread::LockGuard lock(lock_);
+    store_.forEachGauge(f_size, f_stat);
+  }
+  void forEachTextReadout(Stats::SizeFn f_size, StatFn<TextReadout> f_stat) const override {
+    Thread::LockGuard lock(lock_);
+    store_.forEachTextReadout(f_size, f_stat);
+  }
+  void forEachHistogram(Stats::SizeFn f_size, StatFn<ParentHistogram> f_stat) const override {
+    Thread::LockGuard lock(lock_);
+    store_.forEachHistogram(f_size, f_stat);
+  }
+  void forEachScope(std::function<void(std::size_t)> f_size,
+                    StatFn<const Scope> f_scope) const override {
+    Thread::LockGuard lock(lock_);
+    store_.forEachScope(f_size, f_scope);
+  }
+  void forEachSinkedCounter(Stats::SizeFn f_size, StatFn<Counter> f_stat) const override {
+    Thread::LockGuard lock(lock_);
+    store_.forEachSinkedCounter(f_size, f_stat);
+  }
+  void forEachSinkedGauge(Stats::SizeFn f_size, StatFn<Gauge> f_stat) const override {
+    Thread::LockGuard lock(lock_);
+    store_.forEachSinkedGauge(f_size, f_stat);
+  }
+  void forEachSinkedTextReadout(Stats::SizeFn f_size, StatFn<TextReadout> f_stat) const override {
+    Thread::LockGuard lock(lock_);
+    store_.forEachSinkedTextReadout(f_size, f_stat);
+  }
+  void setSinkPredicates(std::unique_ptr<SinkPredicates>&& sink_predicates) override {
+    UNREFERENCED_PARAMETER(sink_predicates);
+  }
+
   Counter& counterFromString(const std::string& name) override {
     Thread::LockGuard lock(lock_);
     return store_.counterFromString(name);
   }
-  ScopePtr createScope(const std::string& name) override {
+  ScopeSharedPtr createScope(const std::string& name) override {
     Thread::LockGuard lock(lock_);
-    return ScopePtr{new TestScopeWrapper(lock_, store_.createScope(name))};
+    return ScopeSharedPtr{new TestScopeWrapper(lock_, store_.createScope(name))};
+  }
+  ScopeSharedPtr scopeFromStatName(StatName name) override {
+    Thread::LockGuard lock(lock_);
+    return ScopeSharedPtr{new TestScopeWrapper(lock_, store_.scopeFromStatName(name))};
   }
   void deliverHistogramToSinks(const Histogram&, uint64_t) override {}
   Gauge& gaugeFromStatNameWithTags(const StatName& name, StatNameTagVectorOptConstRef tags,
@@ -178,6 +353,15 @@ public:
     Thread::LockGuard lock(lock_);
     return store_.histogramFromString(name, unit);
   }
+  TextReadout& textReadoutFromStatNameWithTags(const StatName& name,
+                                               StatNameTagVectorOptConstRef tags) override {
+    Thread::LockGuard lock(lock_);
+    return store_.textReadoutFromStatNameWithTags(name, tags);
+  }
+  TextReadout& textReadoutFromString(const std::string& name) override {
+    Thread::LockGuard lock(lock_);
+    return store_.textReadoutFromString(name);
+  }
   CounterOptConstRef findCounter(StatName name) const override {
     Thread::LockGuard lock(lock_);
     return store_.findCounter(name);
@@ -189,6 +373,10 @@ public:
   HistogramOptConstRef findHistogram(StatName name) const override {
     Thread::LockGuard lock(lock_);
     return store_.findHistogram(name);
+  }
+  TextReadoutOptConstRef findTextReadout(StatName name) const override {
+    Thread::LockGuard lock(lock_);
+    return store_.findTextReadout(name);
   }
   const SymbolTable& constSymbolTable() const override { return store_.constSymbolTable(); }
   SymbolTable& symbolTable() override { return store_.symbolTable(); }
@@ -202,23 +390,36 @@ public:
     Thread::LockGuard lock(lock_);
     return store_.gauges();
   }
-
   std::vector<ParentHistogramSharedPtr> histograms() const override {
     Thread::LockGuard lock(lock_);
     return store_.histograms();
   }
+  std::vector<TextReadoutSharedPtr> textReadouts() const override {
+    Thread::LockGuard lock(lock_);
+    return store_.textReadouts();
+  }
+  StatName prefix() const override { return store_.prefix(); }
+
+  bool iterate(const IterateFn<Counter>& fn) const override { return store_.iterate(fn); }
+  bool iterate(const IterateFn<Gauge>& fn) const override { return store_.iterate(fn); }
+  bool iterate(const IterateFn<Histogram>& fn) const override { return store_.iterate(fn); }
+  bool iterate(const IterateFn<TextReadout>& fn) const override { return store_.iterate(fn); }
 
   // Stats::StoreRoot
   void addSink(Sink&) override {}
   void setTagProducer(TagProducerPtr&&) override {}
   void setStatsMatcher(StatsMatcherPtr&&) override {}
+  void setHistogramSettings(HistogramSettingsConstPtr&&) override {}
   void initializeThreading(Event::Dispatcher&, ThreadLocal::Instance&) override {}
   void shutdownThreading() override {}
-  void mergeHistograms(PostMergeCb) override {}
+  void mergeHistograms(PostMergeCb cb) override { merge_cb_ = cb; }
+
+  void runMergeCallback() { merge_cb_(); }
 
 private:
   mutable Thread::MutexBasicLockable lock_;
   IsolatedStoreImpl store_;
+  PostMergeCb merge_cb_;
 };
 
 } // namespace Stats
@@ -237,20 +438,29 @@ class IntegrationTestServer : public Logger::Loggable<Logger::Id::testing>,
                               public IntegrationTestServerStats,
                               public Server::ComponentFactory {
 public:
-  static IntegrationTestServerPtr create(
-      const std::string& config_path, const Network::Address::IpVersion version,
-      std::function<void(IntegrationTestServer&)> on_server_ready_function,
-      std::function<void()> on_server_init_function, bool deterministic,
-      Event::TestTimeSystem& time_system, Api::Api& api, bool defer_listener_finalization = false,
-      ProcessObjectOptRef process_object = absl::nullopt, bool allow_unknown_static_fields = false,
-      bool reject_unknown_dynamic_fields = false, uint32_t concurrency = 1);
+  static IntegrationTestServerPtr
+  create(const std::string& config_path, const Network::Address::IpVersion version,
+         std::function<void(IntegrationTestServer&)> on_server_ready_function,
+         std::function<void()> on_server_init_function,
+         absl::optional<uint64_t> deterministic_value, Event::TestTimeSystem& time_system,
+         Api::Api& api, bool defer_listener_finalization = false,
+         ProcessObjectOptRef process_object = absl::nullopt,
+         Server::FieldValidationConfig validation_config = Server::FieldValidationConfig(),
+         uint32_t concurrency = 1, std::chrono::seconds drain_time = std::chrono::seconds(1),
+         Server::DrainStrategy drain_strategy = Server::DrainStrategy::Gradual,
+         Buffer::WatermarkFactorySharedPtr watermark_factory = nullptr, bool use_real_stats = false,
+         bool use_bootstrap_node_metadata = false);
   // Note that the derived class is responsible for tearing down the server in its
   // destructor.
   ~IntegrationTestServer() override;
 
   void waitUntilListenersReady();
 
-  Server::TestDrainManager& drainManager() { return *drain_manager_; }
+  void setDynamicContextParam(absl::string_view resource_type_url, absl::string_view key,
+                              absl::string_view value);
+  void unsetDynamicContextParam(absl::string_view resource_type_url, absl::string_view key);
+
+  Server::DrainManagerImpl& drainManager() { return *drain_manager_; }
   void setOnWorkerListenerAddedCb(std::function<void()> on_worker_listener_added) {
     on_worker_listener_added_cb_ = std::move(on_worker_listener_added);
   }
@@ -260,53 +470,86 @@ public:
   void setOnServerReadyCb(std::function<void(IntegrationTestServer&)> on_server_ready) {
     on_server_ready_cb_ = std::move(on_server_ready);
   }
-  void onRuntimeCreated() override {}
+  void onWorkersStarted() override {}
 
   void start(const Network::Address::IpVersion version,
-             std::function<void()> on_server_init_function, bool deterministic,
-             bool defer_listener_finalization, ProcessObjectOptRef process_object,
-             bool allow_unknown_static_fields, bool reject_unknown_dynamic_fields,
-             uint32_t concurrency);
+             std::function<void()> on_server_init_function,
+             absl::optional<uint64_t> deterministic_value, bool defer_listener_finalization,
+             ProcessObjectOptRef process_object, Server::FieldValidationConfig validation_config,
+             uint32_t concurrency, std::chrono::seconds drain_time,
+             Server::DrainStrategy drain_strategy,
+             Buffer::WatermarkFactorySharedPtr watermark_factory, bool use_bootstrap_node_metadata);
 
-  void waitForCounterEq(const std::string& name, uint64_t value) override {
-    TestUtility::waitForCounterEq(stat_store(), name, value, time_system_);
+  void waitForCounterEq(const std::string& name, uint64_t value,
+                        std::chrono::milliseconds timeout = TestUtility::DefaultTimeout,
+                        Event::Dispatcher* dispatcher = nullptr) override {
+    ASSERT_TRUE(
+        TestUtility::waitForCounterEq(statStore(), name, value, time_system_, timeout, dispatcher));
   }
 
-  void waitForCounterGe(const std::string& name, uint64_t value) override {
-    TestUtility::waitForCounterGe(stat_store(), name, value, time_system_);
+  void waitForCounterGe(const std::string& name, uint64_t value,
+                        std::chrono::milliseconds timeout = TestUtility::DefaultTimeout) override {
+    ASSERT_TRUE(TestUtility::waitForCounterGe(statStore(), name, value, time_system_, timeout));
   }
 
-  void waitForGaugeGe(const std::string& name, uint64_t value) override {
-    TestUtility::waitForGaugeGe(stat_store(), name, value, time_system_);
+  void waitForGaugeEq(const std::string& name, uint64_t value,
+                      std::chrono::milliseconds timeout = TestUtility::DefaultTimeout) override {
+    ASSERT_TRUE(TestUtility::waitForGaugeEq(statStore(), name, value, time_system_, timeout));
   }
 
-  void waitForGaugeEq(const std::string& name, uint64_t value) override {
-    TestUtility::waitForGaugeEq(stat_store(), name, value, time_system_);
+  void waitForGaugeGe(const std::string& name, uint64_t value,
+                      std::chrono::milliseconds timeout = TestUtility::DefaultTimeout) override {
+    ASSERT_TRUE(TestUtility::waitForGaugeGe(statStore(), name, value, time_system_, timeout));
+  }
+
+  void waitForCounterExists(const std::string& name) override {
+    notifyingStatsAllocator().waitForCounterExists(name);
+  }
+
+  // TODO(#17956): Add Gauge type to NotifyingAllocator and adopt it in this method.
+  void waitForGaugeDestroyed(const std::string& name) override {
+    ASSERT_TRUE(TestUtility::waitForGaugeDestroyed(statStore(), name, time_system_));
+  }
+
+  void waitUntilHistogramHasSamples(
+      const std::string& name,
+      std::chrono::milliseconds timeout = std::chrono::milliseconds::zero()) override {
+    ASSERT_TRUE(TestUtility::waitUntilHistogramHasSamples(statStore(), name, time_system_,
+                                                          server().dispatcher(), timeout));
   }
 
   Stats::CounterSharedPtr counter(const std::string& name) override {
     // When using the thread local store, only counters() is thread safe. This also allows us
     // to test if a counter exists at all versus just defaulting to zero.
-    return TestUtility::findCounter(stat_store(), name);
+    return TestUtility::findCounter(statStore(), name);
   }
 
   Stats::GaugeSharedPtr gauge(const std::string& name) override {
     // When using the thread local store, only gauges() is thread safe. This also allows us
     // to test if a counter exists at all versus just defaulting to zero.
-    return TestUtility::findGauge(stat_store(), name);
+    return TestUtility::findGauge(statStore(), name);
   }
 
-  std::vector<Stats::CounterSharedPtr> counters() override { return stat_store().counters(); }
+  Stats::ParentHistogramSharedPtr histogram(const std::string& name) {
+    return TestUtility::findHistogram(statStore(), name);
+  }
 
-  std::vector<Stats::GaugeSharedPtr> gauges() override { return stat_store().gauges(); }
+  std::vector<Stats::CounterSharedPtr> counters() override { return statStore().counters(); }
+
+  std::vector<Stats::GaugeSharedPtr> gauges() override { return statStore().gauges(); }
+
+  std::vector<Stats::ParentHistogramSharedPtr> histograms() override {
+    return statStore().histograms();
+  }
 
   // ListenerHooks
   void onWorkerListenerAdded() override;
   void onWorkerListenerRemoved() override;
 
   // Server::ComponentFactory
-  Server::DrainManagerPtr createDrainManager(Server::Instance&) override {
-    drain_manager_ = new Server::TestDrainManager();
+  Server::DrainManagerPtr createDrainManager(Server::Instance& server) override {
+    drain_manager_ = new Server::DrainManagerImpl(
+        server, envoy::config::listener::v3::Listener::MODIFY_ONLY, server.dispatcher());
     return Server::DrainManagerPtr{drain_manager_};
   }
   Runtime::LoaderPtr createRuntime(Server::Instance& server,
@@ -316,8 +559,11 @@ public:
 
   // Should not be called until createAndRunEnvoyServer() is called.
   virtual Server::Instance& server() PURE;
-  virtual Stats::Store& stat_store() PURE;
-  virtual Network::Address::InstanceConstSharedPtr admin_address() PURE;
+  virtual Stats::Store& statStore() PURE;
+  virtual Network::Address::InstanceConstSharedPtr adminAddress() PURE;
+  virtual Stats::NotifyingAllocatorImpl& notifyingStatsAllocator() PURE;
+  void useAdminInterfaceToQuit(bool use) { use_admin_interface_to_quit_ = use; }
+  bool useAdminInterfaceToQuit() { return use_admin_interface_to_quit_; }
 
 protected:
   IntegrationTestServer(Event::TestTimeSystem& time_system, Api::Api& api,
@@ -325,18 +571,19 @@ protected:
       : time_system_(time_system), api_(api), config_path_(config_path) {}
 
   // Create the running envoy server. This function will call serverReady() when the virtual
-  // functions server(), stat_store(), and admin_address() may be called, but before the server
+  // functions server(), statStore(), and adminAddress() may be called, but before the server
   // has been started.
   // The subclass is also responsible for tearing down this server in its destructor.
   virtual void createAndRunEnvoyServer(OptionsImpl& options, Event::TimeSystem& time_system,
                                        Network::Address::InstanceConstSharedPtr local_address,
                                        ListenerHooks& hooks, Thread::BasicLockable& access_log_lock,
                                        Server::ComponentFactory& component_factory,
-                                       Runtime::RandomGeneratorPtr&& random_generator,
-                                       ProcessObjectOptRef process_object) PURE;
+                                       Random::RandomGeneratorPtr&& random_generator,
+                                       ProcessObjectOptRef process_object,
+                                       Buffer::WatermarkFactorySharedPtr watermark_factory) PURE;
 
   // Will be called by subclass on server thread when the server is ready to be accessed. The
-  // server may not have been run yet, but all server access methods (server(), stat_store(),
+  // server may not have been run yet, but all server access methods (server(), statStore(),
   // adminAddress()) will be available.
   void serverReady();
 
@@ -344,9 +591,13 @@ private:
   /**
    * Runs the real server on a thread.
    */
-  void threadRoutine(const Network::Address::IpVersion version, bool deterministic,
-                     ProcessObjectOptRef process_object, bool allow_unknown_static_fields,
-                     bool reject_unknown_dynamic_fields, uint32_t concurrency);
+  void threadRoutine(const Network::Address::IpVersion version,
+                     absl::optional<uint64_t> deterministic_value,
+                     ProcessObjectOptRef process_object,
+                     Server::FieldValidationConfig validation_config, uint32_t concurrency,
+                     std::chrono::seconds drain_time, Server::DrainStrategy drain_strategy,
+                     Buffer::WatermarkFactorySharedPtr watermark_factory,
+                     bool use_bootstrap_node_metadata);
 
   Event::TestTimeSystem& time_system_;
   Api::Api& api_;
@@ -356,19 +607,19 @@ private:
   Thread::MutexBasicLockable listeners_mutex_;
   uint64_t pending_listeners_;
   ConditionalInitializer server_set_;
-  Server::TestDrainManager* drain_manager_{};
+  Server::DrainManagerImpl* drain_manager_{};
   std::function<void()> on_worker_listener_added_cb_;
   std::function<void()> on_worker_listener_removed_cb_;
   TcpDumpPtr tcp_dump_;
   std::function<void(IntegrationTestServer&)> on_server_ready_cb_;
+  bool use_admin_interface_to_quit_{};
 };
 
 // Default implementation of IntegrationTestServer
 class IntegrationTestServerImpl : public IntegrationTestServer {
 public:
   IntegrationTestServerImpl(Event::TestTimeSystem& time_system, Api::Api& api,
-                            const std::string& config_path)
-      : IntegrationTestServer(time_system, api, config_path) {}
+                            const std::string& config_path, bool real_stats = false);
 
   ~IntegrationTestServerImpl() override;
 
@@ -376,19 +627,27 @@ public:
     RELEASE_ASSERT(server_ != nullptr, "");
     return *server_;
   }
-  Stats::Store& stat_store() override {
+  Stats::Store& statStore() override {
     RELEASE_ASSERT(stat_store_ != nullptr, "");
     return *stat_store_;
   }
-  Network::Address::InstanceConstSharedPtr admin_address() override { return admin_address_; }
+  Network::Address::InstanceConstSharedPtr adminAddress() override { return admin_address_; }
+
+  Stats::NotifyingAllocatorImpl& notifyingStatsAllocator() override {
+    auto* ret = dynamic_cast<Stats::NotifyingAllocatorImpl*>(stats_allocator_.get());
+    RELEASE_ASSERT(ret != nullptr,
+                   "notifyingStatsAllocator() is not created when real_stats is true");
+    return *ret;
+  }
 
 private:
   void createAndRunEnvoyServer(OptionsImpl& options, Event::TimeSystem& time_system,
                                Network::Address::InstanceConstSharedPtr local_address,
                                ListenerHooks& hooks, Thread::BasicLockable& access_log_lock,
                                Server::ComponentFactory& component_factory,
-                               Runtime::RandomGeneratorPtr&& random_generator,
-                               ProcessObjectOptRef process_object) override;
+                               Random::RandomGeneratorPtr&& random_generator,
+                               ProcessObjectOptRef process_object,
+                               Buffer::WatermarkFactorySharedPtr watermark_factory) override;
 
   // Owned by this class. An owning pointer is not used because the actual allocation is done
   // on a stack in a non-main thread.
@@ -396,6 +655,8 @@ private:
   Stats::Store* stat_store_{};
   Network::Address::InstanceConstSharedPtr admin_address_;
   absl::Notification server_gone_;
+  Stats::SymbolTableImpl symbol_table_;
+  std::unique_ptr<Stats::AllocatorImpl> stats_allocator_;
 };
 
 } // namespace Envoy

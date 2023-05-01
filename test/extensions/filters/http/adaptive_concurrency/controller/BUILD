@@ -1,5 +1,3 @@
-licenses(["notice"])  # Apache 2
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_package",
@@ -9,12 +7,14 @@ load(
     "envoy_extension_cc_test",
 )
 
+licenses(["notice"])  # Apache 2
+
 envoy_package()
 
 envoy_extension_cc_test(
     name = "gradient_controller_test",
     srcs = ["gradient_controller_test.cc"],
-    extension_name = "envoy.filters.http.adaptive_concurrency",
+    extension_names = ["envoy.filters.http.adaptive_concurrency"],
     deps = [
         "//source/common/stats:isolated_store_lib",
         "//source/extensions/filters/http/adaptive_concurrency:adaptive_concurrency_filter_lib",

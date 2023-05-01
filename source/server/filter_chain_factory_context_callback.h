@@ -2,8 +2,8 @@
 
 #include <memory>
 
-#include "envoy/api/v2/listener/listener.pb.h"
 #include "envoy/common/pure.h"
+#include "envoy/config/listener/v3/listener.pb.h"
 #include "envoy/server/filter_config.h"
 
 namespace Envoy {
@@ -21,7 +21,7 @@ public:
    * Generate the filter chain factory context from proto. Note the caller does not own the filter
    * chain context.
    */
-  virtual std::unique_ptr<Configuration::FilterChainFactoryContext> createFilterChainFactoryContext(
+  virtual Configuration::FilterChainFactoryContextPtr createFilterChainFactoryContext(
       const ::envoy::config::listener::v3::FilterChain* const filter_chain) PURE;
 };
 

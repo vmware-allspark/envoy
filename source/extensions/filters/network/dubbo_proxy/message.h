@@ -5,8 +5,9 @@
 
 #include "envoy/common/pure.h"
 
-#include "common/buffer/buffer_impl.h"
+#include "source/common/buffer/buffer_impl.h"
 
+#include "absl/container/node_hash_map.h"
 #include "absl/types/optional.h"
 
 namespace Envoy {
@@ -88,23 +89,18 @@ enum class RpcResponseType : uint8_t {
 
 class Context {
 public:
-  using AttachmentMap = std::unordered_map<std::string, std::string>;
+  virtual ~Context() = default;
 
-  bool hasAttachments() const { return !attachments_.empty(); }
-  const AttachmentMap& attachments() const { return attachments_; }
+  Buffer::Instance& originMessage() { return origin_message_; }
+  size_t messageSize() const { return headerSize() + bodySize(); }
 
-  Buffer::Instance& message_origin_data() { return message_origin_buffer_; }
-  size_t message_size() const { return header_size() + body_size(); }
+  virtual size_t headerSize() const PURE;
+  virtual size_t bodySize() const PURE;
 
-  virtual size_t body_size() const PURE;
-  virtual size_t header_size() const PURE;
+  virtual bool isHeartbeat() const PURE;
 
 protected:
-  Context() = default;
-  virtual ~Context() { attachments_.clear(); }
-
-  AttachmentMap attachments_;
-  Buffer::OwnedImpl message_origin_buffer_;
+  Buffer::OwnedImpl origin_message_;
 };
 
 using ContextSharedPtr = std::shared_ptr<Context>;
@@ -118,10 +114,10 @@ class RpcInvocation {
 public:
   virtual ~RpcInvocation() = default;
 
-  virtual const std::string& service_name() const PURE;
-  virtual const std::string& method_name() const PURE;
-  virtual const absl::optional<std::string>& service_version() const PURE;
-  virtual const absl::optional<std::string>& service_group() const PURE;
+  virtual const std::string& serviceName() const PURE;
+  virtual const std::string& methodName() const PURE;
+  virtual const absl::optional<std::string>& serviceVersion() const PURE;
+  virtual const absl::optional<std::string>& serviceGroup() const PURE;
 };
 
 using RpcInvocationSharedPtr = std::shared_ptr<RpcInvocation>;
@@ -134,6 +130,7 @@ using RpcInvocationSharedPtr = std::shared_ptr<RpcInvocation>;
 class RpcResult {
 public:
   virtual ~RpcResult() = default;
+
   virtual bool hasException() const PURE;
 };
 

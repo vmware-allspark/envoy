@@ -8,8 +8,8 @@ In this mode, the goals of Envoy are to maintain availability and partition tole
 over consistency. This is the key point when comparing Envoy to `Redis Cluster
 <https://redis.io/topics/cluster-spec>`_. Envoy is designed as a best-effort cache,
 meaning that it will not try to reconcile inconsistent data or keep a globally consistent
-view of cluster membership. It also supports routing commands from different workload to
-different to different upstream clusters based on their access patterns, eviction, or isolation
+view of cluster membership. It also supports routing commands from different workloads to
+different upstream clusters based on their access patterns, eviction, or isolation
 requirements.
 
 The Redis project offers a thorough reference on partitioning as it relates to Redis. See
@@ -20,6 +20,7 @@ The Redis project offers a thorough reference on partitioning as it relates to R
 
 * `Redis protocol <https://redis.io/topics/protocol>`_ codec.
 * Hash-based partitioning.
+* Redis transaction support.
 * Ketama distribution.
 * Detailed command statistics.
 * Active and passive healthchecking.
@@ -27,7 +28,7 @@ The Redis project offers a thorough reference on partitioning as it relates to R
 * Prefix routing.
 * Separate downstream client and upstream server authentication.
 * Request mirroring for all requests or write requests only.
-* Control :ref:`read requests routing<envoy_api_field_config.filter.network.redis_proxy.v2.RedisProxy.ConnPoolSettings.read_policy>`. This only works with Redis Cluster.
+* Control :ref:`read requests routing<envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.read_policy>`. This only works with Redis Cluster.
 
 **Planned future enhancements**:
 
@@ -47,11 +48,11 @@ For filter configuration details, see the Redis proxy filter
 :ref:`configuration reference <config_network_filters_redis_proxy>`.
 
 The corresponding cluster definition should be configured with
-:ref:`ring hash load balancing <envoy_api_field_Cluster.lb_policy>`.
+:ref:`ring hash load balancing <envoy_v3_api_field_config.cluster.v3.Cluster.lb_policy>`.
 
 If :ref:`active health checking <arch_overview_health_checking>` is desired, the
 cluster should be configured with a :ref:`custom health check
-<envoy_api_field_core.HealthCheck.custom_health_check>` which configured as a
+<envoy_v3_api_field_config.core.v3.HealthCheck.custom_health_check>` which configured as a
 :ref:`Redis health checker <config_health_checkers_redis>`.
 
 If passive healthchecking is desired, also configure
@@ -62,10 +63,10 @@ close map to 5xx. All other responses from Redis are counted as a success.
 
 .. _arch_overview_redis_cluster_support:
 
-Redis Cluster Support (Experimental)
-----------------------------------------
+Redis Cluster Support
+---------------------
 
-Envoy currently offers experimental support for `Redis Cluster <https://redis.io/topics/cluster-spec>`_.
+Envoy offers support for `Redis Cluster <https://redis.io/topics/cluster-spec>`_.
 
 When using Envoy as a sidecar proxy for a Redis Cluster, the service can use a non-cluster Redis client
 implemented in any language to connect to the proxy as if it's a single node Redis instance.
@@ -78,11 +79,13 @@ Envoy proxy tracks the topology of the cluster by sending periodic
 following information:
 
 * List of known nodes.
-* The masters for each shard.
+* The primaries for each shard.
 * Nodes entering or leaving the cluster.
 
+Envoy proxy supports identification of the nodes via both IP address and hostnames in the ``cluster slots`` command response. In case of failure to resolve a primary hostname, Envoy will retry resolution of all nodes periodically until success. Failure to resolve a replica simply skips that replica.
+
 For topology configuration details, see the Redis Cluster
-:ref:`v2 API reference <envoy_api_msg_config.cluster.redis.RedisClusterConfig>`.
+:ref:`v3 API reference <envoy_v3_api_msg_extensions.clusters.redis.v3.RedisClusterConfig>`.
 
 Every Redis cluster has its own extra statistics tree rooted at *cluster.<name>.redis_cluster.* with the following statistics:
 
@@ -96,7 +99,7 @@ Every Redis cluster has its own extra statistics tree rooted at *cluster.<name>.
 
 .. _arch_overview_redis_cluster_command_stats:
 
-Per-cluster command statistics can be enabled via the setting :ref:`enable_command_stats <envoy_api_field_config.filter.network.redis_proxy.v2.RedisProxy.ConnPoolSettings.enable_command_stats>`:
+Per-cluster command statistics can be enabled via the setting :ref:`enable_command_stats <envoy_v3_api_field_extensions.filters.network.redis_proxy.v3.RedisProxy.ConnPoolSettings.enable_command_stats>`.:
 
 .. csv-table::
   :header: Name, Type, Description
@@ -106,11 +109,22 @@ Per-cluster command statistics can be enabled via the setting :ref:`enable_comma
   upstream_commands.[command].failure, Counter, Total number of failed or cancelled requests for a specific Redis command
   upstream_commands.[command].total, Counter, Total number of requests for a specific Redis command (sum of success and failure)
   upstream_commands.[command].latency, Histogram, Latency of requests for a specific Redis command
-  
+
+Transactions
+------------
+
+Transactions (MULTI) are supported. Their use is no different from regular Redis: you start a transaction with MULTI,
+and you execute it with EXEC. Within the transaction only commands that are supported by Envoy (see below) and are single-key
+commands are supported, i.e. MGET and MSET are not supported. The DISCARD command is supported.
+
+When working in Redis Cluster mode, Envoy will relay all the commands in the transaction to the node handling the first
+key-based command in the transaction. It is the user's responsibility to ensure that all keys in the transaction are mapped
+to the same hashslot, as commands will not be redirected.
+
 Supported commands
 ------------------
 
-At the protocol level, pipelines are supported. MULTI (transaction block) is not.
+At the protocol level, pipelines are supported.
 Use pipelining wherever possible for the best performance.
 
 At the command level, Envoy only supports commands that can be reliably hashed to a server. AUTH and PING
@@ -130,8 +144,11 @@ For details on each command's usage see the official
 
   AUTH, Authentication
   PING, Connection
+  QUIT, Connection
   DEL, Generic
+  DISCARD, Transaction
   DUMP, Generic
+  EXEC, Transaction
   EXISTS, Generic
   EXPIRE, Generic
   EXPIREAT, Generic
@@ -165,6 +182,8 @@ For details on each command's usage see the official
   HSETNX, Hash
   HSTRLEN, Hash
   HVALS, Hash
+  PFADD, HyperLogLog
+  PFCOUNT, HyperLogLog
   LINDEX, List
   LINSERT, List
   LLEN, List
@@ -175,6 +194,7 @@ For details on each command's usage see the official
   LREM, List
   LSET, List
   LTRIM, List
+  MUTLI, Transaction
   RPOP, List
   RPUSH, List
   RPUSHX, List

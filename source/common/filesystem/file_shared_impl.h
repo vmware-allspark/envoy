@@ -4,7 +4,7 @@
 
 #include "envoy/filesystem/filesystem.h"
 
-#include "common/common/assert.h"
+#include "source/common/common/assert.h"
 
 namespace Envoy {
 namespace Filesystem {
@@ -17,6 +17,7 @@ public:
 
   Api::IoError::IoErrorCode getErrorCode() const override;
   std::string getErrorDetails() const override;
+  int getSystemErrorCode() const override { return errno_; }
 
 private:
   const int errno_;
@@ -32,29 +33,23 @@ template <typename T> Api::IoCallResult<T> resultFailure(T result, int sys_errno
 }
 
 template <typename T> Api::IoCallResult<T> resultSuccess(T result) {
-  return {result, IoFileErrorPtr(nullptr, [](Api::IoError*) { NOT_REACHED_GCOVR_EXCL_LINE; })};
+  return {result, IoFileErrorPtr(nullptr, [](Api::IoError*) { PANIC("unimplemented"); })};
 }
 
 class FileSharedImpl : public File {
 public:
-  FileSharedImpl(std::string path) : fd_(-1), path_(std::move(path)) {}
+  FileSharedImpl(const FilePathAndType& filepath_and_type)
+      : fd_(INVALID_HANDLE), filepath_and_type_(filepath_and_type) {}
 
   ~FileSharedImpl() override = default;
 
-  // Filesystem::File
-  Api::IoCallBoolResult open(FlagSet flag) override;
-  Api::IoCallSizeResult write(absl::string_view buffer) override;
-  Api::IoCallBoolResult close() override;
   bool isOpen() const override;
   std::string path() const override;
+  DestinationType destinationType() const override;
 
 protected:
-  virtual void openFile(FlagSet in) PURE;
-  virtual ssize_t writeFile(absl::string_view buffer) PURE;
-  virtual bool closeFile() PURE;
-
-  int fd_;
-  const std::string path_;
+  filesystem_os_id_t fd_;
+  const FilePathAndType filepath_and_type_;
 };
 
 } // namespace Filesystem

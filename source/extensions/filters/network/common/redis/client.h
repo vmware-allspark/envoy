@@ -4,8 +4,8 @@
 
 #include "envoy/upstream/cluster_manager.h"
 
-#include "extensions/filters/network/common/redis/codec_impl.h"
-#include "extensions/filters/network/common/redis/redis_command_stats.h"
+#include "source/extensions/filters/network/common/redis/codec_impl.h"
+#include "source/extensions/filters/network/common/redis/redis_command_stats.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -106,7 +106,7 @@ public:
    * Initialize the connection. Issue the auth command and readonly command as needed.
    * @param auth password for upstream host.
    */
-  virtual void initialize(const std::string& auth_password) PURE;
+  virtual void initialize(const std::string& auth_username, const std::string& auth_password) PURE;
 };
 
 using ClientPtr = std::unique_ptr<Client>;
@@ -114,7 +114,7 @@ using ClientPtr = std::unique_ptr<Client>;
 /**
  * Read policy to use for Redis cluster.
  */
-enum class ReadPolicy { Master, PreferMaster, Replica, PreferReplica, Any };
+enum class ReadPolicy { Primary, PreferPrimary, Replica, PreferReplica, Any };
 
 /**
  * Configuration for a redis connection pool.
@@ -186,6 +186,8 @@ public:
   virtual ReadPolicy readPolicy() const PURE;
 };
 
+using ConfigSharedPtr = std::shared_ptr<Config>;
+
 /**
  * A factory for individual redis client connections.
  */
@@ -201,12 +203,71 @@ public:
    * @param redis_command_stats supplies the redis command stats.
    * @param scope supplies the stats scope.
    * @param auth password for upstream host.
+   * @param is_transaction_client true if this client was created to relay a transaction.
    * @return ClientPtr a new connection pool client.
    */
   virtual ClientPtr create(Upstream::HostConstSharedPtr host, Event::Dispatcher& dispatcher,
                            const Config& config,
                            const RedisCommandStatsSharedPtr& redis_command_stats,
-                           Stats::Scope& scope, const std::string& auth_password) PURE;
+                           Stats::Scope& scope, const std::string& auth_username,
+                           const std::string& auth_password, bool is_transaction_client) PURE;
+};
+
+// A MULTI command sent when starting a transaction.
+struct MultiRequest : public Extensions::NetworkFilters::Common::Redis::RespValue {
+public:
+  MultiRequest() {
+    type(Extensions::NetworkFilters::Common::Redis::RespType::Array);
+    std::vector<NetworkFilters::Common::Redis::RespValue> values(1);
+    values[0].type(NetworkFilters::Common::Redis::RespType::BulkString);
+    values[0].asString() = "MULTI";
+    asArray().swap(values);
+  }
+};
+
+// An empty array sent when a transaction is empty.
+struct EmptyArray : public Extensions::NetworkFilters::Common::Redis::RespValue {
+public:
+  EmptyArray() {
+    type(Extensions::NetworkFilters::Common::Redis::RespType::Array);
+    std::vector<NetworkFilters::Common::Redis::RespValue> values;
+    asArray().swap(values);
+  }
+};
+
+// A struct representing a Redis transaction.
+struct Transaction {
+  Transaction(Network::ConnectionCallbacks* connection_cb) : connection_cb_(connection_cb) {}
+  ~Transaction() {
+    if (connection_established_) {
+      client_->close();
+      connection_established_ = false;
+    }
+  }
+
+  void start() { active_ = true; }
+
+  void close() {
+    active_ = false;
+    key_.clear();
+    if (connection_established_) {
+      client_->close();
+      connection_established_ = false;
+    }
+    should_close_ = false;
+  }
+
+  bool active_{false};
+  bool connection_established_{false};
+  bool should_close_{false};
+  std::string key_;
+  ClientPtr client_;
+  Network::ConnectionCallbacks* connection_cb_;
+};
+
+class NoOpTransaction : public Transaction {
+public:
+  NoOpTransaction() : Transaction(nullptr) {}
 };
 
 } // namespace Client

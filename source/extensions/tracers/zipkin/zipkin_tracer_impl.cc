@@ -1,19 +1,18 @@
-#include "extensions/tracers/zipkin/zipkin_tracer_impl.h"
+#include "source/extensions/tracers/zipkin/zipkin_tracer_impl.h"
 
-#include "envoy/config/trace/v3/trace.pb.h"
+#include "envoy/config/trace/v3/zipkin.pb.h"
 
-#include "common/common/enum_to_int.h"
-#include "common/common/fmt.h"
-#include "common/common/utility.h"
-#include "common/config/utility.h"
-#include "common/http/headers.h"
-#include "common/http/message_impl.h"
-#include "common/http/utility.h"
-#include "common/tracing/http_tracer_impl.h"
-
-#include "extensions/tracers/well_known_names.h"
-#include "extensions/tracers/zipkin/span_context_extractor.h"
-#include "extensions/tracers/zipkin/zipkin_core_constants.h"
+#include "source/common/common/empty_string.h"
+#include "source/common/common/enum_to_int.h"
+#include "source/common/common/fmt.h"
+#include "source/common/common/utility.h"
+#include "source/common/config/utility.h"
+#include "source/common/http/headers.h"
+#include "source/common/http/message_impl.h"
+#include "source/common/http/utility.h"
+#include "source/common/tracing/http_tracer_impl.h"
+#include "source/extensions/tracers/zipkin/span_context_extractor.h"
+#include "source/extensions/tracers/zipkin/zipkin_core_constants.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -36,20 +35,25 @@ void ZipkinSpan::log(SystemTime timestamp, const std::string& event) {
   span_.log(timestamp, event);
 }
 
-void ZipkinSpan::injectContext(Http::RequestHeaderMap& request_headers) {
+// TODO(#11622): Implement baggage storage for zipkin spans
+void ZipkinSpan::setBaggage(absl::string_view, absl::string_view) {}
+std::string ZipkinSpan::getBaggage(absl::string_view) { return EMPTY_STRING; }
+
+void ZipkinSpan::injectContext(Tracing::TraceContext& trace_context,
+                               const Upstream::HostDescriptionConstSharedPtr&) {
   // Set the trace-id and span-id headers properly, based on the newly-created span structure.
-  request_headers.setReferenceKey(ZipkinCoreConstants::get().X_B3_TRACE_ID,
+  trace_context.setByReferenceKey(ZipkinCoreConstants::get().X_B3_TRACE_ID,
                                   span_.traceIdAsHexString());
-  request_headers.setReferenceKey(ZipkinCoreConstants::get().X_B3_SPAN_ID, span_.idAsHexString());
+  trace_context.setByReferenceKey(ZipkinCoreConstants::get().X_B3_SPAN_ID, span_.idAsHexString());
 
   // Set the parent-span header properly, based on the newly-created span structure.
   if (span_.isSetParentId()) {
-    request_headers.setReferenceKey(ZipkinCoreConstants::get().X_B3_PARENT_SPAN_ID,
+    trace_context.setByReferenceKey(ZipkinCoreConstants::get().X_B3_PARENT_SPAN_ID,
                                     span_.parentIdAsHexString());
   }
 
   // Set the sampled header.
-  request_headers.setReferenceKey(ZipkinCoreConstants::get().X_B3_SAMPLED,
+  trace_context.setByReferenceKey(ZipkinCoreConstants::get().X_B3_SAMPLED,
                                   span_.sampled() ? SAMPLED : NOT_SAMPLED);
 }
 
@@ -68,21 +72,23 @@ Driver::TlsTracer::TlsTracer(TracerPtr&& tracer, Driver& driver)
 Driver::Driver(const envoy::config::trace::v3::ZipkinConfig& zipkin_config,
                Upstream::ClusterManager& cluster_manager, Stats::Scope& scope,
                ThreadLocal::SlotAllocator& tls, Runtime::Loader& runtime,
-               const LocalInfo::LocalInfo& local_info, Runtime::RandomGenerator& random_generator,
+               const LocalInfo::LocalInfo& local_info, Random::RandomGenerator& random_generator,
                TimeSource& time_source)
     : cm_(cluster_manager), tracer_stats_{ZIPKIN_TRACER_STATS(
                                 POOL_COUNTER_PREFIX(scope, "tracing.zipkin."))},
       tls_(tls.allocateSlot()), runtime_(runtime), local_info_(local_info),
       time_source_(time_source) {
-  Config::Utility::checkCluster(TracerNames::get().Zipkin, zipkin_config.collector_cluster(), cm_,
+  Config::Utility::checkCluster("envoy.tracers.zipkin", zipkin_config.collector_cluster(), cm_,
                                 /* allow_added_via_api */ true);
   cluster_ = zipkin_config.collector_cluster();
+  hostname_ = !zipkin_config.collector_hostname().empty() ? zipkin_config.collector_hostname()
+                                                          : zipkin_config.collector_cluster();
 
   CollectorInfo collector;
   if (!zipkin_config.collector_endpoint().empty()) {
     collector.endpoint_ = zipkin_config.collector_endpoint();
   }
-  // The current default version of collector_endpoint_version is HTTP_JSON_V1.
+  // The current default version of collector_endpoint_version is HTTP_JSON.
   collector.version_ = zipkin_config.collector_endpoint_version();
   const bool trace_id_128bit = zipkin_config.trace_id_128bit();
 
@@ -90,11 +96,14 @@ Driver::Driver(const envoy::config::trace::v3::ZipkinConfig& zipkin_config,
       zipkin_config, shared_span_context, DEFAULT_SHARED_SPAN_CONTEXT);
   collector.shared_span_context_ = shared_span_context;
 
-  tls_->set([this, collector, &random_generator, trace_id_128bit, shared_span_context](
+  const bool split_spans_for_request = zipkin_config.split_spans_for_request();
+
+  tls_->set([this, collector, &random_generator, trace_id_128bit, shared_span_context,
+             split_spans_for_request](
                 Event::Dispatcher& dispatcher) -> ThreadLocal::ThreadLocalObjectSharedPtr {
-    TracerPtr tracer =
-        std::make_unique<Tracer>(local_info_.clusterName(), local_info_.address(), random_generator,
-                                 trace_id_128bit, shared_span_context, time_source_);
+    TracerPtr tracer = std::make_unique<Tracer>(
+        local_info_.clusterName(), local_info_.address(), random_generator, trace_id_128bit,
+        shared_span_context, time_source_, split_spans_for_request);
     tracer->setReporter(
         ReporterImpl::NewInstance(std::ref(*this), std::ref(dispatcher), collector));
     return std::make_shared<TlsTracer>(std::move(tracer), *this);
@@ -102,24 +111,23 @@ Driver::Driver(const envoy::config::trace::v3::ZipkinConfig& zipkin_config,
 }
 
 Tracing::SpanPtr Driver::startSpan(const Tracing::Config& config,
-                                   Http::RequestHeaderMap& request_headers, const std::string&,
+                                   Tracing::TraceContext& trace_context, const std::string&,
                                    SystemTime start_time,
                                    const Tracing::Decision tracing_decision) {
   Tracer& tracer = *tls_->getTyped<TlsTracer>().tracer_;
   SpanPtr new_zipkin_span;
-  SpanContextExtractor extractor(request_headers);
+  SpanContextExtractor extractor(trace_context);
   bool sampled{extractor.extractSampled(tracing_decision)};
   try {
     auto ret_span_context = extractor.extractSpanContext(sampled);
     if (!ret_span_context.second) {
       // Create a root Zipkin span. No context was found in the headers.
-      new_zipkin_span = tracer.startSpan(
-          config, std::string(request_headers.Host()->value().getStringView()), start_time);
+      new_zipkin_span =
+          tracer.startSpan(config, std::string(trace_context.authority()), start_time);
       new_zipkin_span->setSampled(sampled);
     } else {
-      new_zipkin_span =
-          tracer.startSpan(config, std::string(request_headers.Host()->value().getStringView()),
-                           start_time, ret_span_context.first);
+      new_zipkin_span = tracer.startSpan(config, std::string(trace_context.authority()), start_time,
+                                         ret_span_context.first);
     }
 
   } catch (const ExtractorException& e) {
@@ -178,26 +186,22 @@ void ReporterImpl::flushSpans() {
     Http::RequestMessagePtr message = std::make_unique<Http::RequestMessageImpl>();
     message->headers().setReferenceMethod(Http::Headers::get().MethodValues.Post);
     message->headers().setPath(collector_.endpoint_);
-    message->headers().setHost(driver_.cluster());
+    message->headers().setHost(driver_.hostname());
     message->headers().setReferenceContentType(
         collector_.version_ == envoy::config::trace::v3::ZipkinConfig::HTTP_PROTO
             ? Http::Headers::get().ContentTypeValues.Protobuf
             : Http::Headers::get().ContentTypeValues.Json);
 
-    Buffer::InstancePtr body = std::make_unique<Buffer::OwnedImpl>();
-    body->add(request_body);
-    message->body() = std::move(body);
+    message->body().add(request_body);
 
     const uint64_t timeout =
         driver_.runtime().snapshot().getInteger("tracing.zipkin.request_timeout", 5000U);
 
-    if (collector_cluster_.exists()) {
+    if (collector_cluster_.threadLocalCluster().has_value()) {
       Http::AsyncClient::Request* request =
-          driver_.clusterManager()
-              .httpAsyncClientForCluster(collector_cluster_.info()->name())
-              .send(std::move(message), *this,
-                    Http::AsyncClient::RequestOptions().setTimeout(
-                        std::chrono::milliseconds(timeout)));
+          collector_cluster_.threadLocalCluster()->get().httpAsyncClient().send(
+              std::move(message), *this,
+              Http::AsyncClient::RequestOptions().setTimeout(std::chrono::milliseconds(timeout)));
       if (request) {
         active_requests_.add(*request);
       }

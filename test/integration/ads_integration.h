@@ -10,61 +10,62 @@
 #include "envoy/config/route/v3/route.pb.h"
 
 #include "test/common/grpc/grpc_client_integration.h"
+#include "test/config/utility.h"
 #include "test/integration/http_integration.h"
 
-// TODO(fredlas) set_node_on_first_message_only was true; the delta+SotW unification
-//               work restores it here.
 namespace Envoy {
-static std::string AdsIntegrationConfig(const std::string& api_type) {
-  // Note: do not use CONSTRUCT_ON_FIRST_USE here!
-  return fmt::format(R"EOF(
-dynamic_resources:
-  lds_config:
-    ads: {{}}
-  cds_config:
-    ads: {{}}
-  ads_config:
-    api_type: {}
-    set_node_on_first_message_only: false
-static_resources:
-  clusters:
-    name: dummy_cluster
-    connect_timeout:
-      seconds: 5
-    type: STATIC
-    load_assignment:
-      cluster_name: dummy_cluster
-      endpoints:
-      - lb_endpoints:
-        - endpoint:
-            address:
-              socket_address:
-                address: 127.0.0.1
-                port_value: 0
-    lb_policy: ROUND_ROBIN
-    http2_protocol_options: {{}}
-admin:
-  access_log_path: /dev/null
-  address:
-    socket_address:
-      address: 127.0.0.1
-      port_value: 0
-)EOF",
-                     api_type);
-}
 
-class AdsIntegrationTest : public Grpc::DeltaSotwIntegrationParamTest, public HttpIntegrationTest {
+// Support parameterizing over old DSS vs new DSS. Can be dropped when old DSS goes away.
+enum class OldDssOrNewDss { Old, New };
+
+// Base class that supports parameterizing over old DSS vs new DSS. Can be replaced with
+// Grpc::BaseGrpcClientIntegrationParamTest when old DSS is removed.
+class AdsDeltaSotwIntegrationSubStateParamTest
+    : public Grpc::BaseGrpcClientIntegrationParamTest,
+      public testing::TestWithParam<std::tuple<Network::Address::IpVersion, Grpc::ClientType,
+                                               Grpc::SotwOrDelta, OldDssOrNewDss>> {
+public:
+  ~AdsDeltaSotwIntegrationSubStateParamTest() override = default;
+  static std::string protocolTestParamsToString(
+      const ::testing::TestParamInfo<std::tuple<Network::Address::IpVersion, Grpc::ClientType,
+                                                Grpc::SotwOrDelta, OldDssOrNewDss>>& p) {
+    return fmt::format(
+        "{}_{}_{}_{}", std::get<0>(p.param) == Network::Address::IpVersion::v4 ? "IPv4" : "IPv6",
+        std::get<1>(p.param) == Grpc::ClientType::GoogleGrpc ? "GoogleGrpc" : "EnvoyGrpc",
+        std::get<2>(p.param) == Grpc::SotwOrDelta::Delta ? "Delta" : "StateOfTheWorld",
+        std::get<3>(p.param) == OldDssOrNewDss::Old ? "OldDSS" : "NewDSS");
+  }
+  Network::Address::IpVersion ipVersion() const override { return std::get<0>(GetParam()); }
+  Grpc::ClientType clientType() const override { return std::get<1>(GetParam()); }
+  Grpc::SotwOrDelta sotwOrDelta() const { return std::get<2>(GetParam()); }
+  OldDssOrNewDss oldDssOrNewDss() const { return std::get<3>(GetParam()); }
+};
+
+class AdsIntegrationTest : public AdsDeltaSotwIntegrationSubStateParamTest,
+                           public HttpIntegrationTest {
 public:
   AdsIntegrationTest();
 
   void TearDown() override;
 
-  envoy::config::cluster::v3::Cluster buildCluster(const std::string& name);
+  envoy::config::cluster::v3::Cluster buildCluster(const std::string& name,
+                                                   const std::string& lb_policy = "ROUND_ROBIN");
+
+  envoy::config::cluster::v3::Cluster buildTlsCluster(const std::string& name);
 
   envoy::config::cluster::v3::Cluster buildRedisCluster(const std::string& name);
 
   envoy::config::endpoint::v3::ClusterLoadAssignment
   buildClusterLoadAssignment(const std::string& name);
+
+  envoy::config::endpoint::v3::ClusterLoadAssignment
+  buildTlsClusterLoadAssignment(const std::string& name);
+
+  envoy::config::endpoint::v3::ClusterLoadAssignment
+  buildClusterLoadAssignmentWithLeds(const std::string& name, const std::string& collection_name);
+
+  envoy::service::discovery::v3::Resource
+  buildLbEndpointResource(const std::string& lb_endpoint_resource_name, const std::string& version);
 
   envoy::config::listener::v3::Listener buildListener(const std::string& name,
                                                       const std::string& route_config,
@@ -87,5 +88,13 @@ public:
   envoy::admin::v3::ListenersConfigDump getListenersConfigDump();
   envoy::admin::v3::RoutesConfigDump getRoutesConfigDump();
 };
+
+// When old delta subscription state goes away, we could replace this macro back with
+// DELTA_SOTW_GRPC_CLIENT_INTEGRATION_PARAMS.
+#define ADS_INTEGRATION_PARAMS                                                                     \
+  testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),                     \
+                   testing::ValuesIn(TestEnvironment::getsGrpcVersionsForTest()),                  \
+                   testing::Values(Grpc::SotwOrDelta::Sotw, Grpc::SotwOrDelta::Delta),             \
+                   testing::Values(OldDssOrNewDss::Old, OldDssOrNewDss::New))
 
 } // namespace Envoy

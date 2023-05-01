@@ -5,14 +5,14 @@
 
 #include "envoy/api/os_sys_calls.h"
 
-#include "common/filesystem/file_shared_impl.h"
+#include "source/common/filesystem/file_shared_impl.h"
 
 namespace Envoy {
 namespace Filesystem {
 
 class FileImplPosix : public FileSharedImpl {
 public:
-  FileImplPosix(const std::string& path) : FileSharedImpl(path) {}
+  FileImplPosix(const FilePathAndType& file_info) : FileSharedImpl(file_info) {}
   ~FileImplPosix() override;
 
 protected:
@@ -21,20 +21,19 @@ protected:
     mode_t mode_ = 0;
   };
 
-  // Filesystem::FileSharedImpl
-  FlagsAndMode translateFlag(FlagSet in);
-  void openFile(FlagSet flags) override;
-  ssize_t writeFile(absl::string_view buffer) override;
-  bool closeFile() override;
+  Api::IoCallBoolResult open(FlagSet flag) override;
+  Api::IoCallSizeResult write(absl::string_view buffer) override;
+  Api::IoCallBoolResult close() override;
 
 private:
+  FlagsAndMode translateFlag(FlagSet in);
   friend class FileSystemImplTest;
 };
 
 class InstanceImplPosix : public Instance {
 public:
   // Filesystem::Instance
-  FilePtr createFile(const std::string& path) override;
+  FilePtr createFile(const FilePathAndType& file_info) override;
   bool fileExists(const std::string& path) override;
   bool directoryExists(const std::string& path) override;
   ssize_t fileSize(const std::string& path) override;
@@ -47,5 +46,7 @@ private:
   friend class FileSystemImplTest;
 };
 
+using FileImpl = FileImplPosix;
+using InstanceImpl = InstanceImplPosix;
 } // namespace Filesystem
 } // namespace Envoy

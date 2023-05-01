@@ -4,7 +4,7 @@ Priority levels
 ------------------
 
 During load balancing, Envoy will generally only consider hosts configured at the highest priority
-level. For each EDS :ref:`LocalityLbEndpoints<envoy_api_msg_endpoint.LocalityLbEndpoints>` an optional
+level. For each EDS :ref:`LocalityLbEndpoints<envoy_v3_api_msg_config.endpoint.v3.LocalityLbEndpoints>` an optional
 priority may also be specified. When endpoints at the highest priority level (P=0) are healthy, all
 traffic will land on endpoints in that priority level. As endpoints for the highest priority level
 become unhealthy, traffic will begin to trickle to lower priority levels.
@@ -98,7 +98,7 @@ To sum this up in pseudo algorithms:
 
   health(P_X) = min(100, 1.4 * 100 * healthy_P_X_backends / total_P_X_backends)
   normalized_total_health = min(100, Σ(health(P_0)...health(P_X)))
-  priority_load(P_0) = min(100, health(P_0) * 100 / normalized_total_health)
+  priority_load(P_0) = health(P_0) * 100 / normalized_total_health
   priority_load(P_X) = min(100 - Σ(priority_load(P_0)..priority_load(P_X-1)),
                            health(P_X) * 100 / normalized_total_health)
 

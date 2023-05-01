@@ -85,6 +85,36 @@ rules:
 bypass_cors_preflight: true
 )";
 
+const char ExampleConfigWithRegEx[] = R"(
+providers:
+  example_provider:
+    issuer: https://example.com
+    audiences:
+    - example_service
+    - http://example_service1
+    - https://example_service2/
+    remote_jwks:
+      http_uri:
+        uri: https://pubkey_server/pubkey_path
+        cluster: pubkey_cluster
+        timeout:
+          seconds: 5
+      cache_duration:
+        seconds: 600
+    forward_payload_header: sec-istio-auth-userinfo
+rules:
+- match:
+    safe_regex:
+      regex: "/somethig/.*"
+  requires:
+    provider_name: "example_provider"
+- match:
+    path: "/"
+  requires:
+    provider_name: "example_provider"
+bypass_cors_preflight: true
+)";
+
 // The name of provider for above config.
 const char ProviderName[] = "example_provider";
 
@@ -178,6 +208,11 @@ const char ExpectedPayloadValue[] = "eyJpc3MiOiJodHRwczovL2V4YW1wbGUuY29tIiwic3V
                                     "xlLmNvbSIsImV4cCI6MjAwMTAwMTAwMSwiYXVkIjoiZXhhbXBsZV9zZXJ2"
                                     "aWNlIn0";
 
+const char ExpectedPayloadValueWithPadding[] =
+    "eyJpc3MiOiJodHRwczovL2V4YW1wbGUuY29tIiwic3ViIjoidGVzdEBleGFtcG"
+    "xlLmNvbSIsImV4cCI6MjAwMTAwMTAwMSwiYXVkIjoiZXhhbXBsZV9zZXJ2"
+    "aWNlIn0=";
+
 // Base64 decoded Payload JSON
 const char ExpectedPayloadJSON[] = R"(
 {
@@ -185,6 +220,58 @@ const char ExpectedPayloadJSON[] = R"(
   "sub":"test@example.com",
   "exp":2001001001,
   "aud":"example_service"
+}
+)";
+
+const char ExpectedHeaderJSON[] = R"(
+{
+  "alg": "RS256",
+  "typ": "JWT"
+}
+)";
+
+const char ExpectedPayloadAndHeaderJSON[] = R"(
+{
+  "my_payload":{
+    "iss":"https://example.com",
+    "exp":2001001001,
+    "sub":"test@example.com",
+    "aud":"example_service"
+  },
+  "my_header":{
+    "typ":"JWT",
+    "alg":"RS256"
+  }
+}
+)";
+
+// Token copied from https://github.com/google/jwt_verify_lib/blob/master/src/verify_jwk_ec_test.cc
+// Use jwt.io to modify payload as:
+// {
+//  "iss11": "628645741881-noabiu23f5a8m8ovd8ucv698lj78vv0l@developer.gserviceaccount.com",
+//  "sub": "628645741881-noabiu23f5a8m8ovd8ucv698lj78vv0l@developer.gserviceaccount.com",
+//  "aud": "example_service"
+// }
+const char ES256WithoutIssToken[] =
+    "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImFiYyJ9."
+    "eyJpc3MxMSI6IjYyODY0NTc0MTg4MS1ub2FiaXUyM2Y1YThtOG92ZDh1Y3Y2OThsajc4dnYwbEBkZXZlbG9wZXIuZ3Nlcn"
+    "ZpY2VhY2NvdW50LmNvbSIsInN1YiI6IjYyODY0NTc0MTg4MS1ub2FiaXUyM2Y1YThtOG92ZDh1Y3Y2OThsajc4dnYwbEBk"
+    "ZXZlbG9wZXIuZ3NlcnZpY2VhY2NvdW50LmNvbSIsImF1ZCI6ImV4YW1wbGVfc2VydmljZSJ9.f-_"
+    "NAdznQK9o93AZTqNawu1yal1igNLgYvuj0JzW9SVmJJQuBT_12wJi9XQzZLFwSFn6D3f7bPWSZQlScTFSMg";
+
+// Public key for above ES256 tokens.
+const char ES256PublicKey[] = R"(
+{
+  "keys": [
+    {
+      "kty": "EC",
+      "crv": "P-256",
+      "alg": "ES256",
+      "kid": "abc",
+      "x": "EB54wykhS7YJFD6RYJNnwbWEz3cI7CF5bCDTXlrwI5k",
+      "y": "92bCBTvMFQ8lKbS2MbgjT3YfmYo6HnPEE2tsAqWUJw8"
+    }
+  ]
 }
 )";
 

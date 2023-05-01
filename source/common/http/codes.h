@@ -8,7 +8,8 @@
 #include "envoy/http/header_map.h"
 #include "envoy/stats/scope.h"
 
-#include "common/stats/symbol_table_impl.h"
+#include "source/common/common/thread.h"
+#include "source/common/stats/symbol_table.h"
 
 namespace Envoy {
 namespace Http {
@@ -21,6 +22,7 @@ struct CodeStats::ResponseStatInfo {
   bool internal_request_;
   Stats::StatName request_vhost_name_;
   Stats::StatName request_vcluster_name_;
+  Stats::StatName request_route_name_;
   Stats::StatName from_zone_;
   Stats::StatName to_zone_;
   bool upstream_canary_;
@@ -35,6 +37,7 @@ struct CodeStats::ResponseTimingInfo {
   bool internal_request_;
   Stats::StatName request_vhost_name_;
   Stats::StatName request_vcluster_name_;
+  Stats::StatName request_route_name_;
   Stats::StatName from_zone_;
   Stats::StatName to_zone_;
 };
@@ -44,9 +47,10 @@ public:
   explicit CodeStatsImpl(Stats::SymbolTable& symbol_table);
 
   // CodeStats
-  void chargeBasicResponseStat(Stats::Scope& scope, Stats::StatName prefix,
-                               Code response_code) const override;
-  void chargeResponseStat(const ResponseStatInfo& info) const override;
+  void chargeBasicResponseStat(Stats::Scope& scope, Stats::StatName prefix, Code response_code,
+                               bool exclude_http_code_stats) const override;
+  void chargeResponseStat(const ResponseStatInfo& info,
+                          bool exclude_http_code_stats) const override;
   void chargeResponseTiming(const ResponseTimingInfo& info) const override;
 
 private:
@@ -62,8 +66,7 @@ private:
   Stats::StatName upstreamRqGroup(Code response_code) const;
   Stats::StatName upstreamRqStatName(Code response_code) const;
 
-  mutable Stats::StatNamePool stat_name_pool_ ABSL_GUARDED_BY(mutex_);
-  mutable absl::Mutex mutex_;
+  mutable Stats::StatNamePool stat_name_pool_;
   Stats::SymbolTable& symbol_table_;
 
   const Stats::StatName canary_;
@@ -81,6 +84,7 @@ private:
   const Stats::StatName upstream_rq_time_;
   const Stats::StatName vcluster_;
   const Stats::StatName vhost_;
+  const Stats::StatName route_;
   const Stats::StatName zone_;
 
   // Use an array of atomic pointers to hold StatNameStorage objects for
@@ -108,7 +112,9 @@ private:
 
   static constexpr uint32_t NumHttpCodes = 500;
   static constexpr uint32_t HttpCodeOffset = 100; // code 100 is at index 0.
-  mutable std::atomic<const uint8_t*> rc_stat_names_[NumHttpCodes];
+  mutable Thread::AtomicPtrArray<const uint8_t, NumHttpCodes,
+                                 Thread::AtomicPtrAllocMode::DoNotDelete>
+      rc_stat_names_;
 };
 
 /**

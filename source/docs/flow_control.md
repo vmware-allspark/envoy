@@ -101,6 +101,32 @@ upstream connections, the `readDisable(true)` calls are unwound in
 ClientConnectionImpl::onMessageComplete() to make sure that as connections are
 returned to the connection pool they are ready to read.
 
+#### HTTP2 defer processing backed up streams
+
+This section will be further integrated with the rest of the document when it is
+enabled by default (currently off by default). At a high level this change does
+the following:
+
+* If a HTTP/2 stream is read disabled anywhere we will begin buffering body and
+  trailers in the receiving side of the codec to minimize work done on the
+  stream when it's read disabled. There will be a callback scheduled to drain
+  these when the stream is read enabled, it can also be drained if the stream is
+  read enabled, and the stream is invoked with additional data.
+* The codec's recieve buffer high watermark is still used in consideration for
+  granting peer stream additional window (preserving existing protocol flow
+  control). The codec's recieve buffer high watermark was rarely used prior as we'd
+  eagerly dispatch data through the filter chain. An exceptions where it could be
+  triggered is if a filter in the filter chain either injects data triggering watermark.
+  The codec's recieve buffer no longer read disables the stream, as we could be
+  read disabled elsewhere, buffer data in codec's recieve buffer hitting high
+  watermark and never switch back to being read enabled.
+* One side effect of deferring stream processing is the need to defer processing
+  stream close. See ``deferred_stream_close`` in
+  :ref:`config_http_conn_man_stats_per_codec` for additional details.
+
+As of now we push all buffered data through the other end, but will implement
+chunking and fairness to avoid a stream starving the others.
+
 ## HTTP/2 codec recv buffer
 
 Given the HTTP/2 `Envoy::Http::Http2::ConnectionImpl::StreamImpl::pending_recv_data_` is processed immediately
@@ -135,7 +161,7 @@ time, it should return `FilterDataStatus::StopIterationAndWatermark` to pause
 further data processing, which will cause the `ConnectionManagerImpl` to trigger
 watermark callbacks on behalf of the filter. If a filter can not make forward progress without the
 complete body, it should return `FilterDataStatus::StopIterationAndBuffer`.
-in this case if the `ConnectionManagerImpl` buffers more than the allowed data
+In this case if the `ConnectionManagerImpl` buffers more than the allowed data
 it will return an error downstream: a 413 on the request path, 500 or `resetStream()` on the
 response path.
 
@@ -165,7 +191,7 @@ And the low watermark path:
    `StreamDecoderFilterCallback::onDecoderFilterBelowWriteBufferLowWatermark()`.
  * When `Envoy::Http::ConnectionManagerImpl` receives
  `onDecoderFilterAboveWriteBufferHighWatermark()` it calls `readDisable(false)` on the downstream
- stream to pause data.
+ stream to resume data.
 
 # Encoder filters
 
@@ -192,11 +218,11 @@ The encoder high watermark path for streaming filters is as follows:
     `DownstreamWatermarkCallbacks::onAboveWriteBufferHighWatermark()` for all
     filters which registered to receive watermark events
  * `Envoy::Router::Filter` receives `onAboveWriteBufferHighWatermark()` and calls
-   `readDisable(false)` on the upstream request.
+   `readDisable(true)` on the upstream request.
 
 The encoder low watermark path for streaming filters is as follows:
 
- * When an instance of `Envoy::Router::StreamEncoderFilter` buffers too much data it should call
+ * When an instance of `Envoy::Router::StreamEncoderFilter` buffers drains it should call
    `StreamEncoderFilterCallback::onEncodeFilterBelowWriteBufferLowWatermark()`.
  * When `Envoy::Http::ConnectionManagerImpl::ActiveStreamEncoderFilter` receives
  `onEncoderFilterBelowWriteBufferLowWatermark()` it calls
@@ -205,7 +231,7 @@ The encoder low watermark path for streaming filters is as follows:
     `DownstreamWatermarkCallbacks::onBelowWriteBufferLowWatermark()` for all
     filters which registered to receive watermark events
  * `Envoy::Router::Filter` receives `onBelowWriteBufferLowWatermark()` and calls
-   `readDisable(true)` on the upstream request.
+   `readDisable(false)` on the upstream request.
 
 # HTTP and HTTP/2 codec upstream send buffer
 
@@ -394,6 +420,8 @@ watermark path is as follows:
 From this point the `ConnectionManagerImpl` takes over and the code path is the same as for the
 HTTP/2 codec downstream send buffer.
 
+The low watermark path is as follows:
+
  * When `Http::Http1::ConnectionImpl::output_buffer_` drains
    it calls `onOutputBufferBelowLowWatermark()`
  * Http::Http1::ConnectionImpl::ServerConnectionImpl::onOutputBufferBelowLowWatermark() calls
@@ -416,6 +444,8 @@ watermark path is as follows:
 From this point on the `Envoy::Router::Filter` picks up the event and the code path is the same as
 for the HTTP/2 codec upstream send buffer.
 
+The low watermark path is as follows:
+
  * When `Http::Http1::ConnectionImpl::output_buffer_` drains
    it calls `onOutputBufferBelowLowWatermark()`
  * Http::Http1::ConnectionImpl::ClientConnectionImpl::onOutputBufferBelowLowWatermark() calls
@@ -423,3 +453,6 @@ for the HTTP/2 codec upstream send buffer.
    receiving an `onBelowWriteBufferLowWatermark()` callback.
 From this point on the `Envoy::Router::Filter` picks up the event and the code path is the same as
 for the HTTP/2 codec upstream send buffer.
+
+### HTTP3 implementation details
+HTTP3 network buffer and stream send buffer works differently from HTTP2 and HTTP. See quiche_integration.md.

@@ -5,8 +5,8 @@
 #include "envoy/extensions/transport_sockets/tls/v3/cert.pb.h"
 #include "envoy/upstream/upstream.h"
 
-#include "extensions/transport_sockets/tls/context_config_impl.h"
-#include "extensions/transport_sockets/tls/ssl_socket.h"
+#include "source/extensions/transport_sockets/tls/context_config_impl.h"
+#include "source/extensions/transport_sockets/tls/ssl_socket.h"
 
 #include "test/integration/http_integration.h"
 
@@ -16,34 +16,41 @@ class AutoSniIntegrationTest : public testing::TestWithParam<Network::Address::I
                                public Event::TestUsingSimulatedTime,
                                public HttpIntegrationTest {
 public:
-  AutoSniIntegrationTest() : HttpIntegrationTest(Http::CodecClient::Type::HTTP1, GetParam()) {}
+  AutoSniIntegrationTest() : HttpIntegrationTest(Http::CodecType::HTTP1, GetParam()) {}
 
-  void setup() {
-    setUpstreamProtocol(FakeHttpConnection::Type::HTTP1);
+  void setup(const std::string& override_auto_sni_header = "") {
+    setUpstreamProtocol(Http::CodecType::HTTP1);
 
-    config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
-      auto& cluster_config = bootstrap.mutable_static_resources()->mutable_clusters()->at(0);
-      cluster_config.mutable_upstream_http_protocol_options()->set_auto_sni(true);
+    config_helper_.addConfigModifier(
+        [override_auto_sni_header](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+          auto& cluster_config = bootstrap.mutable_static_resources()->mutable_clusters()->at(0);
+          ConfigHelper::HttpProtocolOptions protocol_options;
+          protocol_options.mutable_upstream_http_protocol_options()->set_auto_sni(true);
+          if (!override_auto_sni_header.empty()) {
+            protocol_options.mutable_upstream_http_protocol_options()->set_override_auto_sni_header(
+                override_auto_sni_header);
+          }
+          ConfigHelper::setProtocolOptions(
+              *bootstrap.mutable_static_resources()->mutable_clusters(0), protocol_options);
 
-      envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext tls_context;
-      auto* validation_context =
-          tls_context.mutable_common_tls_context()->mutable_validation_context();
-      validation_context->mutable_trusted_ca()->set_filename(
-          TestEnvironment::runfilesPath("test/config/integration/certs/upstreamcacert.pem"));
-      cluster_config.mutable_transport_socket()->set_name("envoy.transport_sockets.tls");
-      cluster_config.mutable_transport_socket()->mutable_typed_config()->PackFrom(tls_context);
-    });
+          envoy::extensions::transport_sockets::tls::v3::UpstreamTlsContext tls_context;
+          auto* validation_context =
+              tls_context.mutable_common_tls_context()->mutable_validation_context();
+          validation_context->mutable_trusted_ca()->set_filename(
+              TestEnvironment::runfilesPath("test/config/integration/certs/upstreamcacert.pem"));
+          cluster_config.mutable_transport_socket()->set_name("envoy.transport_sockets.tls");
+          cluster_config.mutable_transport_socket()->mutable_typed_config()->PackFrom(tls_context);
+        });
 
     HttpIntegrationTest::initialize();
   }
 
   void createUpstreams() override {
-    fake_upstreams_.emplace_back(new FakeUpstream(
-        createUpstreamSslContext(), 0, FakeHttpConnection::Type::HTTP1, version_, timeSystem()));
-    fake_upstreams_[0]->set_allow_unexpected_disconnects(true);
+    addFakeUpstream(createUpstreamSslContext(), Http::CodecType::HTTP1,
+                    /*autonomous_upstream=*/false);
   }
 
-  Network::TransportSocketFactoryPtr createUpstreamSslContext() {
+  Network::DownstreamTransportSocketFactoryPtr createUpstreamSslContext() {
     envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext tls_context;
     auto* common_tls_context = tls_context.mutable_common_tls_context();
     auto* tls_cert = common_tls_context->add_tls_certificates();
@@ -69,35 +76,54 @@ TEST_P(AutoSniIntegrationTest, BasicAutoSniTest) {
   setup();
   codec_client_ = makeHttpConnection(lookupPort("http"));
   const auto response_ = sendRequestAndWaitForResponse(
-      Http::TestHeaderMapImpl{
+      Http::TestRequestHeaderMapImpl{
           {":method", "GET"}, {":path", "/"}, {":scheme", "http"}, {":authority", "localhost"}},
       0, default_response_headers_, 0);
 
   EXPECT_TRUE(upstream_request_->complete());
   EXPECT_TRUE(response_->complete());
 
-  const Extensions::TransportSockets::Tls::SslSocketInfo* ssl_socket =
-      dynamic_cast<const Extensions::TransportSockets::Tls::SslSocketInfo*>(
+  const Extensions::TransportSockets::Tls::SslHandshakerImpl* ssl_socket =
+      dynamic_cast<const Extensions::TransportSockets::Tls::SslHandshakerImpl*>(
           fake_upstream_connection_->connection().ssl().get());
-  EXPECT_STREQ("localhost",
-               SSL_get_servername(ssl_socket->rawSslForTest(), TLSEXT_NAMETYPE_host_name));
+  EXPECT_STREQ("localhost", SSL_get_servername(ssl_socket->ssl(), TLSEXT_NAMETYPE_host_name));
+}
+
+TEST_P(AutoSniIntegrationTest, AutoSniWithAltHeaderNameTest) {
+  setup("x-host");
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+  const auto response_ =
+      sendRequestAndWaitForResponse(Http::TestRequestHeaderMapImpl{{":method", "GET"},
+                                                                   {":path", "/"},
+                                                                   {":scheme", "http"},
+                                                                   {":authority", "localhost"},
+                                                                   {"x-host", "custom"}},
+                                    0, default_response_headers_, 0);
+
+  EXPECT_TRUE(upstream_request_->complete());
+  EXPECT_TRUE(response_->complete());
+
+  const Extensions::TransportSockets::Tls::SslHandshakerImpl* ssl_socket =
+      dynamic_cast<const Extensions::TransportSockets::Tls::SslHandshakerImpl*>(
+          fake_upstream_connection_->connection().ssl().get());
+  EXPECT_STREQ("custom", SSL_get_servername(ssl_socket->ssl(), TLSEXT_NAMETYPE_host_name));
 }
 
 TEST_P(AutoSniIntegrationTest, PassingNotDNS) {
   setup();
   codec_client_ = makeHttpConnection(lookupPort("http"));
   const auto response_ = sendRequestAndWaitForResponse(
-      Http::TestHeaderMapImpl{
+      Http::TestRequestHeaderMapImpl{
           {":method", "GET"}, {":path", "/"}, {":scheme", "http"}, {":authority", "127.0.0.1"}},
       0, default_response_headers_, 0);
 
   EXPECT_TRUE(upstream_request_->complete());
   EXPECT_TRUE(response_->complete());
 
-  const Extensions::TransportSockets::Tls::SslSocketInfo* ssl_socket =
-      dynamic_cast<const Extensions::TransportSockets::Tls::SslSocketInfo*>(
+  const Extensions::TransportSockets::Tls::SslHandshakerImpl* ssl_socket =
+      dynamic_cast<const Extensions::TransportSockets::Tls::SslHandshakerImpl*>(
           fake_upstream_connection_->connection().ssl().get());
-  EXPECT_STREQ(nullptr, SSL_get_servername(ssl_socket->rawSslForTest(), TLSEXT_NAMETYPE_host_name));
+  EXPECT_STREQ(nullptr, SSL_get_servername(ssl_socket->ssl(), TLSEXT_NAMETYPE_host_name));
 }
 
 TEST_P(AutoSniIntegrationTest, PassingHostWithoutPort) {
@@ -113,11 +139,10 @@ TEST_P(AutoSniIntegrationTest, PassingHostWithoutPort) {
   EXPECT_TRUE(upstream_request_->complete());
   EXPECT_TRUE(response_->complete());
 
-  const Extensions::TransportSockets::Tls::SslSocketInfo* ssl_socket =
-      dynamic_cast<const Extensions::TransportSockets::Tls::SslSocketInfo*>(
+  const Extensions::TransportSockets::Tls::SslHandshakerImpl* ssl_socket =
+      dynamic_cast<const Extensions::TransportSockets::Tls::SslHandshakerImpl*>(
           fake_upstream_connection_->connection().ssl().get());
-  EXPECT_STREQ("example.com",
-               SSL_get_servername(ssl_socket->rawSslForTest(), TLSEXT_NAMETYPE_host_name));
+  EXPECT_STREQ("example.com", SSL_get_servername(ssl_socket->ssl(), TLSEXT_NAMETYPE_host_name));
 }
 
 } // namespace

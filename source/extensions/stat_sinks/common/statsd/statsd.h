@@ -1,5 +1,6 @@
 #pragma once
 
+#include "envoy/buffer/buffer.h"
 #include "envoy/common/platform.h"
 #include "envoy/local_info/local_info.h"
 #include "envoy/network/connection.h"
@@ -11,9 +12,12 @@
 #include "envoy/thread_local/thread_local.h"
 #include "envoy/upstream/cluster_manager.h"
 
-#include "common/buffer/buffer_impl.h"
-#include "common/common/macros.h"
-#include "common/network/io_socket_handle_impl.h"
+#include "source/common/buffer/buffer_impl.h"
+#include "source/common/common/macros.h"
+#include "source/common/network/io_socket_handle_impl.h"
+#include "source/extensions/stat_sinks/common/statsd/tag_formats.h"
+
+#include "absl/types/optional.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -34,15 +38,21 @@ public:
   class Writer : public ThreadLocal::ThreadLocalObject {
   public:
     virtual void write(const std::string& message) PURE;
+    virtual void writeBuffer(Buffer::Instance& data) PURE;
   };
 
   UdpStatsdSink(ThreadLocal::SlotAllocator& tls, Network::Address::InstanceConstSharedPtr address,
-                const bool use_tag, const std::string& prefix = getDefaultPrefix());
+                const bool use_tag, const std::string& prefix = getDefaultPrefix(),
+                absl::optional<uint64_t> buffer_size = absl::nullopt,
+                const Statsd::TagFormat& tag_format = Statsd::getDefaultTagFormat());
   // For testing.
   UdpStatsdSink(ThreadLocal::SlotAllocator& tls, const std::shared_ptr<Writer>& writer,
-                const bool use_tag, const std::string& prefix = getDefaultPrefix())
+                const bool use_tag, const std::string& prefix = getDefaultPrefix(),
+                absl::optional<uint64_t> buffer_size = absl::nullopt,
+                const Statsd::TagFormat& tag_format = Statsd::getDefaultTagFormat())
       : tls_(tls.allocateSlot()), use_tag_(use_tag),
-        prefix_(prefix.empty() ? getDefaultPrefix() : prefix) {
+        prefix_(prefix.empty() ? getDefaultPrefix() : prefix),
+        buffer_size_(buffer_size.value_or(0)), tag_format_(tag_format) {
     tls_->set(
         [writer](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr { return writer; });
   }
@@ -52,6 +62,7 @@ public:
   void onHistogramComplete(const Stats::Histogram& histogram, uint64_t value) override;
 
   bool getUseTagForTest() { return use_tag_; }
+  uint64_t getBufferSizeForTest() { return buffer_size_; }
   const std::string& getPrefix() { return prefix_; }
 
 private:
@@ -64,12 +75,19 @@ private:
 
     // Writer
     void write(const std::string& message) override;
+    void writeBuffer(Buffer::Instance& data) override;
 
   private:
     UdpStatsdSink& parent_;
     const Network::IoHandlePtr io_handle_;
   };
 
+  void flushBuffer(Buffer::OwnedImpl& buffer, Writer& writer) const;
+  void writeBuffer(Buffer::OwnedImpl& buffer, Writer& writer, const std::string& data) const;
+
+  template <typename ValueType>
+  const std::string buildMessage(const Stats::Metric& metric, ValueType value,
+                                 const std::string& type) const;
   const std::string getName(const Stats::Metric& metric) const;
   const std::string buildTagStr(const std::vector<Stats::Tag>& tags) const;
 
@@ -78,6 +96,8 @@ private:
   const bool use_tag_;
   // Prefix for all flushed stats.
   const std::string prefix_;
+  const uint64_t buffer_size_;
+  const Statsd::TagFormat tag_format_;
 };
 
 /**
@@ -91,11 +111,7 @@ public:
 
   // Stats::Sink
   void flush(Stats::MetricSnapshot& snapshot) override;
-  void onHistogramComplete(const Stats::Histogram& histogram, uint64_t value) override {
-    // For statsd histograms are all timers.
-    tls_->getTyped<TlsSink>().onTimespanComplete(histogram.name(),
-                                                 std::chrono::milliseconds(value));
-  }
+  void onHistogramComplete(const Stats::Histogram& histogram, uint64_t value) override;
 
   const std::string& getPrefix() { return prefix_; }
 
@@ -110,6 +126,7 @@ private:
     void flushGauge(const std::string& name, uint64_t value);
     void endFlush(bool do_write);
     void onTimespanComplete(const std::string& name, std::chrono::milliseconds ms);
+    void onPercentHistogramComplete(const std::string& name, float value);
     uint64_t usedBuffer() const;
     void write(Buffer::Instance& buffer);
 
@@ -122,7 +139,7 @@ private:
     Event::Dispatcher& dispatcher_;
     Network::ClientConnectionPtr connection_;
     Buffer::OwnedImpl buffer_;
-    Buffer::RawSlice current_buffer_slice_;
+    absl::optional<Buffer::ReservationSingleSlice> current_buffer_reservation_;
     char* current_slice_mem_{};
   };
 

@@ -7,12 +7,10 @@
 #include "envoy/type/matcher/v3/string.pb.h"
 #include "envoy/upstream/cluster_manager.h"
 
-#include "common/common/logger.h"
-#include "common/common/matchers.h"
-#include "common/router/header_parser.h"
-#include "common/runtime/runtime_protos.h"
-
-#include "extensions/filters/common/ext_authz/ext_authz.h"
+#include "source/common/common/logger.h"
+#include "source/common/common/matchers.h"
+#include "source/common/router/header_parser.h"
+#include "source/extensions/filters/common/ext_authz/ext_authz.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -95,14 +93,31 @@ public:
 
   /**
    * Returns a list of matchers used for selecting the authorization response headers that
+   * should be send back to the client on a successful (i.e. non-denied) response.
+   */
+  const MatcherSharedPtr& clientHeaderOnSuccessMatchers() const {
+    return client_header_on_success_matchers_;
+  }
+
+  /**
+   * Returns a list of matchers used for selecting the headers to emit as dynamic metadata.
+   */
+  const MatcherSharedPtr& dynamicMetadataMatchers() const { return to_dynamic_metadata_matchers_; }
+
+  /**
+   * Returns a list of matchers used for selecting the authorization response headers that
    * should be send to an the upstream server.
    */
   const MatcherSharedPtr& upstreamHeaderMatchers() const { return upstream_header_matchers_; }
 
   /**
-   * Returns a list of headers that will be add to the authorization request.
+   * Returns a list of matchers used for selecting the authorization response headers that
+   * should be sent to the upstream server. The same header keys will be appended, instead of
+   * be replaced.
    */
-  const Http::LowerCaseStrPairVector& headersToAdd() const { return authorization_headers_to_add_; }
+  const MatcherSharedPtr& upstreamHeaderToAppendMatchers() const {
+    return upstream_header_to_append_matchers_;
+  }
 
   /**
    * Returns the name used for tracing.
@@ -116,20 +131,21 @@ public:
 
 private:
   static MatcherSharedPtr
-  toRequestMatchers(const envoy::type::matcher::v3::ListStringMatcher& matcher,
-                    bool enable_case_sensitive_string_matcher);
+  toRequestMatchers(const envoy::type::matcher::v3::ListStringMatcher& list);
+  static MatcherSharedPtr toClientMatchers(const envoy::type::matcher::v3::ListStringMatcher& list);
   static MatcherSharedPtr
-  toClientMatchers(const envoy::type::matcher::v3::ListStringMatcher& matcher,
-                   bool enable_case_sensitive_string_matcher);
+  toClientMatchersOnSuccess(const envoy::type::matcher::v3::ListStringMatcher& list);
   static MatcherSharedPtr
-  toUpstreamMatchers(const envoy::type::matcher::v3::ListStringMatcher& matcher,
-                     bool enable_case_sensitive_string_matcher);
+  toDynamicMetadataMatchers(const envoy::type::matcher::v3::ListStringMatcher& list);
+  static MatcherSharedPtr
+  toUpstreamMatchers(const envoy::type::matcher::v3::ListStringMatcher& list);
 
-  const bool enable_case_sensitive_string_matcher_;
   const MatcherSharedPtr request_header_matchers_;
   const MatcherSharedPtr client_header_matchers_;
+  const MatcherSharedPtr client_header_on_success_matchers_;
+  const MatcherSharedPtr to_dynamic_metadata_matchers_;
   const MatcherSharedPtr upstream_header_matchers_;
-  const Http::LowerCaseStrPairVector authorization_headers_to_add_;
+  const MatcherSharedPtr upstream_header_to_append_matchers_;
   const std::string cluster_name_;
   const std::chrono::milliseconds timeout_;
   const std::string path_prefix_;
@@ -150,8 +166,7 @@ class RawHttpClientImpl : public Client,
                           public Http::AsyncClient::Callbacks,
                           Logger::Loggable<Logger::Id::config> {
 public:
-  explicit RawHttpClientImpl(Upstream::ClusterManager& cm, ClientConfigSharedPtr config,
-                             TimeSource& time_source);
+  explicit RawHttpClientImpl(Upstream::ClusterManager& cm, ClientConfigSharedPtr config);
   ~RawHttpClientImpl() override;
 
   // ExtAuthz::Client
@@ -163,15 +178,16 @@ public:
   void onSuccess(const Http::AsyncClient::Request&, Http::ResponseMessagePtr&& message) override;
   void onFailure(const Http::AsyncClient::Request&,
                  Http::AsyncClient::FailureReason reason) override;
+  void onBeforeFinalizeUpstreamSpan(Tracing::Span& span,
+                                    const Http::ResponseHeaderMap* response_headers) override;
 
 private:
   ResponsePtr toResponse(Http::ResponseMessagePtr message);
+
   Upstream::ClusterManager& cm_;
   ClientConfigSharedPtr config_;
   Http::AsyncClient::Request* request_{};
   RequestCallbacks* callbacks_{};
-  TimeSource& time_source_;
-  Tracing::SpanPtr span_;
 };
 
 } // namespace ExtAuthz

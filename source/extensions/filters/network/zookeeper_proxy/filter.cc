@@ -1,18 +1,17 @@
-#include "extensions/filters/network/zookeeper_proxy/filter.h"
+#include "source/extensions/filters/network/zookeeper_proxy/filter.h"
 
 #include <string>
 #include <vector>
 
 #include "envoy/config/core/v3/base.pb.h"
 
-#include "common/buffer/buffer_impl.h"
-#include "common/common/assert.h"
-#include "common/common/enum_to_int.h"
-#include "common/common/fmt.h"
-#include "common/common/logger.h"
-#include "common/stats/utility.h"
-
-#include "extensions/filters/network/well_known_names.h"
+#include "source/common/buffer/buffer_impl.h"
+#include "source/common/common/assert.h"
+#include "source/common/common/enum_to_int.h"
+#include "source/common/common/fmt.h"
+#include "source/common/common/logger.h"
+#include "source/common/stats/utility.h"
+#include "source/extensions/filters/network/well_known_names.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -154,11 +153,11 @@ void ZooKeeperFilter::onPing() {
 }
 
 void ZooKeeperFilter::onAuthRequest(const std::string& scheme) {
-  Stats::SymbolTable::StoragePtr storage = config_->scope_.symbolTable().join(
-      {config_->stat_prefix_, config_->auth_,
-       config_->stat_name_set_->getBuiltin(absl::StrCat(scheme, "_rq"),
-                                           config_->unknown_scheme_rq_)});
-  config_->scope_.counterFromStatName(Stats::StatName(storage.get())).inc();
+  Stats::Counter& counter = Stats::Utility::counterFromStatNames(
+      config_->scope_, {config_->stat_prefix_, config_->auth_,
+                        config_->stat_name_set_->getBuiltin(absl::StrCat(scheme, "_rq"),
+                                                            config_->unknown_scheme_rq_)});
+  counter.inc();
   setDynamicMetadata("opname", "auth");
 }
 
@@ -290,11 +289,10 @@ void ZooKeeperFilter::onConnectResponse(const int32_t proto_version, const int32
                                         const std::chrono::milliseconds& latency) {
   config_->stats_.connect_resp_.inc();
 
-  Stats::SymbolTable::StoragePtr storage =
-      config_->scope_.symbolTable().join({config_->stat_prefix_, config_->connect_latency_});
-  config_->scope_
-      .histogramFromStatName(Stats::StatName(storage.get()), Stats::Histogram::Unit::Milliseconds)
-      .recordValue(latency.count());
+  Stats::Histogram& histogram = Stats::Utility::histogramFromElements(
+      config_->scope_, {config_->stat_prefix_, config_->connect_latency_},
+      Stats::Histogram::Unit::Milliseconds);
+  histogram.recordValue(latency.count());
 
   setDynamicMetadata({{"opname", "connect_response"},
                       {"protocol_version", std::to_string(proto_version)},
@@ -313,11 +311,11 @@ void ZooKeeperFilter::onResponse(const OpCodes opcode, const int32_t xid, const 
     opname = opcode_info.opname_;
     opcode_latency = opcode_info.latency_name_;
   }
-  Stats::SymbolTable::StoragePtr storage =
-      config_->scope_.symbolTable().join({config_->stat_prefix_, opcode_latency});
-  config_->scope_
-      .histogramFromStatName(Stats::StatName(storage.get()), Stats::Histogram::Unit::Milliseconds)
-      .recordValue(latency.count());
+
+  Stats::Histogram& histogram = Stats::Utility::histogramFromStatNames(
+      config_->scope_, {config_->stat_prefix_, opcode_latency},
+      Stats::Histogram::Unit::Milliseconds);
+  histogram.recordValue(latency.count());
 
   setDynamicMetadata({{"opname", opname},
                       {"xid", std::to_string(xid)},

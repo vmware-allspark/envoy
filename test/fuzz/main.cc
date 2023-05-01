@@ -12,17 +12,19 @@
 // neat, as we get features likes --gtest_filter to select over the corpus
 // and the reporting features of gtest.
 
-#include "common/common/assert.h"
-#include "common/common/logger.h"
+#include "source/common/common/assert.h"
+#include "source/common/common/logger.h"
+#include "source/common/common/thread.h"
 
 #include "test/fuzz/fuzz_runner.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/utility.h"
+#include "test/test_listener.h"
 
 #include "absl/debugging/symbolize.h"
 
 #ifdef ENVOY_HANDLE_SIGNALS
-#include "common/signal/signal_action.h"
+#include "source/common/signal/signal_action.h"
 #endif
 
 #include "gtest/gtest.h"
@@ -54,13 +56,8 @@ INSTANTIATE_TEST_SUITE_P(CorpusExamples, FuzzerCorpusTest, testing::ValuesIn(tes
 } // namespace Envoy
 
 int main(int argc, char** argv) {
-#ifndef __APPLE__
-  absl::InitializeSymbolizer(argv[0]);
-#endif
-#ifdef ENVOY_HANDLE_SIGNALS
-  // Enabled by default. Control with "bazel --define=signal_trace=disabled"
-  Envoy::SignalAction handle_sigs;
-#endif
+  Envoy::TestEnvironment::initializeTestMain(argv[0]);
+
   // Expected usage: <test path> <corpus paths..> [other gtest flags]
   RELEASE_ASSERT(argc >= 2, "");
   // Consider any file after the test path which doesn't have a - prefix to be a corpus entry.
@@ -90,6 +87,9 @@ int main(int argc, char** argv) {
     argv[i] = argv[i + input_args];
   }
 
+  // Make sure flags are restored. Fuzz tests do not pass the singleton checks.
+  ::testing::TestEventListeners& listeners = ::testing::UnitTest::GetInstance()->listeners();
+  listeners.Append(new Envoy::TestListener(false));
   testing::InitGoogleTest(&argc, argv);
   testing::InitGoogleMock(&argc, argv);
   Envoy::Fuzz::Runner::setupEnvironment(argc, argv, spdlog::level::info);

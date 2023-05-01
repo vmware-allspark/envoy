@@ -7,20 +7,22 @@
 #include "envoy/service/discovery/v3/discovery.pb.h"
 #include "envoy/stats/scope.h"
 
-#include "common/config/utility.h"
-#include "common/singleton/manager_impl.h"
-#include "common/upstream/eds.h"
-
-#include "server/transport_socket_config_impl.h"
+#include "source/common/config/utility.h"
+#include "source/common/singleton/manager_impl.h"
+#include "source/common/upstream/eds.h"
+#include "source/server/transport_socket_config_impl.h"
 
 #include "test/common/stats/stat_test_utility.h"
 #include "test/common/upstream/utility.h"
 #include "test/mocks/local_info/mocks.h"
 #include "test/mocks/protobuf/mocks.h"
 #include "test/mocks/runtime/mocks.h"
-#include "test/mocks/server/mocks.h"
+#include "test/mocks/server/admin.h"
+#include "test/mocks/server/instance.h"
 #include "test/mocks/ssl/mocks.h"
-#include "test/mocks/upstream/mocks.h"
+#include "test/mocks/upstream/cluster_manager.h"
+#include "test/mocks/upstream/health_checker.h"
+#include "test/test_common/test_runtime.h"
 #include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
@@ -33,8 +35,8 @@ namespace Upstream {
 namespace {
 
 class EdsTest : public testing::Test {
-protected:
-  EdsTest() : api_(Api::createApiForTest(stats_)) { resetCluster(); }
+public:
+  EdsTest() { resetCluster(); }
 
   void resetCluster() {
     resetCluster(R"EOF(
@@ -54,13 +56,47 @@ protected:
                  Cluster::InitializePhase::Secondary);
   }
 
+  //  Define a cluster with secure and unsecure (default) transport
+  //  sockets.
+  void resetClusterWithTransportSockets() {
+    resetCluster(R"EOF(
+      name: name
+      connect_timeout: 0.25s
+      type: EDS
+      lb_policy: ROUND_ROBIN
+      eds_cluster_config:
+        service_name: fare
+        eds_config:
+          api_config_source:
+            api_type: REST
+            cluster_names:
+            - eds
+            refresh_delay: 1s
+      transport_socket_matches:
+      - match:
+          secure: enabled
+        name: secure-mode
+        transport_socket:
+          name: envoy.transport_sockets.tls
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+      - match: {}
+        name: default-mode
+        transport_socket:
+          name: envoy.transport_sockets.raw_buffer
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
+ )EOF",
+                 Cluster::InitializePhase::Secondary);
+  }
+
   void resetClusterDrainOnHostRemoval() {
     resetCluster(R"EOF(
         name: name
         connect_timeout: 0.25s
         type: EDS
         lb_policy: ROUND_ROBIN
-        drain_connections_on_host_removal: true
+        ignore_health_on_host_removal: true
         eds_cluster_config:
           service_name: fare
           eds_config:
@@ -87,48 +123,42 @@ protected:
   }
 
   void resetCluster(const std::string& yaml_config, Cluster::InitializePhase initialize_phase) {
-    local_info_.node_.mutable_locality()->set_zone("us-east-1a");
-    eds_cluster_ = parseClusterFromV2Yaml(yaml_config);
-    Envoy::Stats::ScopePtr scope = stats_.createScope(fmt::format(
+    server_context_.local_info_.node_.mutable_locality()->set_zone("us-east-1a");
+    eds_cluster_ = parseClusterFromV3Yaml(yaml_config);
+    Envoy::Stats::ScopeSharedPtr scope = stats_.createScope(fmt::format(
         "cluster.{}.",
         eds_cluster_.alt_stat_name().empty() ? eds_cluster_.name() : eds_cluster_.alt_stat_name()));
     Envoy::Server::Configuration::TransportSocketFactoryContextImpl factory_context(
-        admin_, ssl_context_manager_, *scope, cm_, local_info_, dispatcher_, random_, stats_,
-        singleton_manager_, tls_, validation_visitor_, *api_);
-    cluster_ = std::make_shared<EdsClusterImpl>(eds_cluster_, runtime_, factory_context,
-                                                std::move(scope), false);
+        server_context_, ssl_context_manager_, *scope, server_context_.cluster_manager_, stats_,
+        validation_visitor_);
+    cluster_ = std::make_shared<EdsClusterImpl>(server_context_, eds_cluster_, runtime_.loader(),
+                                                factory_context, std::move(scope), false);
     EXPECT_EQ(initialize_phase, cluster_->initializePhase());
-    eds_callbacks_ = cm_.subscription_factory_.callbacks_;
+    eds_callbacks_ = server_context_.cluster_manager_.subscription_factory_.callbacks_;
   }
 
   void initialize() {
-    EXPECT_CALL(*cm_.subscription_factory_.subscription_, start(_));
+    EXPECT_CALL(*server_context_.cluster_manager_.subscription_factory_.subscription_, start(_));
     cluster_->initialize([this] { initialized_ = true; });
   }
 
   void doOnConfigUpdateVerifyNoThrow(
       const envoy::config::endpoint::v3::ClusterLoadAssignment& cluster_load_assignment) {
-    Protobuf::RepeatedPtrField<ProtobufWkt::Any> resources;
-    resources.Add()->PackFrom(cluster_load_assignment);
-    VERBOSE_EXPECT_NO_THROW(eds_callbacks_->onConfigUpdate(resources, ""));
+    const auto decoded_resources =
+        TestUtility::decodeResources({cluster_load_assignment}, "cluster_name");
+    VERBOSE_EXPECT_NO_THROW(eds_callbacks_->onConfigUpdate(decoded_resources.refvec_, ""));
   }
 
+  NiceMock<Server::Configuration::MockServerFactoryContext> server_context_;
   bool initialized_{};
   Stats::TestUtil::TestStore stats_;
-  Ssl::MockContextManager ssl_context_manager_;
+  NiceMock<Ssl::MockContextManager> ssl_context_manager_;
   envoy::config::cluster::v3::Cluster eds_cluster_;
-  NiceMock<MockClusterManager> cm_;
-  NiceMock<Event::MockDispatcher> dispatcher_;
-  std::shared_ptr<EdsClusterImpl> cluster_;
+  EdsClusterImplSharedPtr cluster_;
   Config::SubscriptionCallbacks* eds_callbacks_{};
-  NiceMock<Runtime::MockRandomGenerator> random_;
-  NiceMock<Runtime::MockLoader> runtime_;
-  NiceMock<LocalInfo::MockLocalInfo> local_info_;
-  NiceMock<Server::MockAdmin> admin_;
-  Singleton::ManagerImpl singleton_manager_{Thread::threadFactoryForTest()};
-  NiceMock<ThreadLocal::MockInstance> tls_;
+  NiceMock<Random::MockRandomGenerator> random_;
+  TestScopedRuntime runtime_;
   NiceMock<ProtobufMessage::MockValidationVisitor> validation_visitor_;
-  Api::ApiPtr api_;
 };
 
 class EdsWithHealthCheckUpdateTest : public EdsTest {
@@ -137,8 +167,8 @@ protected:
 
   // Build the initial cluster with some endpoints.
   void initializeCluster(const std::vector<uint32_t> endpoint_ports,
-                         const bool drain_connections_on_host_removal) {
-    resetCluster(drain_connections_on_host_removal);
+                         const bool ignore_health_on_host_removal) {
+    resetCluster(ignore_health_on_host_removal);
 
     auto health_checker = std::make_shared<MockHealthChecker>();
     EXPECT_CALL(*health_checker, start());
@@ -172,13 +202,13 @@ protected:
     }
   }
 
-  void resetCluster(const bool drain_connections_on_host_removal) {
+  void resetCluster(const bool ignore_health_on_host_removal) {
     const std::string config = R"EOF(
       name: name
       connect_timeout: 0.25s
       type: EDS
       lb_policy: ROUND_ROBIN
-      drain_connections_on_host_removal: {}
+      ignore_health_on_host_removal: {}
       eds_cluster_config:
         service_name: fare
         eds_config:
@@ -188,7 +218,7 @@ protected:
             - eds
             refresh_delay: 1s
       )EOF";
-    EdsTest::resetCluster(fmt::format(config, drain_connections_on_host_removal),
+    EdsTest::resetCluster(fmt::format(config, ignore_health_on_host_removal),
                           Cluster::InitializePhase::Secondary);
   }
 
@@ -218,25 +248,15 @@ protected:
   envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment_;
 };
 
-// Negative test for protoc-gen-validate constraints.
-TEST_F(EdsTest, ValidateFail) {
-  initialize();
-  envoy::config::endpoint::v3::ClusterLoadAssignment resource;
-  Protobuf::RepeatedPtrField<ProtobufWkt::Any> resources;
-  resources.Add()->PackFrom(resource);
-  EXPECT_THROW(eds_callbacks_->onConfigUpdate(resources, ""), ProtoValidationException);
-  EXPECT_FALSE(initialized_);
-}
-
 // Validate that onConfigUpdate() with unexpected cluster names rejects config.
 TEST_F(EdsTest, OnConfigUpdateWrongName) {
   envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
   cluster_load_assignment.set_cluster_name("wrong name");
-  Protobuf::RepeatedPtrField<ProtobufWkt::Any> resources;
-  resources.Add()->PackFrom(cluster_load_assignment);
+  const auto decoded_resources =
+      TestUtility::decodeResources({cluster_load_assignment}, "cluster_name");
   initialize();
   try {
-    eds_callbacks_->onConfigUpdate(resources, "");
+    eds_callbacks_->onConfigUpdate(decoded_resources.refvec_, "");
   } catch (const EnvoyException& e) {
     eds_callbacks_->onConfigUpdateFailed(Envoy::Config::ConfigUpdateFailureReason::UpdateRejected,
                                          &e);
@@ -248,9 +268,8 @@ TEST_F(EdsTest, OnConfigUpdateWrongName) {
 TEST_F(EdsTest, OnConfigUpdateEmpty) {
   initialize();
   eds_callbacks_->onConfigUpdate({}, "");
-  Protobuf::RepeatedPtrField<envoy::service::discovery::v3::Resource> resources;
   Protobuf::RepeatedPtrField<std::string> removed_resources;
-  eds_callbacks_->onConfigUpdate(resources, removed_resources, "");
+  eds_callbacks_->onConfigUpdate({}, removed_resources, "");
   EXPECT_EQ(2UL, stats_.counter("cluster.name.update_empty").value());
   EXPECT_TRUE(initialized_);
 }
@@ -260,11 +279,10 @@ TEST_F(EdsTest, OnConfigUpdateWrongSize) {
   initialize();
   envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
   cluster_load_assignment.set_cluster_name("fare");
-  Protobuf::RepeatedPtrField<ProtobufWkt::Any> resources;
-  resources.Add()->PackFrom(cluster_load_assignment);
-  resources.Add()->PackFrom(cluster_load_assignment);
+  const auto decoded_resources = TestUtility::decodeResources(
+      {cluster_load_assignment, cluster_load_assignment}, "cluster_name");
   try {
-    eds_callbacks_->onConfigUpdate(resources, "");
+    eds_callbacks_->onConfigUpdate(decoded_resources.refvec_, "");
   } catch (const EnvoyException& e) {
     eds_callbacks_->onConfigUpdateFailed(Envoy::Config::ConfigUpdateFailureReason::UpdateRejected,
                                          &e);
@@ -292,7 +310,10 @@ TEST_F(EdsTest, DeltaOnConfigUpdateSuccess) {
   auto* resource = resources.Add();
   resource->mutable_resource()->PackFrom(cluster_load_assignment);
   resource->set_version("v1");
-  VERBOSE_EXPECT_NO_THROW(eds_callbacks_->onConfigUpdate(resources, {}, "v1"));
+  const auto decoded_resources =
+      TestUtility::decodeResources<envoy::config::endpoint::v3::ClusterLoadAssignment>(
+          resources, "cluster_name");
+  VERBOSE_EXPECT_NO_THROW(eds_callbacks_->onConfigUpdate(decoded_resources.refvec_, {}, "v1"));
 
   EXPECT_TRUE(initialized_);
   EXPECT_EQ(1UL, stats_.counter("cluster.name.update_no_rebuild").value());
@@ -329,6 +350,38 @@ TEST_F(EdsTest, EdsClusterFromFileIsPrimaryCluster) {
   initialize();
   doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
   EXPECT_TRUE(initialized_);
+}
+
+// Verify that host weight changes cause a full rebuild.
+TEST_F(EdsTest, EndpointWeightChangeCausesRebuild) {
+  envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
+  cluster_load_assignment.set_cluster_name("fare");
+  auto* endpoints = cluster_load_assignment.add_endpoints();
+  auto* endpoint = endpoints->add_lb_endpoints();
+  endpoint->mutable_endpoint()->mutable_address()->mutable_socket_address()->set_address("1.2.3.4");
+  endpoint->mutable_endpoint()->mutable_address()->mutable_socket_address()->set_port_value(80);
+  endpoint->mutable_load_balancing_weight()->set_value(30);
+
+  initialize();
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+  EXPECT_TRUE(initialized_);
+  EXPECT_EQ(0UL, stats_.counter("cluster.name.update_no_rebuild").value());
+  EXPECT_EQ(
+      30UL,
+      stats_.gauge("cluster.name.max_host_weight", Stats::Gauge::ImportMode::Accumulate).value());
+  auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+  EXPECT_EQ(hosts.size(), 1);
+  EXPECT_EQ(hosts[0]->weight(), 30);
+
+  endpoint->mutable_load_balancing_weight()->set_value(31);
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+  EXPECT_EQ(0UL, stats_.counter("cluster.name.update_no_rebuild").value());
+  EXPECT_EQ(
+      31UL,
+      stats_.gauge("cluster.name.max_host_weight", Stats::Gauge::ImportMode::Accumulate).value());
+  auto& new_hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+  EXPECT_EQ(new_hosts.size(), 1);
+  EXPECT_EQ(new_hosts[0]->weight(), 31);
 }
 
 // Validate that onConfigUpdate() updates the endpoint metadata.
@@ -398,14 +451,59 @@ TEST_F(EdsTest, EndpointMetadata) {
   // New resources with Metadata updated.
   Config::Metadata::mutableMetadataValue(*canary->mutable_metadata(),
                                          Config::MetadataFilters::get().ENVOY_LB, "version")
-      .set_string_value("v2");
+      .set_string_value("v3");
   doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
   auto& nhosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
   EXPECT_EQ(nhosts.size(), 2);
   EXPECT_EQ(Config::Metadata::metadataValue(nhosts[1]->metadata().get(),
                                             Config::MetadataFilters::get().ENVOY_LB, "version")
                 .string_value(),
-            "v2");
+            "v3");
+}
+
+// Test verifies that updating metadata updates
+// data members dependent on metadata values.
+// Specifically, it transport socket matcher has changed,
+// the transport socket factory should also be updated.
+TEST_F(EdsTest, EndpointMetadataWithTransportSocket) {
+  envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
+  cluster_load_assignment.set_cluster_name("fare");
+  resetClusterWithTransportSockets();
+
+  auto health_checker = std::make_shared<MockHealthChecker>();
+  EXPECT_CALL(*health_checker, start());
+  EXPECT_CALL(*health_checker, addHostCheckCompleteCb(_)).Times(2);
+  cluster_->setHealthChecker(health_checker);
+
+  // Add single endpoint to the cluster.
+  auto* endpoints = cluster_load_assignment.add_endpoints();
+  auto* endpoint = endpoints->add_lb_endpoints();
+
+  auto* socket_address = endpoint->mutable_endpoint()->mutable_address()->mutable_socket_address();
+  socket_address->set_address("1.2.3.4");
+  socket_address->set_port_value(80);
+
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+
+  auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+  ASSERT_EQ(hosts.size(), 1);
+  auto* upstream_host = hosts[0].get();
+
+  // Verify that default transport socket is raw (does not implement secure transport).
+  EXPECT_FALSE(upstream_host->transportSocketFactory().implementsSecureTransport());
+
+  // Create metadata with transport socket match pointing to secure mode.
+  auto metadata = new envoy::config::core::v3::Metadata();
+  MetadataConstSharedPtr metadata_sharedptr(metadata);
+  Config::Metadata::mutableMetadataValue(
+      *metadata, Config::MetadataFilters::get().ENVOY_TRANSPORT_SOCKET_MATCH, "secure")
+      .set_string_value("enabled");
+
+  // Update metadata.
+  upstream_host->metadata(metadata_sharedptr);
+
+  // Transport socket factory should point to tls, which implements secure transport.
+  EXPECT_TRUE(upstream_host->transportSocketFactory().implementsSecureTransport());
 }
 
 // Validate that onConfigUpdate() updates endpoint health status.
@@ -415,7 +513,7 @@ TEST_F(EdsTest, EndpointHealthStatus) {
   auto* endpoints = cluster_load_assignment.add_endpoints();
 
   // First check that EDS is correctly mapping
-  // envoy::api::v2::core::HealthStatus values to the expected health() status.
+  // HealthStatus values to the expected health() status.
   const std::vector<std::pair<envoy::config::core::v3::HealthStatus, Host::Health>>
       health_status_expected = {
           {envoy::config::core::v3::UNKNOWN, Host::Health::Healthy},
@@ -563,6 +661,42 @@ TEST_F(EdsTest, UseHostnameForHealthChecks) {
   auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
   EXPECT_EQ(hosts.size(), 1);
   EXPECT_EQ(hosts[0]->hostnameForHealthChecks(), "foo");
+}
+
+TEST_F(EdsTest, UseAddressForHealthChecks) {
+  envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
+  auto* endpoint = cluster_load_assignment.add_endpoints()->add_lb_endpoints()->mutable_endpoint();
+  auto* socket_address = endpoint->mutable_address()->mutable_socket_address();
+  socket_address->set_address("1.2.3.4");
+  socket_address->set_port_value(1234);
+  auto* health_check_config_address =
+      endpoint->mutable_health_check_config()->mutable_address()->mutable_socket_address();
+  health_check_config_address->set_address("4.3.2.1");
+  health_check_config_address->set_port_value(4321);
+  cluster_load_assignment.set_cluster_name("fare");
+  initialize();
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+  auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+  EXPECT_EQ(hosts.size(), 1);
+  EXPECT_EQ(hosts[0]->healthCheckAddress()->asString(), "4.3.2.1:4321");
+}
+
+TEST_F(EdsTest, MalformedIPForHealthChecks) {
+  envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
+  auto* endpoint = cluster_load_assignment.add_endpoints()->add_lb_endpoints()->mutable_endpoint();
+  auto* socket_address = endpoint->mutable_address()->mutable_socket_address();
+  socket_address->set_address("1.2.3.4");
+  socket_address->set_port_value(1234);
+  auto* health_check_config_address =
+      endpoint->mutable_health_check_config()->mutable_address()->mutable_socket_address();
+  health_check_config_address->set_address("foo.bar.com");
+  health_check_config_address->set_port_value(4321);
+  cluster_load_assignment.set_cluster_name("fare");
+  initialize();
+  const auto decoded_resources =
+      TestUtility::decodeResources({cluster_load_assignment}, "cluster_name");
+  EXPECT_THROW_WITH_MESSAGE(eds_callbacks_->onConfigUpdate(decoded_resources.refvec_, ""),
+                            EnvoyException, "malformed IP address: foo.bar.com");
 }
 
 // Verify that a host is removed if it is removed from discovery, stabilized, and then later
@@ -793,7 +927,7 @@ TEST_F(EdsTest, EndpointRemovalClusterDrainOnHostRemoval) {
 }
 
 // Verifies that if an endpoint is moved to a new priority, the active hc status is preserved.
-TEST_F(EdsTest, EndpointMovedToNewPriority) {
+TEST_F(EdsTest, EndpointMovedToNewPriorityWithDrain) {
   envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
   cluster_load_assignment.set_cluster_name("fare");
   resetClusterDrainOnHostRemoval();
@@ -838,10 +972,11 @@ TEST_F(EdsTest, EndpointMovedToNewPriority) {
   add_endpoint(80, 1);
 
   // Verify that no hosts gets added or removed to/from the PrioritySet.
-  cluster_->prioritySet().addMemberUpdateCb([&](const auto& added, const auto& removed) {
-    EXPECT_TRUE(added.empty());
-    EXPECT_TRUE(removed.empty());
-  });
+  auto member_update_cb =
+      cluster_->prioritySet().addMemberUpdateCb([&](const auto& added, const auto& removed) {
+        EXPECT_TRUE(added.empty());
+        EXPECT_TRUE(removed.empty());
+      });
 
   doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
 
@@ -855,6 +990,7 @@ TEST_F(EdsTest, EndpointMovedToNewPriority) {
     // The endpoint was healthy in the original priority, so moving it
     // around should preserve that.
     EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::PENDING_DYNAMIC_REMOVAL));
   }
 
   {
@@ -867,6 +1003,7 @@ TEST_F(EdsTest, EndpointMovedToNewPriority) {
     // The endpoint was healthy in the original priority, so moving it
     // around should preserve that.
     EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::PENDING_DYNAMIC_REMOVAL));
   }
 
   // Moves all the endpoints to priority 1.
@@ -888,13 +1025,15 @@ TEST_F(EdsTest, EndpointMovedToNewPriority) {
 
     // The endpoints were healthy, so moving them around should preserve that.
     EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::PENDING_DYNAMIC_REMOVAL));
     EXPECT_FALSE(hosts[1]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    EXPECT_FALSE(hosts[1]->healthFlagGet(Host::HealthFlag::PENDING_DYNAMIC_REMOVAL));
   }
 }
 
 // Verifies that if an endpoint is moved between priorities, the health check value
 // of the host is preserved
-TEST_F(EdsTest, EndpointMoved) {
+TEST_F(EdsTest, EndpointMovedWithDrain) {
   envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
   cluster_load_assignment.set_cluster_name("fare");
   resetClusterDrainOnHostRemoval();
@@ -947,10 +1086,11 @@ TEST_F(EdsTest, EndpointMoved) {
   add_endpoint(81, 0);
   add_endpoint(80, 1);
   // Verify that no hosts gets added or removed to/from the PrioritySet.
-  cluster_->prioritySet().addMemberUpdateCb([&](const auto& added, const auto& removed) {
-    EXPECT_TRUE(added.empty());
-    EXPECT_TRUE(removed.empty());
-  });
+  auto member_update_cb =
+      cluster_->prioritySet().addMemberUpdateCb([&](const auto& added, const auto& removed) {
+        EXPECT_TRUE(added.empty());
+        EXPECT_TRUE(removed.empty());
+      });
   doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
 
   {
@@ -964,6 +1104,7 @@ TEST_F(EdsTest, EndpointMoved) {
     // The endpoint was healthy in the original priority, so moving it
     // around should preserve that.
     EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::PENDING_DYNAMIC_REMOVAL));
   }
 
   {
@@ -977,6 +1118,300 @@ TEST_F(EdsTest, EndpointMoved) {
     // The endpoint was healthy in the original priority, so moving it
     // around should preserve that.
     EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::PENDING_DYNAMIC_REMOVAL));
+  }
+}
+
+// Verifies that if an endpoint is moved to a new priority, the active hc status is preserved.
+TEST_F(EdsTest, EndpointMovedToNewPriority) {
+  envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
+  cluster_load_assignment.set_cluster_name("fare");
+  resetCluster();
+
+  auto health_checker = std::make_shared<MockHealthChecker>();
+  EXPECT_CALL(*health_checker, start());
+  EXPECT_CALL(*health_checker, addHostCheckCompleteCb(_)).Times(2);
+  cluster_->setHealthChecker(health_checker);
+
+  auto add_endpoint = [&cluster_load_assignment](int port, int priority) {
+    auto* endpoints = cluster_load_assignment.add_endpoints();
+    endpoints->set_priority(priority);
+
+    auto* socket_address = endpoints->add_lb_endpoints()
+                               ->mutable_endpoint()
+                               ->mutable_address()
+                               ->mutable_socket_address();
+    socket_address->set_address("1.2.3.4");
+    socket_address->set_port_value(port);
+  };
+
+  add_endpoint(80, 0);
+  add_endpoint(81, 0);
+
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+
+  {
+    auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+    EXPECT_EQ(hosts.size(), 2);
+
+    // Mark the hosts as healthy
+    for (auto& host : hosts) {
+      EXPECT_TRUE(host->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+      host->healthFlagClear(Host::HealthFlag::FAILED_ACTIVE_HC);
+      host->healthFlagClear(Host::HealthFlag::PENDING_ACTIVE_HC);
+    }
+  }
+
+  // Moves the endpoints between priorities
+  cluster_load_assignment.clear_endpoints();
+  add_endpoint(81, 0);
+  add_endpoint(80, 1);
+
+  // Verify that no hosts gets added or removed to/from the PrioritySet.
+  auto member_update_cb =
+      cluster_->prioritySet().addMemberUpdateCb([&](const auto& added, const auto& removed) {
+        EXPECT_TRUE(added.empty());
+        EXPECT_TRUE(removed.empty());
+      });
+
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+
+  {
+    auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+    EXPECT_EQ(hosts.size(), 1);
+
+    // assert that it didn't move
+    EXPECT_EQ(hosts[0]->address()->asString(), "1.2.3.4:81");
+
+    // The endpoint was healthy in the original priority, so moving it
+    // around should preserve that.
+    EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::PENDING_DYNAMIC_REMOVAL));
+  }
+
+  {
+    auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[1]->hosts();
+    EXPECT_EQ(hosts.size(), 1);
+
+    // assert that it moved
+    EXPECT_EQ(hosts[0]->address()->asString(), "1.2.3.4:80");
+
+    // The endpoint was healthy in the original priority, so moving it
+    // around should preserve that.
+    EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::PENDING_DYNAMIC_REMOVAL));
+  }
+
+  // Moves all the endpoints to priority 1.
+  cluster_load_assignment.clear_endpoints();
+  add_endpoint(80, 1);
+  add_endpoint(81, 1);
+
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+
+  {
+    // Priority 0 should now be empty.
+    auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+    EXPECT_EQ(hosts.size(), 0);
+  }
+
+  {
+    auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[1]->hosts();
+    EXPECT_EQ(hosts.size(), 2);
+
+    // The endpoints were healthy, so moving them around should preserve that.
+    EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::PENDING_DYNAMIC_REMOVAL));
+    EXPECT_FALSE(hosts[1]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    EXPECT_FALSE(hosts[1]->healthFlagGet(Host::HealthFlag::PENDING_DYNAMIC_REMOVAL));
+  }
+}
+
+// Verifies that if an endpoint is moved between priorities, the health check value
+// of the host is preserved
+TEST_F(EdsTest, EndpointMoved) {
+  envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
+  cluster_load_assignment.set_cluster_name("fare");
+  resetCluster();
+
+  auto health_checker = std::make_shared<MockHealthChecker>();
+  EXPECT_CALL(*health_checker, start());
+  EXPECT_CALL(*health_checker, addHostCheckCompleteCb(_)).Times(2);
+  cluster_->setHealthChecker(health_checker);
+
+  auto add_endpoint = [&cluster_load_assignment](int port, int priority) {
+    auto* endpoints = cluster_load_assignment.add_endpoints();
+    endpoints->set_priority(priority);
+
+    auto* socket_address = endpoints->add_lb_endpoints()
+                               ->mutable_endpoint()
+                               ->mutable_address()
+                               ->mutable_socket_address();
+    socket_address->set_address("1.2.3.4");
+    socket_address->set_port_value(port);
+  };
+
+  add_endpoint(80, 0);
+  add_endpoint(81, 1);
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+
+  {
+    auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+    EXPECT_EQ(hosts.size(), 1);
+
+    EXPECT_TRUE(hosts[0]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    EXPECT_EQ(0, hosts[0]->priority());
+    // Mark the host as healthy and remove the pending active hc flag.
+    hosts[0]->healthFlagClear(Host::HealthFlag::FAILED_ACTIVE_HC);
+    hosts[0]->healthFlagClear(Host::HealthFlag::PENDING_ACTIVE_HC);
+  }
+
+  {
+    auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[1]->hosts();
+    EXPECT_EQ(hosts.size(), 1);
+
+    EXPECT_TRUE(hosts[0]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    EXPECT_EQ(1, hosts[0]->priority());
+    // Mark the host as healthy and remove the pending active hc flag.
+    hosts[0]->healthFlagClear(Host::HealthFlag::FAILED_ACTIVE_HC);
+    hosts[0]->healthFlagClear(Host::HealthFlag::PENDING_ACTIVE_HC);
+  }
+
+  // Moves the endpoints between priorities
+  cluster_load_assignment.clear_endpoints();
+  add_endpoint(81, 0);
+  add_endpoint(80, 1);
+  // Verify that no hosts gets added or removed to/from the PrioritySet.
+  auto member_update_cb =
+      cluster_->prioritySet().addMemberUpdateCb([&](const auto& added, const auto& removed) {
+        EXPECT_TRUE(added.empty());
+        EXPECT_TRUE(removed.empty());
+      });
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+
+  {
+    auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+    EXPECT_EQ(hosts.size(), 1);
+
+    // assert that it moved
+    EXPECT_EQ(hosts[0]->address()->asString(), "1.2.3.4:81");
+    EXPECT_EQ(0, hosts[0]->priority());
+
+    // The endpoint was healthy in the original priority, so moving it
+    // around should preserve that.
+    EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::PENDING_DYNAMIC_REMOVAL));
+  }
+
+  {
+    auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[1]->hosts();
+    EXPECT_EQ(hosts.size(), 1);
+
+    // assert that it moved
+    EXPECT_EQ(hosts[0]->address()->asString(), "1.2.3.4:80");
+    EXPECT_EQ(1, hosts[0]->priority());
+
+    // The endpoint was healthy in the original priority, so moving it
+    // around should preserve that.
+    EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    EXPECT_FALSE(hosts[0]->healthFlagGet(Host::HealthFlag::PENDING_DYNAMIC_REMOVAL));
+  }
+}
+
+// Verifies that if an endpoint is moved to a new priority and has its health check address altered
+// then nothing bad happens
+TEST_F(EdsTest, EndpointMovedToNewPriorityWithHealthAddressChange) {
+  envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
+  cluster_load_assignment.set_cluster_name("fare");
+  resetCluster();
+
+  auto health_checker = std::make_shared<MockHealthChecker>();
+  EXPECT_CALL(*health_checker, start());
+  EXPECT_CALL(*health_checker, addHostCheckCompleteCb(_)).Times(2);
+  cluster_->setHealthChecker(health_checker);
+
+  auto add_endpoint = [&cluster_load_assignment](int port, int priority, int health_port) {
+    auto* endpoints = cluster_load_assignment.add_endpoints();
+    endpoints->set_priority(priority);
+    auto* endpoint = endpoints->add_lb_endpoints()->mutable_endpoint();
+
+    auto* socket_address = endpoint->mutable_address()->mutable_socket_address();
+    socket_address->set_address("1.2.3.4");
+    socket_address->set_port_value(port);
+
+    endpoint->mutable_health_check_config()->set_port_value(health_port);
+  };
+
+  add_endpoint(80, 0, 80);
+  add_endpoint(81, 1, 81);
+
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+
+  {
+    auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+    EXPECT_EQ(hosts.size(), 1);
+
+    EXPECT_TRUE(hosts[0]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    hosts[0]->healthFlagClear(Host::HealthFlag::FAILED_ACTIVE_HC);
+    hosts[0]->healthFlagClear(Host::HealthFlag::PENDING_ACTIVE_HC);
+  }
+
+  {
+    auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[1]->hosts();
+    EXPECT_EQ(hosts.size(), 1);
+
+    EXPECT_TRUE(hosts[0]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    hosts[0]->healthFlagClear(Host::HealthFlag::FAILED_ACTIVE_HC);
+    hosts[0]->healthFlagClear(Host::HealthFlag::PENDING_ACTIVE_HC);
+  }
+
+  cluster_load_assignment.clear_endpoints();
+  add_endpoint(80, 0, 80);
+  add_endpoint(81, 0, 82);
+
+  // Changing a health check endpoint at the same time as priority is an add and immediate remove
+  auto member_update_cb =
+      cluster_->prioritySet().addMemberUpdateCb([&](const auto& added, const auto& removed) {
+        EXPECT_EQ(added.size(), 1);
+        EXPECT_EQ(removed.size(), 1);
+      });
+
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+
+  {
+    auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+    EXPECT_EQ(hosts.size(), 2);
+
+    EXPECT_EQ(hosts[1]->address()->asString(), "1.2.3.4:81");
+    EXPECT_TRUE(hosts[1]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
+    hosts[1]->healthFlagClear(Host::HealthFlag::FAILED_ACTIVE_HC);
+    hosts[1]->healthFlagClear(Host::HealthFlag::PENDING_ACTIVE_HC);
+  }
+
+  cluster_load_assignment.clear_endpoints();
+  add_endpoint(80, 0, 80);
+  add_endpoint(81, 1, 83);
+
+  // Changing a health check endpoint at the same time as priority is an add and immediate remove
+  auto member_update_cb2 =
+      cluster_->prioritySet().addMemberUpdateCb([&](const auto& added, const auto& removed) {
+        EXPECT_EQ(added.size(), 1);
+        EXPECT_EQ(removed.size(), 1);
+      });
+
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+
+  {
+    auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+    EXPECT_EQ(hosts.size(), 1);
+  }
+
+  {
+    auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[1]->hosts();
+    EXPECT_EQ(hosts.size(), 1);
+
+    EXPECT_EQ(hosts[0]->address()->asString(), "1.2.3.4:81");
+    EXPECT_TRUE(hosts[0]->healthFlagGet(Host::HealthFlag::FAILED_ACTIVE_HC));
   }
 }
 
@@ -1054,8 +1489,132 @@ TEST_F(EdsTest, EndpointLocality) {
   EXPECT_EQ(nullptr, cluster_->prioritySet().hostSetsPerPriority()[0]->localityWeights());
 }
 
+// Validate that onConfigUpdate() updates the endpoint locality of an existing endpoint.
+TEST_F(EdsTest, EndpointLocalityUpdated) {
+  envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
+  cluster_load_assignment.set_cluster_name("fare");
+  auto* endpoints = cluster_load_assignment.add_endpoints();
+  auto* locality = endpoints->mutable_locality();
+  locality->set_region("oceania");
+  locality->set_zone("hello");
+  locality->set_sub_zone("world");
+
+  {
+    auto* endpoint_address = endpoints->add_lb_endpoints()
+                                 ->mutable_endpoint()
+                                 ->mutable_address()
+                                 ->mutable_socket_address();
+    endpoint_address->set_address("1.2.3.4");
+    endpoint_address->set_port_value(80);
+  }
+  {
+    auto* endpoint_address = endpoints->add_lb_endpoints()
+                                 ->mutable_endpoint()
+                                 ->mutable_address()
+                                 ->mutable_socket_address();
+    endpoint_address->set_address("2.3.4.5");
+    endpoint_address->set_port_value(80);
+  }
+
+  initialize();
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+  EXPECT_TRUE(initialized_);
+
+  auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+  EXPECT_EQ(hosts.size(), 2);
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(0, hosts[i]->priority());
+    const auto& locality = hosts[i]->locality();
+    EXPECT_EQ("oceania", locality.region());
+    EXPECT_EQ("hello", locality.zone());
+    EXPECT_EQ("world", locality.sub_zone());
+  }
+  EXPECT_EQ(nullptr, cluster_->prioritySet().hostSetsPerPriority()[0]->localityWeights());
+
+  // Update locality now
+  locality->set_region("space");
+  locality->set_zone("station");
+  locality->set_sub_zone("mars");
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+
+  auto& updatedHosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+  EXPECT_EQ(updatedHosts.size(), 2);
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(0, updatedHosts[i]->priority());
+    const auto& locality = updatedHosts[i]->locality();
+    EXPECT_EQ("space", locality.region());
+    EXPECT_EQ("station", locality.zone());
+    EXPECT_EQ("mars", locality.sub_zone());
+  }
+}
+
+// Validate that onConfigUpdate() does not update the endpoint locality if fix for the issue,
+// https://github.com/envoyproxy/envoy/issues/12392, is disabled.
+// Unlike EndpointLocalityUpdated, runtime feature flag is disabled this time and then it is
+// verified that locality update does not happen on eds cluster endpoints.
+TEST_F(EdsTest, EndpointLocalityNotUpdatedIfFixDisabled) {
+  runtime_.mergeValues(
+      {{"envoy.reloadable_features.support_locality_update_on_eds_cluster_endpoints", "false"}});
+  envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
+  cluster_load_assignment.set_cluster_name("fare");
+  auto* endpoints = cluster_load_assignment.add_endpoints();
+  auto* locality = endpoints->mutable_locality();
+  locality->set_region("oceania");
+  locality->set_zone("hello");
+  locality->set_sub_zone("world");
+
+  {
+    auto* endpoint_address = endpoints->add_lb_endpoints()
+                                 ->mutable_endpoint()
+                                 ->mutable_address()
+                                 ->mutable_socket_address();
+    endpoint_address->set_address("1.2.3.4");
+    endpoint_address->set_port_value(80);
+  }
+  {
+    auto* endpoint_address = endpoints->add_lb_endpoints()
+                                 ->mutable_endpoint()
+                                 ->mutable_address()
+                                 ->mutable_socket_address();
+    endpoint_address->set_address("2.3.4.5");
+    endpoint_address->set_port_value(80);
+  }
+
+  initialize();
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+  EXPECT_TRUE(initialized_);
+
+  auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+  EXPECT_EQ(hosts.size(), 2);
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(0, hosts[i]->priority());
+    const auto& locality = hosts[i]->locality();
+    EXPECT_EQ("oceania", locality.region());
+    EXPECT_EQ("hello", locality.zone());
+    EXPECT_EQ("world", locality.sub_zone());
+  }
+  EXPECT_EQ(nullptr, cluster_->prioritySet().hostSetsPerPriority()[0]->localityWeights());
+
+  // Update locality now
+  locality->set_region("space");
+  locality->set_zone("station");
+  locality->set_sub_zone("mars");
+  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+
+  // runtime flag is disabled, verify that locality does not get updated
+  auto& updatedHosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
+  EXPECT_EQ(updatedHosts.size(), 2);
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(0, updatedHosts[i]->priority());
+    const auto& locality = updatedHosts[i]->locality();
+    EXPECT_EQ("oceania", locality.region());
+    EXPECT_EQ("hello", locality.zone());
+    EXPECT_EQ("world", locality.sub_zone());
+  }
+}
+
 // Validate that onConfigUpdate() does not propagate locality weights to the host set when
-// locality weighted balancing isn't configured.
+// locality weighted balancing isn't configured and the cluster does not use LB policy extensions.
 TEST_F(EdsTest, EndpointLocalityWeightsIgnored) {
   envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
   cluster_load_assignment.set_cluster_name("fare");
@@ -1083,12 +1642,77 @@ TEST_F(EdsTest, EndpointLocalityWeightsIgnored) {
   EXPECT_EQ(nullptr, cluster_->prioritySet().hostSetsPerPriority()[0]->localityWeights());
 }
 
+class EdsLocalityWeightsTest : public EdsTest {
+public:
+  void expectLocalityWeightsPresentForClusterConfig(const std::string& config) {
+    envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
+    cluster_load_assignment.set_cluster_name("fare");
+    resetCluster(config, Cluster::InitializePhase::Secondary);
+
+    {
+      auto* endpoints = cluster_load_assignment.add_endpoints();
+      auto* locality = endpoints->mutable_locality();
+      locality->set_region("oceania");
+      locality->set_zone("hello");
+      locality->set_sub_zone("world");
+      endpoints->mutable_load_balancing_weight()->set_value(42);
+
+      auto* endpoint_address = endpoints->add_lb_endpoints()
+                                   ->mutable_endpoint()
+                                   ->mutable_address()
+                                   ->mutable_socket_address();
+      endpoint_address->set_address("1.2.3.4");
+      endpoint_address->set_port_value(80);
+    }
+
+    {
+      auto* endpoints = cluster_load_assignment.add_endpoints();
+      auto* locality = endpoints->mutable_locality();
+      locality->set_region("space");
+      locality->set_zone("station");
+      locality->set_sub_zone("international");
+
+      auto* endpoint_address = endpoints->add_lb_endpoints()
+                                   ->mutable_endpoint()
+                                   ->mutable_address()
+                                   ->mutable_socket_address();
+      endpoint_address->set_address("1.2.3.5");
+      endpoint_address->set_port_value(80);
+    }
+
+    {
+      auto* endpoints = cluster_load_assignment.add_endpoints();
+      auto* locality = endpoints->mutable_locality();
+      locality->set_region("sugar");
+      locality->set_zone("candy");
+      locality->set_sub_zone("mountain");
+      endpoints->mutable_load_balancing_weight()->set_value(37);
+
+      auto* endpoint_address = endpoints->add_lb_endpoints()
+                                   ->mutable_endpoint()
+                                   ->mutable_address()
+                                   ->mutable_socket_address();
+      endpoint_address->set_address("1.2.3.6");
+      endpoint_address->set_port_value(80);
+    }
+
+    initialize();
+    doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
+    EXPECT_TRUE(initialized_);
+
+    const auto& locality_weights =
+        *cluster_->prioritySet().hostSetsPerPriority()[0]->localityWeights();
+    EXPECT_EQ(3, locality_weights.size());
+    EXPECT_EQ(42, locality_weights[0]);
+    EXPECT_EQ(0, locality_weights[1]);
+    EXPECT_EQ(37, locality_weights[2]);
+  }
+};
+
 // Validate that onConfigUpdate() propagates locality weights to the host set when locality
 // weighted balancing is configured.
-TEST_F(EdsTest, EndpointLocalityWeights) {
-  envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
-  cluster_load_assignment.set_cluster_name("fare");
-  resetCluster(R"EOF(
+TEST_F(EdsLocalityWeightsTest, WeightsPresentWithLocalityWeightedConfig) {
+  expectLocalityWeightsPresentForClusterConfig(R"EOF(
       name: name
       connect_timeout: 0.25s
       type: EDS
@@ -1103,66 +1727,35 @@ TEST_F(EdsTest, EndpointLocalityWeights) {
             cluster_names:
             - eds
             refresh_delay: 1s
-    )EOF",
-               Cluster::InitializePhase::Secondary);
+    )EOF");
+}
 
-  {
-    auto* endpoints = cluster_load_assignment.add_endpoints();
-    auto* locality = endpoints->mutable_locality();
-    locality->set_region("oceania");
-    locality->set_zone("hello");
-    locality->set_sub_zone("world");
-    endpoints->mutable_load_balancing_weight()->set_value(42);
+// Validate that onConfigUpdate() propagates locality weights to the host set when the cluster uses
+// load balancing policy extensions.
+TEST_F(EdsLocalityWeightsTest, WeightsPresentWithLoadBalancingPolicyConfig) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues({{"envoy.reloadable_features.no_extension_lookup_by_name", "false"}});
 
-    auto* endpoint_address = endpoints->add_lb_endpoints()
-                                 ->mutable_endpoint()
-                                 ->mutable_address()
-                                 ->mutable_socket_address();
-    endpoint_address->set_address("1.2.3.4");
-    endpoint_address->set_port_value(80);
-  }
-
-  {
-    auto* endpoints = cluster_load_assignment.add_endpoints();
-    auto* locality = endpoints->mutable_locality();
-    locality->set_region("space");
-    locality->set_zone("station");
-    locality->set_sub_zone("international");
-
-    auto* endpoint_address = endpoints->add_lb_endpoints()
-                                 ->mutable_endpoint()
-                                 ->mutable_address()
-                                 ->mutable_socket_address();
-    endpoint_address->set_address("1.2.3.5");
-    endpoint_address->set_port_value(80);
-  }
-
-  {
-    auto* endpoints = cluster_load_assignment.add_endpoints();
-    auto* locality = endpoints->mutable_locality();
-    locality->set_region("sugar");
-    locality->set_zone("candy");
-    locality->set_sub_zone("mountain");
-    endpoints->mutable_load_balancing_weight()->set_value(37);
-
-    auto* endpoint_address = endpoints->add_lb_endpoints()
-                                 ->mutable_endpoint()
-                                 ->mutable_address()
-                                 ->mutable_socket_address();
-    endpoint_address->set_address("1.2.3.6");
-    endpoint_address->set_port_value(80);
-  }
-
-  initialize();
-  doOnConfigUpdateVerifyNoThrow(cluster_load_assignment);
-  EXPECT_TRUE(initialized_);
-
-  const auto& locality_weights =
-      *cluster_->prioritySet().hostSetsPerPriority()[0]->localityWeights();
-  EXPECT_EQ(3, locality_weights.size());
-  EXPECT_EQ(42, locality_weights[0]);
-  EXPECT_EQ(0, locality_weights[1]);
-  EXPECT_EQ(37, locality_weights[2]);
+  // envoy.load_balancers.custom_lb is registered by linking in
+  // //test/integration/load_balancers:custom_lb_policy.
+  expectLocalityWeightsPresentForClusterConfig(R"EOF(
+      name: name
+      connect_timeout: 0.25s
+      type: EDS
+      lb_policy: LOAD_BALANCING_POLICY_CONFIG
+      load_balancing_policy:
+        policies:
+        - typed_extension_config:
+            name: envoy.load_balancers.custom_lb
+      eds_cluster_config:
+        service_name: fare
+        eds_config:
+          api_config_source:
+            api_type: REST
+            cluster_names:
+            - eds
+            refresh_delay: 1s
+    )EOF");
 }
 
 // Validate that onConfigUpdate() removes any locality not referenced in the
@@ -1432,7 +2025,7 @@ TEST_F(EdsTest, EndpointHostsPerPriority) {
 
 // Make sure config updates with P!=0 are rejected for the local cluster.
 TEST_F(EdsTest, NoPriorityForLocalCluster) {
-  cm_.local_cluster_name_ = "name";
+  server_context_.cluster_manager_.local_cluster_name_ = "name";
   resetCluster();
 
   envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
@@ -1457,9 +2050,10 @@ TEST_F(EdsTest, NoPriorityForLocalCluster) {
   add_hosts_to_priority(0, 2);
   add_hosts_to_priority(1, 1);
   initialize();
-  Protobuf::RepeatedPtrField<ProtobufWkt::Any> resources;
-  resources.Add()->PackFrom(cluster_load_assignment);
-  EXPECT_THROW_WITH_MESSAGE(eds_callbacks_->onConfigUpdate(resources, ""), EnvoyException,
+  const auto decoded_resources =
+      TestUtility::decodeResources({cluster_load_assignment}, "cluster_name");
+  EXPECT_THROW_WITH_MESSAGE(eds_callbacks_->onConfigUpdate(decoded_resources.refvec_, ""),
+                            EnvoyException,
                             "Unexpected non-zero priority for local cluster 'name'.");
 
   // Try an update which only has endpoints with P=0. This should go through.
@@ -1746,9 +2340,10 @@ TEST_F(EdsTest, MalformedIP) {
   endpoint->mutable_endpoint()->mutable_address()->mutable_socket_address()->set_port_value(80);
 
   initialize();
-  Protobuf::RepeatedPtrField<ProtobufWkt::Any> resources;
-  resources.Add()->PackFrom(cluster_load_assignment);
-  EXPECT_THROW_WITH_MESSAGE(eds_callbacks_->onConfigUpdate(resources, ""), EnvoyException,
+  const auto decoded_resources =
+      TestUtility::decodeResources({cluster_load_assignment}, "cluster_name");
+  EXPECT_THROW_WITH_MESSAGE(eds_callbacks_->onConfigUpdate(decoded_resources.refvec_, ""),
+                            EnvoyException,
                             "malformed IP address: foo.bar.com. Consider setting resolver_name or "
                             "setting cluster type to 'STRICT_DNS' or 'LOGICAL_DNS'");
 }
@@ -1756,7 +2351,7 @@ TEST_F(EdsTest, MalformedIP) {
 class EdsAssignmentTimeoutTest : public EdsTest {
 public:
   EdsAssignmentTimeoutTest() {
-    EXPECT_CALL(dispatcher_, createTimer_(_))
+    EXPECT_CALL(server_context_.dispatcher_, createTimer_(_))
         .WillOnce(Invoke([this](Event::TimerCb cb) {
           timer_cb_ = cb;
           EXPECT_EQ(nullptr, interval_timer_);
@@ -1796,7 +2391,7 @@ TEST_F(EdsAssignmentTimeoutTest, AssignmentTimeoutEnableDisable) {
       Protobuf::util::TimeUtil::SecondsToDuration(1));
 
   EXPECT_CALL(*interval_timer_, enableTimer(_, _)).Times(2); // Timer enabled twice.
-  EXPECT_CALL(*interval_timer_, disableTimer()).Times(1);    // Timer disabled once.
+  EXPECT_CALL(*interval_timer_, disableTimer());             // Timer disabled once.
   EXPECT_CALL(*interval_timer_, enabled()).Times(6);         // Includes calls by test.
   doOnConfigUpdateVerifyNoThrow(cluster_load_assignment_lease);
   // Check that the timer is enabled.
@@ -1853,6 +2448,29 @@ TEST_F(EdsAssignmentTimeoutTest, AssignmentLeaseExpired) {
     auto& hosts = cluster_->prioritySet().hostSetsPerPriority()[0]->hosts();
     EXPECT_EQ(hosts.size(), 0);
   }
+}
+
+// Validate that onConfigUpdate() with a config that contains both LEDS config
+// source and explicit list of endpoints is rejected.
+TEST_F(EdsTest, OnConfigUpdateLedsAndEndpoints) {
+  envoy::config::endpoint::v3::ClusterLoadAssignment cluster_load_assignment;
+  cluster_load_assignment.set_cluster_name("fare");
+  // Add an endpoint.
+  auto* endpoints = cluster_load_assignment.add_endpoints();
+  auto* endpoint = endpoints->add_lb_endpoints();
+  endpoint->mutable_endpoint()->mutable_address()->mutable_socket_address()->set_address("1.2.3.4");
+  endpoint->mutable_endpoint()->mutable_address()->mutable_socket_address()->set_port_value(80);
+  // Configure an LEDS data source.
+  auto* leds_conf = endpoints->mutable_leds_cluster_locality_config();
+  leds_conf->set_leds_collection_name("xdstp://foo/leds/collection");
+  initialize();
+
+  const auto decoded_resources =
+      TestUtility::decodeResources({cluster_load_assignment}, "cluster_name");
+  EXPECT_THROW_WITH_MESSAGE(eds_callbacks_->onConfigUpdate(decoded_resources.refvec_, ""),
+                            EnvoyException,
+                            "A ClusterLoadAssignment for cluster fare cannot include both LEDS "
+                            "(resource: xdstp://foo/leds/collection) and a list of endpoints.");
 }
 
 } // namespace

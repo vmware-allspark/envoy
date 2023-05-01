@@ -1,6 +1,6 @@
-#include "extensions/filters/network/common/redis/utility.h"
+#include "source/extensions/filters/network/common/redis/utility.h"
 
-#include "common/common/utility.h"
+#include "source/common/common/utility.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -15,6 +15,18 @@ AuthRequest::AuthRequest(const std::string& password) {
   values[0].asString() = "auth";
   values[1].type(RespType::BulkString);
   values[1].asString() = password;
+  type(RespType::Array);
+  asArray().swap(values);
+}
+
+AuthRequest::AuthRequest(const std::string& username, const std::string& password) {
+  std::vector<RespValue> values(3);
+  values[0].type(RespType::BulkString);
+  values[0].asString() = "auth";
+  values[1].type(RespType::BulkString);
+  values[1].asString() = username;
+  values[2].type(RespType::BulkString);
+  values[2].asString() = password;
   type(RespType::Array);
   asArray().swap(values);
 }

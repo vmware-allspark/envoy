@@ -1,4 +1,4 @@
-#include "extensions/filters/http/header_to_metadata/config.h"
+#include "source/extensions/filters/http/header_to_metadata/config.h"
 
 #include <string>
 
@@ -6,9 +6,8 @@
 #include "envoy/extensions/filters/http/header_to_metadata/v3/header_to_metadata.pb.validate.h"
 #include "envoy/registry/registry.h"
 
-#include "common/protobuf/utility.h"
-
-#include "extensions/filters/http/header_to_metadata/header_to_metadata_filter.h"
+#include "source/common/protobuf/utility.h"
+#include "source/extensions/filters/http/header_to_metadata/header_to_metadata_filter.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -24,6 +23,13 @@ Http::FilterFactoryCb HeaderToMetadataConfig::createFilterFactoryFromProtoTyped(
     callbacks.addStreamFilter(
         Http::StreamFilterSharedPtr{new HeaderToMetadataFilter(filter_config)});
   };
+}
+
+Router::RouteSpecificFilterConfigConstSharedPtr
+HeaderToMetadataConfig::createRouteSpecificFilterConfigTyped(
+    const envoy::extensions::filters::http::header_to_metadata::v3::Config& config,
+    Server::Configuration::ServerFactoryContext&, ProtobufMessage::ValidationVisitor&) {
+  return std::make_shared<const Config>(config, true);
 }
 
 /**

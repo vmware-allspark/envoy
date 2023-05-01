@@ -5,14 +5,18 @@ Kafka Broker filter
 
 The Apache Kafka broker filter decodes the client protocol for
 `Apache Kafka <https://kafka.apache.org/>`_, both the requests and responses in the payload.
-The message versions in `Kafka 2.4.0 <http://kafka.apache.org/24/protocol.html#protocol_api_keys>`_
+The message versions in `Kafka 3.4.0 <http://kafka.apache.org/34/protocol.html#protocol_api_keys>`_
 are supported.
 The filter attempts not to influence the communication between client and brokers, so the messages
 that could not be decoded (due to Kafka client or broker running a newer version than supported by
 this filter) are forwarded as-is.
 
-* :ref:`v2 API reference <envoy_api_msg_config.filter.network.kafka_broker.v2alpha1.KafkaBroker>`
-* This filter should be configured with the name *envoy.filters.network.kafka_broker*.
+* This filter should be configured with the type URL ``type.googleapis.com/envoy.extensions.filters.network.kafka_broker.v3.KafkaBroker``.
+* :ref:`v3 API reference <envoy_v3_api_msg_extensions.filters.network.kafka_broker.v3.KafkaBroker>`
+
+.. attention::
+
+   The Kafka broker filter is only included in :ref:`contrib images <install_contrib>`
 
 .. attention::
 
@@ -38,11 +42,11 @@ in the configuration snippet below:
     - filters:
       - name: envoy.filters.network.kafka_broker
         typed_config:
-          "@type": type.googleapis.com/envoy.config.filter.network.kafka_broker.v2alpha1.KafkaBroker
+          "@type": type.googleapis.com/envoy.extensions.filters.network.kafka_broker.v3.KafkaBroker
           stat_prefix: exampleprefix
       - name: envoy.filters.network.tcp_proxy
         typed_config:
-          "@type": type.googleapis.com/envoy.config.filter.network.tcp_proxy.v2.TcpProxy
+          "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
           stat_prefix: tcp
           cluster: localkafka
   clusters:
@@ -50,10 +54,15 @@ in the configuration snippet below:
     connect_timeout: 0.25s
     type: strict_dns
     lb_policy: round_robin
-    hosts:
-    - socket_address:
-        address: 127.0.0.1 # Kafka broker's host.
-        port_value: 9092   # Kafka broker's port.
+    load_assignment:
+      cluster_name: some_service
+      endpoints:
+        - lb_endpoints:
+          - endpoint:
+              address:
+                socket_address:
+                  address: 127.0.0.1 # Kafka broker's host
+                  port_value: 9092 # Kafka broker's port.
 
 The Kafka broker needs to advertise the Envoy listener port instead of its own.
 

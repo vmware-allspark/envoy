@@ -1,11 +1,16 @@
-licenses(["notice"])  # Apache 2
-
 load(
     "//bazel:envoy_build_system.bzl",
+    "envoy_cc_test",
     "envoy_cc_test_library",
     "envoy_package",
     "envoy_proto_library",
 )
+load(
+    "@rules_fuzzing//fuzzing:cc_defs.bzl",
+    "cc_fuzzing_engine",
+)
+
+licenses(["notice"])  # Apache 2
 
 envoy_package()
 
@@ -28,6 +33,7 @@ envoy_cc_test_library(
         "//source/common/common:assert_lib",
         "//source/common/common:minimal_logger_lib",
         "//source/common/stats:isolated_store_lib",
+        "//test:test_listener_lib",
         "//test/test_common:environment_lib",
         "//test/test_common:utility_lib",
     ] + select({
@@ -55,10 +61,12 @@ envoy_cc_test_library(
 
 envoy_cc_test_library(
     name = "utility_lib",
+    srcs = ["utility.cc"],
     hdrs = ["utility.h"],
     deps = [
         ":common_proto_cc_proto",
         "//source/common/common:empty_string",
+        "//source/common/common:logger_lib",
         "//source/common/network:resolver_lib",
         "//source/common/network:utility_lib",
         "//test/common/stream_info:test_util",
@@ -67,4 +75,30 @@ envoy_cc_test_library(
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
     ],
+)
+
+envoy_cc_test_library(
+    name = "random_lib",
+    hdrs = ["random.h"],
+    deps = [
+        "//envoy/common:random_generator_interface",
+        "//source/common/common:assert_lib",
+        "//source/common/common:minimal_logger_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "random_test",
+    srcs = ["random_test.cc"],
+    deps = [
+        "//test/fuzz:random_lib",
+    ],
+)
+
+cc_fuzzing_engine(
+    name = "fuzz_runner_engine",
+    testonly = True,
+    display_name = "Fuzz Test Runner",
+    launcher = "fuzz_runner_launcher.sh",
+    library = ":main",
 )

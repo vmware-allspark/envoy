@@ -1,9 +1,8 @@
-#include "common/protobuf/protobuf.h"
-#include "common/singleton/manager_impl.h"
+#include "source/common/protobuf/protobuf.h"
+#include "source/common/singleton/manager_impl.h"
+#include "source/extensions/transport_sockets/alts/config.h"
 
-#include "extensions/transport_sockets/alts/config.h"
-
-#include "test/mocks/server/mocks.h"
+#include "test/mocks/server/transport_socket_factory_context.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"

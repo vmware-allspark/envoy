@@ -1,4 +1,4 @@
-#include "extensions/filters/http/tap/tap_filter.h"
+#include "source/extensions/filters/http/tap/tap_filter.h"
 
 #include "envoy/extensions/filters/http/tap/v3/tap.pb.h"
 
@@ -35,7 +35,7 @@ Http::FilterHeadersStatus Filter::decodeHeaders(Http::RequestHeaderMap& headers,
 }
 
 Http::FilterDataStatus Filter::decodeData(Buffer::Instance& data, bool) {
-  if (tapper_ != nullptr) {
+  if ((tapper_ != nullptr) && (0 != data.length())) {
     tapper_->onRequestBody(data);
   }
   return Http::FilterDataStatus::Continue;
@@ -56,7 +56,7 @@ Http::FilterHeadersStatus Filter::encodeHeaders(Http::ResponseHeaderMap& headers
 }
 
 Http::FilterDataStatus Filter::encodeData(Buffer::Instance& data, bool) {
-  if (tapper_ != nullptr) {
+  if ((tapper_ != nullptr) && (0 != data.length())) {
     tapper_->onResponseBody(data);
   }
   return Http::FilterDataStatus::Continue;

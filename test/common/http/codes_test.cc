@@ -5,10 +5,9 @@
 
 #include "envoy/stats/stats.h"
 
-#include "common/common/empty_string.h"
-#include "common/http/codes.h"
-#include "common/http/header_map_impl.h"
-#include "common/stats/symbol_table_creator.h"
+#include "source/common/common/empty_string.h"
+#include "source/common/http/codes.h"
+#include "source/common/http/header_map_impl.h"
 
 #include "test/mocks/stats/mocks.h"
 #include "test/test_common/printers.h"
@@ -38,14 +37,16 @@ public:
     Stats::StatName to_zone = pool_.add(to_az);
     Stats::StatName vhost_name = pool_.add(request_vhost_name);
     Stats::StatName vcluster_name = pool_.add(request_vcluster_name);
+    Stats::StatName empty_stat_name;
     Http::CodeStats::ResponseStatInfo info{
-        global_store_, cluster_scope_, prefix,    code,    internal_request,
-        vhost_name,    vcluster_name,  from_zone, to_zone, canary};
+        global_store_,    cluster_scope_, prefix,        code,
+        internal_request, vhost_name,     vcluster_name, empty_stat_name,
+        from_zone,        to_zone,        canary};
 
-    code_stats_.chargeResponseStat(info);
+    code_stats_.chargeResponseStat(info, false);
   }
 
-  Stats::TestSymbolTable symbol_table_;
+  Stats::TestUtil::TestSymbolTable symbol_table_;
   Stats::TestUtil::TestStore global_store_;
   Stats::TestUtil::TestStore cluster_scope_;
   Http::CodeStatsImpl code_stats_;
@@ -53,6 +54,7 @@ public:
 };
 
 TEST_F(CodeUtilityTest, GroupStrings) {
+  EXPECT_EQ("1xx", CodeUtility::groupStringForResponseCode(Code::SwitchingProtocols));
   EXPECT_EQ("2xx", CodeUtility::groupStringForResponseCode(Code::OK));
   EXPECT_EQ("3xx", CodeUtility::groupStringForResponseCode(Code::Found));
   EXPECT_EQ("4xx", CodeUtility::groupStringForResponseCode(Code::NotFound));
@@ -232,6 +234,7 @@ TEST_F(CodeUtilityTest, PerZoneStats) {
 TEST_F(CodeUtilityTest, ResponseTimingTest) {
   Stats::MockStore global_store;
   Stats::MockStore cluster_scope;
+  Stats::StatName empty_stat_name;
 
   Stats::StatNameManagedStorage prefix("prefix", *symbol_table_);
   Http::CodeStats::ResponseTimingInfo info{global_store,
@@ -242,6 +245,7 @@ TEST_F(CodeUtilityTest, ResponseTimingTest) {
                                            true,
                                            pool_.add("vhost_name"),
                                            pool_.add("req_vcluster_name"),
+                                           empty_stat_name,
                                            pool_.add("from_az"),
                                            pool_.add("to_az")};
 

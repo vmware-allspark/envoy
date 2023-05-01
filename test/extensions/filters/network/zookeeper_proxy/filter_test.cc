@@ -1,7 +1,6 @@
-#include "common/buffer/buffer_impl.h"
-
-#include "extensions/filters/network/zookeeper_proxy/decoder.h"
-#include "extensions/filters/network/zookeeper_proxy/filter.h"
+#include "source/common/buffer/buffer_impl.h"
+#include "source/extensions/filters/network/zookeeper_proxy/decoder.h"
+#include "source/extensions/filters/network/zookeeper_proxy/filter.h"
 
 #include "test/mocks/network/mocks.h"
 #include "test/test_common/simulated_time_system.h"
@@ -951,6 +950,18 @@ TEST_F(ZooKeeperFilterTest, WatchEvent) {
   EXPECT_EQ(1UL, config_->stats().watch_event_.value());
   EXPECT_EQ(36UL, config_->stats().response_bytes_.value());
   EXPECT_EQ(0UL, config_->stats().decoder_error_.value());
+}
+
+TEST_F(ZooKeeperFilterTest, MissingXid) {
+  initialize();
+
+  const auto& stat = config_->stats().getdata_resp_;
+  Buffer::OwnedImpl data = encodeResponseHeader(1000, 2000, 0);
+
+  EXPECT_EQ(Envoy::Network::FilterStatus::Continue, filter_->onWrite(data, false));
+  EXPECT_EQ(0UL, stat.value());
+  EXPECT_EQ(0UL, config_->stats().response_bytes_.value());
+  EXPECT_EQ(1UL, config_->stats().decoder_error_.value());
 }
 
 } // namespace ZooKeeperProxy

@@ -1,8 +1,7 @@
 #include "envoy/common/exception.h"
 
-#include "common/buffer/buffer_impl.h"
-
-#include "extensions/filters/network/thrift_proxy/binary_protocol_impl.h"
+#include "source/common/buffer/buffer_impl.h"
+#include "source/extensions/filters/network/thrift_proxy/binary_protocol_impl.h"
 
 #include "test/extensions/filters/network/thrift_proxy/utility.h"
 #include "test/test_common/printers.h"
@@ -36,7 +35,7 @@ public:
     EXPECT_FALSE(metadata_.hasFrameSize());
     EXPECT_FALSE(metadata_.hasProtocol());
     EXPECT_FALSE(metadata_.hasAppException());
-    EXPECT_EQ(metadata_.headers().size(), 0);
+    EXPECT_EQ(metadata_.requestHeaders().size(), 0);
   }
 
   void expectDefaultMetadata() { expectMetadata("-", MessageType::Oneway, 1); }

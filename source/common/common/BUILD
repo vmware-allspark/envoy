@@ -1,5 +1,3 @@
-licenses(["notice"])  # Apache 2
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_basic_cc_library",
@@ -7,10 +5,11 @@ load(
     "envoy_cc_platform_dep",
     "envoy_cc_posix_library",
     "envoy_cc_win32_library",
-    "envoy_include_prefix",
     "envoy_package",
-    "envoy_select_boringssl",
+    "envoy_pch_library",
 )
+
+licenses(["notice"])  # Apache 2
 
 envoy_package()
 
@@ -18,7 +17,21 @@ envoy_cc_library(
     name = "assert_lib",
     srcs = ["assert.cc"],
     hdrs = ["assert.h"],
+    external_deps = [
+        "abseil_base",
+        "abseil_synchronization",
+        "abseil_stacktrace",
+        "abseil_symbolize",
+    ],
     deps = [":minimal_logger_lib"],
+)
+
+envoy_cc_library(
+    name = "containers_lib",
+    hdrs = ["containers.h"],
+    deps = [
+        ":cleanup_lib",
+    ],
 )
 
 envoy_cc_library(
@@ -33,8 +46,8 @@ envoy_cc_library(
     hdrs = ["backoff_strategy.h"],
     deps = [
         ":assert_lib",
-        "//include/envoy/common:backoff_strategy_interface",
-        "//include/envoy/runtime:runtime_interface",
+        "//envoy/common:backoff_strategy_interface",
+        "//envoy/common:random_generator_interface",
     ],
 )
 
@@ -45,7 +58,7 @@ envoy_cc_library(
     deps = [
         ":assert_lib",
         ":empty_string",
-        "//include/envoy/buffer:buffer_interface",
+        "//envoy/buffer:buffer_interface",
     ],
 )
 
@@ -73,6 +86,23 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "dns_utils_lib",
+    srcs = ["dns_utils.cc"],
+    hdrs = ["dns_utils.h"],
+    deps = [
+        ":assert_lib",
+        "//envoy/network:dns_interface",
+        "//source/common/network:utility_lib",
+        "@envoy_api//envoy/config/cluster/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_library(
+    name = "documentation_url_lib",
+    hdrs = ["documentation_url.h"],
+)
+
+envoy_cc_library(
     name = "empty_string",
     hdrs = ["empty_string.h"],
 )
@@ -80,6 +110,11 @@ envoy_cc_library(
 envoy_cc_library(
     name = "enum_to_int",
     hdrs = ["enum_to_int.h"],
+)
+
+envoy_cc_library(
+    name = "safe_memcpy_lib",
+    hdrs = ["safe_memcpy.h"],
 )
 
 # fmt_lib is automatically a dependency of all envoy_cc_library definitions.
@@ -90,8 +125,10 @@ envoy_basic_cc_library(
         "abseil_strings",
         "fmtlib",
     ],
-    include_prefix = envoy_include_prefix(package_name()),
-    deps = ["//include/envoy/common:base_includes"],
+    deps = [
+        "//envoy/common:base_includes",
+        "@com_google_absl//absl/status",
+    ],
 )
 
 envoy_cc_library(
@@ -99,6 +136,10 @@ envoy_cc_library(
     srcs = ["hash.cc"],
     hdrs = ["hash.h"],
     external_deps = ["xxhash"],
+    deps = [
+        ":macros",
+        ":safe_memcpy_lib",
+    ],
 )
 
 envoy_cc_library(
@@ -106,6 +147,28 @@ envoy_cc_library(
     srcs = ["hex.cc"],
     hdrs = ["hex.h"],
     deps = [":utility_lib"],
+)
+
+envoy_cc_library(
+    name = "interval_value",
+    hdrs = ["interval_value.h"],
+)
+
+envoy_cc_library(
+    name = "key_value_store_lib",
+    srcs = ["key_value_store_base.cc"],
+    hdrs = ["key_value_store_base.h"],
+    external_deps = [
+        "abseil_cleanup",
+        "quiche_quic_platform",
+    ],
+    deps = [
+        "//envoy/common:key_value_store_interface",
+        "//envoy/event:dispatcher_interface",
+        "//envoy/filesystem:filesystem_interface",
+        "//source/common/config:ttl_lib",
+        "@com_github_google_quiche//:quiche_common_lib",
+    ],
 )
 
 envoy_cc_library(
@@ -129,8 +192,15 @@ envoy_cc_library(
 # Contains minimal code for logging to stderr.
 envoy_cc_library(
     name = "minimal_logger_lib",
-    srcs = ["logger.cc"],
-    hdrs = ["logger.h"],
+    srcs = [
+        "fine_grain_logger.cc",
+        "logger.cc",
+    ],
+    hdrs = [
+        "fine_grain_logger.h",
+        "json_escape_string.h",
+        "logger.h",
+    ],
     external_deps = ["abseil_synchronization"],
     deps = [
         ":base_logger_lib",
@@ -152,6 +222,7 @@ envoy_cc_library(
 envoy_cc_library(
     name = "logger_impl_lib_standard",
     hdrs = ["standard/logger_impl.h"],
+    include_prefix = "source/common/common",
     strip_include_prefix = "standard",
     deps = [":base_logger_lib"],
 )
@@ -166,7 +237,21 @@ envoy_cc_library(
         "//bazel:android_logger": ["android/logger_impl.h"],
         "//conditions:default": [],
     }),
+    include_prefix = "source/common/common",
     strip_include_prefix = "android",
+    deps = [":base_logger_lib"],
+)
+
+envoy_cc_library(
+    name = "win32_event_logger_impl_lib",
+    srcs = select({
+        "//bazel:windows_x86_64": ["win32/event_logger_impl.cc"],
+        "//conditions:default": [],
+    }),
+    hdrs = select({
+        "//bazel:windows_x86_64": ["win32/event_logger_impl.h"],
+        "//conditions:default": [],
+    }),
     deps = [":base_logger_lib"],
 )
 
@@ -177,7 +262,7 @@ envoy_cc_library(
     external_deps = ["abseil_synchronization"],
     deps = [
         ":assert_lib",
-        "//include/envoy/common:mutex_tracer",
+        "//envoy/common:mutex_tracer",
     ],
 )
 
@@ -191,7 +276,16 @@ envoy_cc_library(
         ":dump_state_utils",
         ":macros",
         ":minimal_logger_lib",
-        "//include/envoy/access_log:access_log_interface",
+        "//envoy/access_log:access_log_interface",
+    ],
+)
+
+envoy_cc_library(
+    name = "basic_resource_lib",
+    hdrs = ["basic_resource_impl.h"],
+    deps = [
+        "//envoy/common:resource_interface",
+        "//envoy/runtime:runtime_interface",
     ],
 )
 
@@ -207,7 +301,7 @@ envoy_cc_library(
     external_deps = ["abseil_optional"],
     deps = [
         ":utility_lib",
-        "//include/envoy/common:matchers_interface",
+        "//envoy/common:matchers_interface",
         "//source/common/common:regex_lib",
         "//source/common/config:metadata_lib",
         "//source/common/http:path_utility_lib",
@@ -218,14 +312,33 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "random_generator_lib",
+    srcs = [
+        "random_generator.cc",
+    ],
+    hdrs = [
+        "random_generator.h",
+    ],
+    external_deps = ["ssl"],
+    deps = [
+        ":assert_lib",
+        "//envoy/common:random_generator_interface",
+    ],
+)
+
+envoy_cc_library(
     name = "regex_lib",
     srcs = ["regex.cc"],
     hdrs = ["regex.h"],
     deps = [
         ":assert_lib",
-        "//include/envoy/common:regex_interface",
+        "//envoy/common:regex_interface",
+        "//envoy/registry",
         "//source/common/protobuf:utility_lib",
+        "//source/common/stats:symbol_table_lib",
+        "@com_github_cncf_udpa//xds/type/matcher/v3:pkg_cc_proto",
         "@com_googlesource_code_re2//:re2",
+        "@envoy_api//envoy/extensions/regex_engines/v3:pkg_cc_proto",
         "@envoy_api//envoy/type/matcher/v3:pkg_cc_proto",
     ],
 )
@@ -244,8 +357,16 @@ envoy_cc_library(
     name = "scope_tracker",
     hdrs = ["scope_tracker.h"],
     deps = [
-        "//include/envoy/common:scope_tracker_interface",
-        "//include/envoy/event:dispatcher_interface",
+        "//envoy/common:scope_tracker_interface",
+        "//envoy/event:dispatcher_interface",
+    ],
+)
+
+envoy_cc_library(
+    name = "scope_tracked_object_stack",
+    hdrs = ["scope_tracked_object_stack.h"],
+    deps = [
+        "//envoy/common:scope_tracker_interface",
     ],
 )
 
@@ -272,19 +393,24 @@ envoy_cc_library(
 
 envoy_cc_library(
     name = "thread_lib",
+    srcs = ["thread.cc"],
     hdrs = ["thread.h"],
     external_deps = ["abseil_synchronization"],
-    deps = envoy_cc_platform_dep("thread_impl_lib"),
+    deps = envoy_cc_platform_dep("thread_impl_lib") + [
+        ":macros",
+        ":non_copyable",
+    ],
 )
 
 envoy_cc_posix_library(
     name = "thread_impl_lib",
     srcs = ["posix/thread_impl.cc"],
     hdrs = ["posix/thread_impl.h"],
+    include_prefix = "source/common/common",
     strip_include_prefix = "posix",
     deps = [
         ":assert_lib",
-        "//include/envoy/thread:thread_interface",
+        "//envoy/thread:thread_interface",
     ],
 )
 
@@ -292,10 +418,11 @@ envoy_cc_win32_library(
     name = "thread_impl_lib",
     srcs = ["win32/thread_impl.cc"],
     hdrs = ["win32/thread_impl.h"],
+    include_prefix = "source/common/common",
     strip_include_prefix = "win32",
     deps = [
         ":assert_lib",
-        "//include/envoy/thread:thread_interface",
+        "//envoy/thread:thread_interface",
     ],
 )
 
@@ -304,7 +431,7 @@ envoy_cc_library(
     hdrs = ["lock_guard.h"],
     deps = [
         ":thread_annotations",
-        "//include/envoy/thread:thread_interface",
+        "//envoy/thread:thread_interface",
     ],
 )
 
@@ -312,83 +439,27 @@ envoy_cc_library(
     name = "utility_lib",
     srcs = ["utility.cc"],
     hdrs = ["utility.h"],
+    external_deps = ["abseil_node_hash_map"],
     deps = [
         ":assert_lib",
         ":hash_lib",
         ":non_copyable",
-        "//include/envoy/common:interval_set_interface",
-        "//include/envoy/common:time_interface",
+        "//envoy/common:interval_set_interface",
+        "//envoy/common:time_interface",
         "//source/common/singleton:const_singleton",
-    ],
-)
-
-genrule(
-    name = "generate_version_number",
-    srcs = ["//:VERSION"],
-    outs = ["version_number.h"],
-    cmd = """echo "#define BUILD_VERSION_NUMBER \\"$$(cat $<)\\"" >$@""",
-)
-
-genrule(
-    name = "generate_version_linkstamp",
-    outs = ["lib/version_linkstamp.h"],
-    cmd = "$(location :generate_version_linkstamp.sh) >> $@",
-    # Undocumented attr to depend on workspace status files.
-    # https://github.com/bazelbuild/bazel/issues/4942
-    # Used here because generate_version_linkstamp.sh depends on the workspace status files.
-    stamp = 1,
-    tools = [":generate_version_linkstamp.sh"],
-)
-
-genrule(
-    name = "generate_version_linkstamp_empty",
-    outs = ["empty/version_linkstamp.h"],
-    cmd = """>$@""",
-)
-
-envoy_cc_library(
-    name = "version_includes",
-    hdrs = [
-        "version.h",
-        ":generate_version_number",
-    ],
-    deps = [
-        "//source/common/singleton:const_singleton",
-        "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
-    ],
-)
-
-envoy_cc_library(
-    name = "version_lib",
-    srcs = ["version.cc"],
-    hdrs = select({
-        "//bazel:manual_stamp": [":generate_version_linkstamp"],
-        # By default the header file is empty.
-        # This is done so that the definitions linked via the linkstamp rule don't cause collisions.
-        "//conditions:default": [":generate_version_linkstamp_empty"],
-    }),
-    copts = envoy_select_boringssl(
-        ["-DENVOY_SSL_VERSION=\\\"BoringSSL-FIPS\\\""],
-        ["-DENVOY_SSL_VERSION=\\\"BoringSSL\\\""],
-    ),
-    linkstamp = "version_linkstamp.cc",
-    strip_include_prefix = select({
-        "//bazel:manual_stamp": "lib",
-        "//conditions:default": "empty",
-    }),
-    deps = [
-        ":version_includes",
-        "//source/common/common:macros",
-        "//source/common/protobuf:utility_lib",
     ],
 )
 
 envoy_cc_library(
     name = "callback_impl_lib",
+    srcs = ["callback_impl.cc"],
     hdrs = ["callback_impl.h"],
     deps = [
         ":assert_lib",
-        "//include/envoy/common:callback",
+        ":lock_guard_lib",
+        ":thread_lib",
+        "//envoy/common:callback",
+        "//source/common/event:dispatcher_lib",
     ],
 )
 
@@ -405,6 +476,18 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "perf_tracing_lib",
+    srcs = ["perf_tracing.cc"],
+    hdrs = ["perf_tracing.h"],
+    deps = select({
+        "//bazel:enable_perf_tracing": [
+            "@com_github_google_perfetto//:perfetto",
+        ],
+        "//conditions:default": [],
+    }),
+)
+
+envoy_cc_library(
     name = "scalar_to_byte_vector_lib",
     hdrs = ["scalar_to_byte_vector.h"],
 )
@@ -414,18 +497,56 @@ envoy_cc_library(
     srcs = ["token_bucket_impl.cc"],
     hdrs = ["token_bucket_impl.h"],
     deps = [
-        "//include/envoy/common:time_interface",
-        "//include/envoy/common:token_bucket_interface",
+        "//envoy/common:time_interface",
+        "//envoy/common:token_bucket_interface",
         "//source/common/common:utility_lib",
     ],
 )
 
 envoy_cc_library(
-    name = "zlib_base_lib",
-    srcs = ["zlib/base.cc"],
-    hdrs = ["zlib/base.h"],
-    external_deps = ["zlib"],
+    name = "shared_token_bucket_impl_lib",
+    srcs = ["shared_token_bucket_impl.cc"],
+    hdrs = ["shared_token_bucket_impl.h"],
     deps = [
-        "//source/common/buffer:buffer_lib",
+        "//envoy/common:time_interface",
+        "//source/common/common:thread_lib",
+        "//source/common/common:thread_synchronizer_lib",
+        "//source/common/common:token_bucket_impl_lib",
+        "//source/common/common:utility_lib",
+    ],
+)
+
+envoy_cc_library(
+    name = "statusor_lib",
+    hdrs = ["statusor.h"],
+    deps = [
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+envoy_pch_library(
+    name = "common_pch",
+    external_deps = [
+        "spdlog",
+    ],
+    includes = [
+        "envoy/config/bootstrap/v3/bootstrap.pb.h",
+        "envoy/config/cluster/v3/cluster.pb.h",
+        "envoy/config/core/v3/base.pb.h",
+        "envoy/config/core/v3/config_source.pb.h",
+        "envoy/config/route/v3/route_components.pb.h",
+        "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h",
+        "envoy/service/discovery/v3/discovery.pb.h",
+        "spdlog/sinks/android_sink.h",
+        "spdlog/spdlog.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
+        "@envoy_api//envoy/config/cluster/v3:pkg_cc_proto",
+        "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
+        "@envoy_api//envoy/config/route/v3:pkg_cc_proto",
+        "@envoy_api//envoy/extensions/filters/network/http_connection_manager/v3:pkg_cc_proto",
+        "@envoy_api//envoy/service/discovery/v3:pkg_cc_proto",
     ],
 )

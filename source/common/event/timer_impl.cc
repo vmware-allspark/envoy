@@ -1,8 +1,8 @@
-#include "common/event/timer_impl.h"
+#include "source/common/event/timer_impl.h"
 
 #include <chrono>
 
-#include "common/common/assert.h"
+#include "source/common/common/assert.h"
 
 #include "event2/event.h"
 
@@ -27,15 +27,18 @@ TimerImpl::TimerImpl(Libevent::BasePtr& libevent, TimerCb cb, Dispatcher& dispat
       this);
 }
 
-void TimerImpl::disableTimer() { event_del(&raw_event_); }
+void TimerImpl::disableTimer() {
+  ASSERT(dispatcher_.isThreadSafe());
+  event_del(&raw_event_);
+}
 
-void TimerImpl::enableTimer(const std::chrono::milliseconds& d, const ScopeTrackedObject* object) {
+void TimerImpl::enableTimer(const std::chrono::milliseconds d, const ScopeTrackedObject* object) {
   timeval tv;
   TimerUtils::durationToTimeval(d, tv);
   internalEnableTimer(tv, object);
 }
 
-void TimerImpl::enableHRTimer(const std::chrono::microseconds& d,
+void TimerImpl::enableHRTimer(const std::chrono::microseconds d,
                               const ScopeTrackedObject* object = nullptr) {
   timeval tv;
   TimerUtils::durationToTimeval(d, tv);
@@ -43,15 +46,16 @@ void TimerImpl::enableHRTimer(const std::chrono::microseconds& d,
 }
 
 void TimerImpl::internalEnableTimer(const timeval& tv, const ScopeTrackedObject* object) {
+  ASSERT(dispatcher_.isThreadSafe());
   object_ = object;
-  if (tv.tv_sec == 0 && tv.tv_usec == 0) {
-    event_active(&raw_event_, EV_TIMEOUT, 0);
-  } else {
-    event_add(&raw_event_, &tv);
-  }
+
+  event_add(&raw_event_, &tv);
 }
 
-bool TimerImpl::enabled() { return 0 != evtimer_pending(&raw_event_, nullptr); }
+bool TimerImpl::enabled() {
+  ASSERT(dispatcher_.isThreadSafe());
+  return 0 != evtimer_pending(&raw_event_, nullptr);
+}
 
 } // namespace Event
 } // namespace Envoy

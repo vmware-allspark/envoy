@@ -12,47 +12,69 @@
 # All configuration values have a default; values that are commented out
 # serve to show the default.
 
-from datetime import datetime
 import os
-from sphinx.directives.code import CodeBlock
-import sphinx_rtd_theme
 import sys
+from datetime import datetime
+
+import yaml
+
+from sphinx.directives.code import CodeBlock
+
+# TODO(phlax): move the pygments style to envoy.docs.sphinx_runner and remove this
+sys.path.append(os.path.abspath("./_pygments"))
+
+
+class SphinxConfigError(Exception):
+    pass
 
 
 # https://stackoverflow.com/questions/44761197/how-to-use-substitution-definitions-with-code-blocks
 class SubstitutionCodeBlock(CodeBlock):
-  """
+    """
   Similar to CodeBlock but replaces placeholders with variables. See "substitutions" below.
   """
 
-  def run(self):
-    """
+    def run(self):
+        """
     Replace placeholders with given variables.
     """
-    app = self.state.document.settings.env.app
-    new_content = []
-    existing_content = self.content
-    for item in existing_content:
-      for pair in app.config.substitutions:
-        original, replacement = pair
-        item = item.replace(original, replacement)
-      new_content.append(item)
+        app = self.state.document.settings.env.app
+        new_content = []
+        existing_content = self.content
+        for item in existing_content:
+            for pair in app.config.substitutions:
+                original, replacement = pair
+                item = item.replace(original, replacement)
+            new_content.append(item)
 
-    self.content = new_content
-    return list(CodeBlock.run(self))
+        self.content = new_content
+        return list(CodeBlock.run(self))
 
 
 def setup(app):
-  app.add_config_value('release_level', '', 'env')
-  app.add_config_value('substitutions', [], 'html')
-  app.add_directive('substitution-code-block', SubstitutionCodeBlock)
+    app.add_config_value('release_level', '', 'env')
+    app.add_config_value('substitutions', [], 'html')
+    app.add_directive('substitution-code-block', SubstitutionCodeBlock)
 
 
-if not os.environ.get('ENVOY_DOCS_RELEASE_LEVEL'):
-  raise Exception("ENVOY_DOCS_RELEASE_LEVEL env var must be defined")
+missing_config = (
+    not os.environ.get("ENVOY_DOCS_BUILD_CONFIG")
+    or not os.path.exists(os.environ["ENVOY_DOCS_BUILD_CONFIG"]))
 
-release_level = os.environ['ENVOY_DOCS_RELEASE_LEVEL']
-blob_sha = os.environ['ENVOY_BLOB_SHA']
+if missing_config:
+    raise SphinxConfigError(
+        "`ENVOY_DOCS_BUILD_CONFIG` env var must be defined, "
+        "and point to a valid yaml file")
+
+with open(os.environ["ENVOY_DOCS_BUILD_CONFIG"]) as f:
+    configs = yaml.safe_load(f.read())
+
+
+def _config(key):
+    if not configs.get(key):
+        raise SphinxConfigError(f"`{key}` config var must be defined")
+    return configs[key]
+
 
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
@@ -67,20 +89,51 @@ blob_sha = os.environ['ENVOY_BLOB_SHA']
 # Add any Sphinx extension module names here, as strings. They can be
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
-extensions = ['sphinxcontrib.httpdomain', 'sphinx.ext.extlinks', 'sphinx.ext.ifconfig']
+
+sys.path.append(os.path.abspath("./_ext"))
+
+extensions = [
+    'envoy.docs.sphinx_runner.ext.httpdomain',
+    'sphinx.ext.extlinks',
+    'sphinx.ext.ifconfig',
+    'sphinx.ext.intersphinx',
+    'envoy.docs.sphinx_runner.sphinx_tabs.tabs',
+    'sphinx_copybutton',
+    'envoy.docs.sphinx_runner.ext.validating_code_block',
+    'sphinxext.rediraffe',
+    'envoy.docs.sphinx_runner.ext.powershell_lexer',
+    'sphinxcontrib.jquery',
+]
+
+release_level = _config('release_level')
+blob_sha = _config('blob_sha')
+
 extlinks = {
-    'repo': ('https://github.com/envoyproxy/envoy/blob/{}/%s'.format(blob_sha), ''),
-    'api': ('https://github.com/envoyproxy/envoy/blob/{}/api/%s'.format(blob_sha), ''),
+    'repo': ('https://github.com/envoyproxy/envoy/blob/{}/%s'.format(blob_sha), '%s'),
+    'api': ('https://github.com/envoyproxy/envoy/blob/{}/api/%s'.format(blob_sha), '%s'),
 }
+
+# Only lookup intersphinx for explicitly prefixed in cross-references
+# This makes docs versioning work
+intersphinx_disabled_reftypes = ['*']
 
 # Setup global substitutions
 if 'pre-release' in release_level:
-  substitutions = [('|envoy_docker_image|', 'envoy-dev:{}'.format(blob_sha))]
+    substitutions = [
+        ('|envoy_docker_image|', 'envoy-dev:{}'.format(blob_sha)),
+        ('|envoy_windows_docker_image|', 'envoy-windows-dev:{}'.format(blob_sha)),
+        ('|envoy_distroless_docker_image|', 'envoy-distroless-dev:{}'.format(blob_sha))
+    ]
 else:
-  substitutions = [('|envoy_docker_image|', 'envoy:{}'.format(blob_sha))]
+    substitutions = [('|envoy_docker_image|', 'envoy:{}'.format(blob_sha)),
+                     ('|envoy_windows_docker_image|', 'envoy-windows:{}'.format(blob_sha)),
+                     ('|envoy_distroless_docker_image|', 'envoy-distroless:{}'.format(blob_sha))]
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
+
+copybutton_prompt_text = r"\$ |PS>"
+copybutton_prompt_is_regexp = True
 
 # The suffix(es) of source filenames.
 # You can specify multiple suffix as a list of string:
@@ -102,20 +155,21 @@ author = u'Envoy Project Authors'
 # |version| and |release|, also used in various other places throughout the
 # built documents.
 
-if not os.environ.get('ENVOY_DOCS_VERSION_STRING'):
-  raise Exception("ENVOY_DOCS_VERSION_STRING env var must be defined")
-
 # The short X.Y version.
-version = os.environ['ENVOY_DOCS_VERSION_STRING']
+version = _config('version_string')
 # The full version, including alpha/beta/rc tags.
-release = os.environ['ENVOY_DOCS_VERSION_STRING']
+release = _config('version_string')
+
+rst_epilog = """
+.. |DOCKER_IMAGE_TAG_NAME| replace:: {}
+""".format(_config('docker_image_tag_name'))
 
 # The language for content autogenerated by Sphinx. Refer to documentation
 # for a list of supported languages.
 #
 # This is also used if you do content translation via gettext catalogs.
 # Usually you set "language" from the command line for these cases.
-language = None
+language = "en"
 
 # There are two options for replacing |today|: either, you set today to some
 # non-false value, then it is used:
@@ -131,8 +185,6 @@ exclude_patterns = [
     '_venv',
     'Thumbs.db',
     '.DS_Store',
-    'api-v2/api/v2/endpoint/load_report.proto.rst',
-    'api-v2/service/discovery/v2/hds.proto.rst',
 ]
 
 # The reST default role (used for this markup: `text`) to use for all
@@ -173,10 +225,11 @@ html_theme = 'sphinx_rtd_theme'
 # documentation.
 html_theme_options = {
     'logo_only': True,
+    'includehidden': False,
 }
 
 # Add any paths that contain custom themes here, relative to this directory.
-html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
+# html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
 
 # The name for this set of Sphinx documents.
 # "<project> v<release> documentation" by default.
@@ -187,7 +240,7 @@ html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
 
 # The name of an image file (relative to this directory) to place at the top
 # of the sidebar.
-html_logo = '_static/img/envoy-logo.png'
+html_logo = 'img/envoy-logo.png'
 
 # The name of an image file (relative to this directory) to use as a favicon of
 # the docs.  This file should be a Windows icon file (.ico) being 16x16 or 32x32
@@ -265,3 +318,12 @@ html_style = 'css/envoy.css'
 
 # Output file base name for HTML help builder.
 htmlhelp_basename = 'envoydoc'
+
+# TODO(phlax): add redirect diff (`rediraffe_branch` setting)
+#  - not sure how diffing will work with main merging in PRs - might need
+#    to be injected dynamically, somehow
+rediraffe_redirects = "redirects.txt"
+
+intersphinx_mapping = _config("intersphinx_mapping")
+
+pygments_style = "style.EnvoyCodeStyle"

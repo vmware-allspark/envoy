@@ -3,8 +3,8 @@
 #include "envoy/config/cluster/v3/cluster.pb.h"
 #include "envoy/config/endpoint/v3/endpoint_components.pb.h"
 
-#include "common/upstream/cluster_factory_impl.h"
-#include "common/upstream/upstream_impl.h"
+#include "source/common/upstream/cluster_factory_impl.h"
+#include "source/common/upstream/upstream_impl.h"
 
 namespace Envoy {
 namespace Upstream {
@@ -15,10 +15,11 @@ namespace Upstream {
  */
 class StrictDnsClusterImpl : public BaseDynamicClusterImpl {
 public:
-  StrictDnsClusterImpl(const envoy::config::cluster::v3::Cluster& cluster, Runtime::Loader& runtime,
+  StrictDnsClusterImpl(Server::Configuration::ServerFactoryContext& server_context,
+                       const envoy::config::cluster::v3::Cluster& cluster, Runtime::Loader& runtime,
                        Network::DnsResolverSharedPtr dns_resolver,
                        Server::Configuration::TransportSocketFactoryContextImpl& factory_context,
-                       Stats::ScopePtr&& stats_scope, bool added_via_api);
+                       Stats::ScopeSharedPtr&& stats_scope, bool added_via_api);
 
   // Upstream::Cluster
   InitializePhase initializePhase() const override { return InitializePhase::Primary; }
@@ -26,7 +27,7 @@ public:
 private:
   struct ResolveTarget {
     ResolveTarget(StrictDnsClusterImpl& parent, Event::Dispatcher& dispatcher,
-                  const std::string& url,
+                  const std::string& dns_address, const uint32_t dns_port,
                   const envoy::config::endpoint::v3::LocalityLbEndpoints& locality_lb_endpoint,
                   const envoy::config::endpoint::v3::LbEndpoint& lb_endpoint);
     ~ResolveTarget();
@@ -34,12 +35,20 @@ private:
 
     StrictDnsClusterImpl& parent_;
     Network::ActiveDnsQuery* active_query_{};
-    std::string dns_address_;
-    uint32_t port_;
-    Event::TimerPtr resolve_timer_;
+    const envoy::config::endpoint::v3::LocalityLbEndpoints& locality_lb_endpoints_;
+    const envoy::config::endpoint::v3::LbEndpoint& lb_endpoint_;
+    const std::string dns_address_;
+    const std::string hostname_;
+    const uint32_t port_;
+    const Event::TimerPtr resolve_timer_;
     HostVector hosts_;
-    const envoy::config::endpoint::v3::LocalityLbEndpoints locality_lb_endpoint_;
-    const envoy::config::endpoint::v3::LbEndpoint lb_endpoint_;
+
+    // Host map for current resolve target. When we have multiple resolve targets, multiple targets
+    // may contain two different hosts with the same address. This has two effects:
+    // 1) This host map cannot be replaced by the cross-priority global host map in the priority
+    // set.
+    // 2) Cross-priority global host map may not be able to search for the expected host based on
+    // the address.
     HostMap all_hosts_;
   };
 
@@ -51,6 +60,9 @@ private:
   // ClusterImplBase
   void startPreInit() override;
 
+  // Keep load assignment as a member to make sure its data referenced in
+  // resolve_targets_ outlives them.
+  const envoy::config::endpoint::v3::ClusterLoadAssignment load_assignment_;
   const LocalInfo::LocalInfo& local_info_;
   Network::DnsResolverSharedPtr dns_resolver_;
   std::list<ResolveTargetPtr> resolve_targets_;
@@ -66,14 +78,14 @@ private:
  */
 class StrictDnsClusterFactory : public ClusterFactoryImplBase {
 public:
-  StrictDnsClusterFactory()
-      : ClusterFactoryImplBase(Extensions::Clusters::ClusterTypes::get().StrictDns) {}
+  StrictDnsClusterFactory() : ClusterFactoryImplBase("envoy.cluster.strict_dns") {}
 
 private:
   std::pair<ClusterImplBaseSharedPtr, ThreadAwareLoadBalancerPtr> createClusterImpl(
+      Server::Configuration::ServerFactoryContext& server_context,
       const envoy::config::cluster::v3::Cluster& cluster, ClusterFactoryContext& context,
       Server::Configuration::TransportSocketFactoryContextImpl& socket_factory_context,
-      Stats::ScopePtr&& stats_scope) override;
+      Stats::ScopeSharedPtr&& stats_scope) override;
 };
 
 } // namespace Upstream

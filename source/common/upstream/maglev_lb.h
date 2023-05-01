@@ -1,11 +1,12 @@
 #pragma once
 
+#include "envoy/common/random_generator.h"
 #include "envoy/config/cluster/v3/cluster.pb.h"
 #include "envoy/stats/scope.h"
 #include "envoy/stats/stats_macros.h"
 
-#include "common/upstream/thread_aware_lb_impl.h"
-#include "common/upstream/upstream_impl.h"
+#include "source/common/upstream/thread_aware_lb_impl.h"
+#include "source/common/upstream/upstream_impl.h"
 
 namespace Envoy {
 namespace Upstream {
@@ -67,30 +68,42 @@ private:
 /**
  * Thread aware load balancer implementation for Maglev.
  */
-class MaglevLoadBalancer : public ThreadAwareLoadBalancerBase {
+class MaglevLoadBalancer : public ThreadAwareLoadBalancerBase,
+                           Logger::Loggable<Logger::Id::upstream> {
 public:
-  MaglevLoadBalancer(const PrioritySet& priority_set, ClusterStats& stats, Stats::Scope& scope,
-                     Runtime::Loader& runtime, Runtime::RandomGenerator& random,
-                     const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config,
-                     uint64_t table_size = MaglevTable::DefaultTableSize);
+  MaglevLoadBalancer(
+      const PrioritySet& priority_set, ClusterStats& stats, Stats::Scope& scope,
+      Runtime::Loader& runtime, Random::RandomGenerator& random,
+      const absl::optional<envoy::config::cluster::v3::Cluster::MaglevLbConfig>& config,
+      const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config);
 
   const MaglevLoadBalancerStats& stats() const { return stats_; }
+  uint64_t tableSize() const { return table_size_; }
 
 private:
   // ThreadAwareLoadBalancerBase
   HashingLoadBalancerSharedPtr
   createLoadBalancer(const NormalizedHostWeightVector& normalized_host_weights,
                      double /* min_normalized_weight */, double max_normalized_weight) override {
-    return std::make_shared<MaglevTable>(normalized_host_weights, max_normalized_weight,
-                                         table_size_, use_hostname_for_hashing_, stats_);
+    HashingLoadBalancerSharedPtr maglev_lb =
+        std::make_shared<MaglevTable>(normalized_host_weights, max_normalized_weight, table_size_,
+                                      use_hostname_for_hashing_, stats_);
+
+    if (hash_balance_factor_ == 0) {
+      return maglev_lb;
+    }
+
+    return std::make_shared<BoundedLoadHashingLoadBalancer>(
+        maglev_lb, std::move(normalized_host_weights), hash_balance_factor_);
   }
 
   static MaglevLoadBalancerStats generateStats(Stats::Scope& scope);
 
-  Stats::ScopePtr scope_;
+  Stats::ScopeSharedPtr scope_;
   MaglevLoadBalancerStats stats_;
   const uint64_t table_size_;
   const bool use_hostname_for_hashing_;
+  const uint32_t hash_balance_factor_;
 };
 
 } // namespace Upstream

@@ -2,19 +2,19 @@
 
 #include <datadog/opentracing.h>
 
-#include "envoy/config/trace/v3/trace.pb.h"
+#include "envoy/config/trace/v3/datadog.pb.h"
 #include "envoy/local_info/local_info.h"
 #include "envoy/runtime/runtime.h"
 #include "envoy/thread_local/thread_local.h"
-#include "envoy/tracing/http_tracer.h"
 #include "envoy/upstream/cluster_manager.h"
 
-#include "common/http/async_client_utility.h"
-#include "common/http/header_map_impl.h"
-#include "common/json/json_loader.h"
-#include "common/upstream/cluster_update_tracker.h"
+#include "source/common/http/async_client_utility.h"
+#include "source/common/http/header_map_impl.h"
+#include "source/common/json/json_loader.h"
+#include "source/common/upstream/cluster_update_tracker.h"
+#include "source/extensions/tracers/common/ot/opentracing_driver_impl.h"
 
-#include "extensions/tracers/common/ot/opentracing_driver_impl.h"
+#include "fmt/ostream.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -52,7 +52,6 @@ public:
   // Getters to return the DatadogDriver's key members.
   Upstream::ClusterManager& clusterManager() { return cm_; }
   const std::string& cluster() { return cluster_; }
-  Runtime::Loader& runtime() { return runtime_; }
   DatadogTracerStats& tracerStats() { return tracer_stats_; }
   const datadog::opentracing::TracerOptions& tracerOptions() { return tracer_options_; }
 
@@ -80,7 +79,6 @@ private:
   DatadogTracerStats tracer_stats_;
   datadog::opentracing::TracerOptions tracer_options_;
   ThreadLocal::SlotPtr tls_;
-  Runtime::Loader& runtime_;
 };
 
 /**
@@ -112,6 +110,7 @@ public:
   // Http::AsyncClient::Callbacks.
   void onSuccess(const Http::AsyncClient::Request&, Http::ResponseMessagePtr&&) override;
   void onFailure(const Http::AsyncClient::Request&, Http::AsyncClient::FailureReason) override;
+  void onBeforeFinalizeUpstreamSpan(Tracing::Span&, const Http::ResponseHeaderMap*) override {}
 
 private:
   /**
@@ -139,3 +138,9 @@ private:
 } // namespace Tracers
 } // namespace Extensions
 } // namespace Envoy
+
+// NOLINT(namespace-envoy)
+namespace fmt {
+// Allow fmtlib to format opentracing::string_view
+template <> struct formatter<opentracing::string_view> : ostream_formatter {};
+} // namespace fmt

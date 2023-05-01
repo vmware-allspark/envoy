@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <functional>
 #include <string>
-#include <unordered_map>
 
 #include "envoy/config/cluster/v3/cluster.pb.h"
 #include "envoy/secret/secret_manager.h"
@@ -11,18 +10,33 @@
 #include "envoy/stats/scope.h"
 #include "envoy/thread_local/thread_local.h"
 
-#include "common/common/empty_string.h"
-#include "common/common/logger.h"
-#include "common/upstream/cluster_factory_impl.h"
-#include "common/upstream/upstream_impl.h"
-
-#include "extensions/clusters/well_known_names.h"
+#include "source/common/common/empty_string.h"
+#include "source/common/common/logger.h"
+#include "source/common/upstream/cluster_factory_impl.h"
+#include "source/common/upstream/upstream_impl.h"
 
 namespace Envoy {
 namespace Upstream {
 
-using HostMapSharedPtr = std::shared_ptr<HostMap>;
-using HostMapConstSharedPtr = std::shared_ptr<const HostMap>;
+struct HostsForAddress {
+  HostsForAddress(HostSharedPtr& host) : host_(host), used_(true) {}
+
+  // Primary host for the address. This is set by the first worker that posts
+  // to the main to add a host. The field is read by all workers.
+  const HostSharedPtr host_;
+  // Hosts that are added concurrently with host_ are stored in this list.
+  // This is populated by the subsequent workers that have not received the
+  // updated table with set host_. The field is only accessed from the main
+  // thread.
+  std::vector<HostSharedPtr> hosts_;
+  // Marks as recently used by load balancers.
+  std::atomic<bool> used_;
+};
+
+using HostsForAddressSharedPtr = std::shared_ptr<HostsForAddress>;
+using HostMultiMap = absl::flat_hash_map<std::string, HostsForAddressSharedPtr>;
+using HostMultiMapSharedPtr = std::shared_ptr<HostMultiMap>;
+using HostMultiMapConstSharedPtr = std::shared_ptr<const HostMultiMap>;
 
 /**
  * The OriginalDstCluster is a dynamic cluster that automatically adds hosts as needed based on the
@@ -32,9 +46,10 @@ using HostMapConstSharedPtr = std::shared_ptr<const HostMap>;
  */
 class OriginalDstCluster : public ClusterImplBase {
 public:
-  OriginalDstCluster(const envoy::config::cluster::v3::Cluster& config, Runtime::Loader& runtime,
+  OriginalDstCluster(Server::Configuration::ServerFactoryContext& server_context,
+                     const envoy::config::cluster::v3::Cluster& config, Runtime::Loader& runtime,
                      Server::Configuration::TransportSocketFactoryContextImpl& factory_context,
-                     Stats::ScopePtr&& stats_scope, bool added_via_api);
+                     Stats::ScopeSharedPtr&& stats_scope, bool added_via_api);
 
   // Upstream::Cluster
   InitializePhase initializePhase() const override { return InitializePhase::Primary; }
@@ -53,17 +68,38 @@ public:
   class LoadBalancer : public Upstream::LoadBalancer {
   public:
     LoadBalancer(const std::shared_ptr<OriginalDstCluster>& parent)
-        : parent_(parent), host_map_(parent->getCurrentHostMap()) {}
+        : parent_(parent), http_header_name_(parent->httpHeaderName()),
+          port_override_(parent->portOverride()), host_map_(parent->getCurrentHostMap()) {}
 
     // Upstream::LoadBalancer
     HostConstSharedPtr chooseHost(LoadBalancerContext* context) override;
+    // Preconnecting is not implemented for OriginalDstCluster
+    HostConstSharedPtr peekAnotherHost(LoadBalancerContext*) override { return nullptr; }
+    // Pool selection not implemented for OriginalDstCluster
+    absl::optional<Upstream::SelectedPoolAndConnection>
+    selectExistingConnection(Upstream::LoadBalancerContext* /*context*/,
+                             const Upstream::Host& /*host*/,
+                             std::vector<uint8_t>& /*hash_key*/) override {
+      return absl::nullopt;
+    }
+    // Lifetime tracking not implemented for OriginalDstCluster
+    OptRef<Envoy::Http::ConnectionPool::ConnectionLifetimeCallbacks> lifetimeCallbacks() override {
+      return {};
+    }
 
-  private:
+    Network::Address::InstanceConstSharedPtr filterStateOverrideHost(LoadBalancerContext* context);
     Network::Address::InstanceConstSharedPtr requestOverrideHost(LoadBalancerContext* context);
 
+  private:
     const std::shared_ptr<OriginalDstCluster> parent_;
-    HostMapConstSharedPtr host_map_;
+    // The optional original host provider that extracts the address from HTTP header map.
+    const absl::optional<Http::LowerCaseString>& http_header_name_;
+    const absl::optional<uint32_t> port_override_;
+    HostMultiMapConstSharedPtr host_map_;
   };
+
+  const absl::optional<Http::LowerCaseString>& httpHeaderName() { return http_header_name_; }
+  const absl::optional<uint32_t> portOverride() { return port_override_; }
 
 private:
   struct LoadBalancerFactory : public Upstream::LoadBalancerFactory {
@@ -88,12 +124,12 @@ private:
     const std::shared_ptr<OriginalDstCluster> cluster_;
   };
 
-  HostMapConstSharedPtr getCurrentHostMap() {
+  HostMultiMapConstSharedPtr getCurrentHostMap() {
     absl::ReaderMutexLock lock(&host_map_lock_);
     return host_map_;
   }
 
-  void setHostMap(const HostMapConstSharedPtr& new_host_map) {
+  void setHostMap(const HostMultiMapConstSharedPtr& new_host_map) {
     absl::WriterMutexLock lock(&host_map_lock_);
     host_map_ = new_host_map;
   }
@@ -107,11 +143,11 @@ private:
   Event::Dispatcher& dispatcher_;
   const std::chrono::milliseconds cleanup_interval_ms_;
   Event::TimerPtr cleanup_timer_;
-  const bool use_http_header_;
 
   absl::Mutex host_map_lock_;
-  HostMapConstSharedPtr host_map_ ABSL_GUARDED_BY(host_map_lock_);
-
+  HostMultiMapConstSharedPtr host_map_ ABSL_GUARDED_BY(host_map_lock_);
+  absl::optional<Http::LowerCaseString> http_header_name_;
+  absl::optional<uint32_t> port_override_;
   friend class OriginalDstClusterFactory;
 };
 
@@ -119,14 +155,14 @@ using OriginalDstClusterSharedPtr = std::shared_ptr<OriginalDstCluster>;
 
 class OriginalDstClusterFactory : public ClusterFactoryImplBase {
 public:
-  OriginalDstClusterFactory()
-      : ClusterFactoryImplBase(Extensions::Clusters::ClusterTypes::get().OriginalDst) {}
+  OriginalDstClusterFactory() : ClusterFactoryImplBase("envoy.cluster.original_dst") {}
 
 private:
   std::pair<ClusterImplBaseSharedPtr, ThreadAwareLoadBalancerPtr> createClusterImpl(
+      Server::Configuration::ServerFactoryContext& server_context,
       const envoy::config::cluster::v3::Cluster& cluster, ClusterFactoryContext& context,
       Server::Configuration::TransportSocketFactoryContextImpl& socket_factory_context,
-      Stats::ScopePtr&& stats_scope) override;
+      Stats::ScopeSharedPtr&& stats_scope) override;
 };
 
 } // namespace Upstream

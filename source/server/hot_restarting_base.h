@@ -1,7 +1,9 @@
 #pragma once
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/un.h>
+#include <unistd.h>
 
 #include <array>
 #include <atomic>
@@ -11,8 +13,9 @@
 #include "envoy/common/platform.h"
 #include "envoy/server/hot_restart.h"
 #include "envoy/server/options.h"
+#include "envoy/stats/scope.h"
 
-#include "common/common/assert.h"
+#include "source/common/common/assert.h"
 
 namespace Envoy {
 namespace Server {
@@ -21,13 +24,16 @@ namespace Server {
  * Logic shared by the implementations of both sides of the child<-->parent hot restart protocol:
  * domain socket communication, and our ad hoc RPC protocol.
  */
-class HotRestartingBase {
+class HotRestartingBase : public Logger::Loggable<Logger::Id::main> {
 protected:
   HotRestartingBase(uint64_t base_id) : base_id_(base_id) {}
+  ~HotRestartingBase();
 
   void initDomainSocketAddress(sockaddr_un* address);
-  sockaddr_un createDomainSocketAddress(uint64_t id, const std::string& role);
-  void bindDomainSocket(uint64_t id, const std::string& role);
+  sockaddr_un createDomainSocketAddress(uint64_t id, const std::string& role,
+                                        const std::string& socket_path, mode_t socket_mode);
+  void bindDomainSocket(uint64_t id, const std::string& role, const std::string& socket_path,
+                        mode_t socket_mode);
   int myDomainSocket() const { return my_domain_socket_; }
 
   // Protocol description:
@@ -55,6 +61,10 @@ protected:
 
   bool replyIsExpectedType(const envoy::HotRestartMessage* proto,
                            envoy::HotRestartMessage::Reply::ReplyCase oneof_type) const;
+
+  // Returns a Gauge that tracks hot-restart generation, where every successive
+  // child increments this number.
+  static Stats::Gauge& hotRestartGeneration(Stats::Scope& scope);
 
 private:
   void getPassedFdIfPresent(envoy::HotRestartMessage* out, msghdr* message);

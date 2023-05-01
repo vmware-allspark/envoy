@@ -1,4 +1,4 @@
-#include "extensions/filters/network/common/redis/client_impl.h"
+#include "source/extensions/filters/network/common/redis/client_impl.h"
 
 #include "envoy/extensions/filters/network/redis_proxy/v3/redis_proxy.pb.h"
 
@@ -30,12 +30,13 @@ ConfigImpl::ConfigImpl(
           PROTOBUF_GET_WRAPPED_OR_DEFAULT(config, max_upstream_unknown_connections, 100)),
       enable_command_stats_(config.enable_command_stats()) {
   switch (config.read_policy()) {
+    PANIC_ON_PROTO_ENUM_SENTINEL_VALUES;
   case envoy::extensions::filters::network::redis_proxy::v3::RedisProxy::ConnPoolSettings::MASTER:
-    read_policy_ = ReadPolicy::Master;
+    read_policy_ = ReadPolicy::Primary;
     break;
   case envoy::extensions::filters::network::redis_proxy::v3::RedisProxy::ConnPoolSettings::
       PREFER_MASTER:
-    read_policy_ = ReadPolicy::PreferMaster;
+    read_policy_ = ReadPolicy::PreferPrimary;
     break;
   case envoy::extensions::filters::network::redis_proxy::v3::RedisProxy::ConnPoolSettings::REPLICA:
     read_policy_ = ReadPolicy::Replica;
@@ -47,9 +48,6 @@ ConfigImpl::ConfigImpl(
   case envoy::extensions::filters::network::redis_proxy::v3::RedisProxy::ConnPoolSettings::ANY:
     read_policy_ = ReadPolicy::Any;
     break;
-  default:
-    NOT_REACHED_GCOVR_EXCL_LINE;
-    break;
   }
 }
 
@@ -57,9 +55,10 @@ ClientPtr ClientImpl::create(Upstream::HostConstSharedPtr host, Event::Dispatche
                              EncoderPtr&& encoder, DecoderFactory& decoder_factory,
                              const Config& config,
                              const RedisCommandStatsSharedPtr& redis_command_stats,
-                             Stats::Scope& scope) {
-  auto client = std::make_unique<ClientImpl>(host, dispatcher, std::move(encoder), decoder_factory,
-                                             config, redis_command_stats, scope);
+                             Stats::Scope& scope, bool is_transaction_client) {
+  auto client =
+      std::make_unique<ClientImpl>(host, dispatcher, std::move(encoder), decoder_factory, config,
+                                   redis_command_stats, scope, is_transaction_client);
   client->connection_ = host->createConnection(dispatcher, nullptr, nullptr).connection_;
   client->connection_->addConnectionCallbacks(*client);
   client->connection_->addReadFilter(Network::ReadFilterSharedPtr{new UpstreamReadFilter(*client)});
@@ -70,13 +69,14 @@ ClientPtr ClientImpl::create(Upstream::HostConstSharedPtr host, Event::Dispatche
 
 ClientImpl::ClientImpl(Upstream::HostConstSharedPtr host, Event::Dispatcher& dispatcher,
                        EncoderPtr&& encoder, DecoderFactory& decoder_factory, const Config& config,
-                       const RedisCommandStatsSharedPtr& redis_command_stats, Stats::Scope& scope)
+                       const RedisCommandStatsSharedPtr& redis_command_stats, Stats::Scope& scope,
+                       bool is_transaction_client)
     : host_(host), encoder_(std::move(encoder)), decoder_(decoder_factory.create(*this)),
       config_(config),
       connect_or_op_timer_(dispatcher.createTimer([this]() { onConnectOrOpTimeout(); })),
       flush_timer_(dispatcher.createTimer([this]() { flushBufferAndResetTimer(); })),
       time_source_(dispatcher.timeSource()), redis_command_stats_(redis_command_stats),
-      scope_(scope) {
+      scope_(scope), is_transaction_client_(is_transaction_client) {
   host->cluster().stats().upstream_cx_total_.inc();
   host->stats().cx_total_.inc();
   host->cluster().stats().upstream_cx_active_.inc();
@@ -222,7 +222,8 @@ void ClientImpl::onRespValue(RespValuePtr&& value) {
   pending_requests_.pop_front();
   if (canceled) {
     host_->cluster().stats().upstream_rq_cancelled_.inc();
-  } else if (config_.enableRedirection() && (value->type() == Common::Redis::RespType::Error)) {
+  } else if (config_.enableRedirection() && !is_transaction_client_ &&
+             (value->type() == Common::Redis::RespType::Error)) {
     std::vector<absl::string_view> err = StringUtil::splitToken(value->asString(), " ", false);
     bool redirected = false;
     if (err.size() == 3) {
@@ -240,7 +241,11 @@ void ClientImpl::onRespValue(RespValuePtr&& value) {
       }
     }
     if (!redirected) {
-      callbacks.onResponse(std::move(value));
+      if (err[0] == RedirectionResponse::get().CLUSTER_DOWN) {
+        callbacks.onFailure();
+      } else {
+        callbacks.onResponse(std::move(value));
+      }
     }
   } else {
     callbacks.onResponse(std::move(value));
@@ -285,16 +290,20 @@ void ClientImpl::PendingRequest::cancel() {
   canceled_ = true;
 }
 
-void ClientImpl::initialize(const std::string& auth_password) {
-  if (!auth_password.empty()) {
+void ClientImpl::initialize(const std::string& auth_username, const std::string& auth_password) {
+  if (!auth_username.empty()) {
+    // Send an AUTH command to the upstream server with username and password.
+    Utility::AuthRequest auth_request(auth_username, auth_password);
+    makeRequest(auth_request, null_pool_callbacks);
+  } else if (!auth_password.empty()) {
     // Send an AUTH command to the upstream server.
     Utility::AuthRequest auth_request(auth_password);
     makeRequest(auth_request, null_pool_callbacks);
   }
   // Any connection to replica requires the READONLY command in order to perform read.
-  // Also the READONLY command is a no-opt for the master.
+  // Also the READONLY command is a no-opt for the primary.
   // We only need to send the READONLY command iff it's possible that the host is a replica.
-  if (config_.readPolicy() != Common::Redis::Client::ReadPolicy::Master) {
+  if (config_.readPolicy() != Common::Redis::Client::ReadPolicy::Primary) {
     makeRequest(Utility::ReadOnlyRequest::instance(), null_pool_callbacks);
   }
 }
@@ -304,10 +313,12 @@ ClientFactoryImpl ClientFactoryImpl::instance_;
 ClientPtr ClientFactoryImpl::create(Upstream::HostConstSharedPtr host,
                                     Event::Dispatcher& dispatcher, const Config& config,
                                     const RedisCommandStatsSharedPtr& redis_command_stats,
-                                    Stats::Scope& scope, const std::string& auth_password) {
-  ClientPtr client = ClientImpl::create(host, dispatcher, EncoderPtr{new EncoderImpl()},
-                                        decoder_factory_, config, redis_command_stats, scope);
-  client->initialize(auth_password);
+                                    Stats::Scope& scope, const std::string& auth_username,
+                                    const std::string& auth_password, bool is_transaction_client) {
+  ClientPtr client =
+      ClientImpl::create(host, dispatcher, EncoderPtr{new EncoderImpl()}, decoder_factory_, config,
+                         redis_command_stats, scope, is_transaction_client);
+  client->initialize(auth_username, auth_password);
   return client;
 }
 

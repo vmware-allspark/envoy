@@ -1,9 +1,9 @@
-#include "common/stats/scope_prefixer.h"
+#include "source/common/stats/scope_prefixer.h"
 
 #include "envoy/stats/scope.h"
 
-#include "common/stats/symbol_table_impl.h"
-#include "common/stats/utility.h"
+#include "source/common/stats/symbol_table.h"
+#include "source/common/stats/utility.h"
 
 namespace Envoy {
 namespace Stats {
@@ -16,14 +16,14 @@ ScopePrefixer::ScopePrefixer(StatName prefix, Scope& scope)
 
 ScopePrefixer::~ScopePrefixer() { prefix_.free(symbolTable()); }
 
-ScopePtr ScopePrefixer::createScopeFromStatName(StatName name) {
+ScopeSharedPtr ScopePrefixer::scopeFromStatName(StatName name) {
   SymbolTable::StoragePtr joined = symbolTable().join({prefix_.statName(), name});
-  return std::make_unique<ScopePrefixer>(StatName(joined.get()), scope_);
+  return std::make_shared<ScopePrefixer>(StatName(joined.get()), scope_);
 }
 
-ScopePtr ScopePrefixer::createScope(const std::string& name) {
+ScopeSharedPtr ScopePrefixer::createScope(const std::string& name) {
   StatNameManagedStorage stat_name_storage(Utility::sanitizeStatsName(name), symbolTable());
-  return createScopeFromStatName(stat_name_storage.statName());
+  return scopeFromStatName(stat_name_storage.statName());
 }
 
 Counter& ScopePrefixer::counterFromStatNameWithTags(const StatName& name,
@@ -49,6 +49,13 @@ Histogram& ScopePrefixer::histogramFromStatNameWithTags(const StatName& name,
   return scope_.histogramFromStatNameWithTags(StatName(stat_name_storage.get()), tags, unit);
 }
 
+TextReadout& ScopePrefixer::textReadoutFromStatNameWithTags(const StatName& name,
+                                                            StatNameTagVectorOptConstRef tags) {
+  Stats::SymbolTable::StoragePtr stat_name_storage =
+      scope_.symbolTable().join({prefix_.statName(), name});
+  return scope_.textReadoutFromStatNameWithTags(StatName(stat_name_storage.get()), tags);
+}
+
 CounterOptConstRef ScopePrefixer::findCounter(StatName name) const {
   return scope_.findCounter(name);
 }
@@ -57,6 +64,10 @@ GaugeOptConstRef ScopePrefixer::findGauge(StatName name) const { return scope_.f
 
 HistogramOptConstRef ScopePrefixer::findHistogram(StatName name) const {
   return scope_.findHistogram(name);
+}
+
+TextReadoutOptConstRef ScopePrefixer::findTextReadout(StatName name) const {
+  return scope_.findTextReadout(name);
 }
 
 void ScopePrefixer::deliverHistogramToSinks(const Histogram& histograms, uint64_t val) {

@@ -1,53 +1,14 @@
-#include "common/signal/signal_action.h"
+#include "source/common/signal/signal_action.h"
 
 #include <sys/mman.h>
 
 #include <csignal>
 
-#include "common/common/assert.h"
-#include "common/common/version.h"
+#include "source/common/common/assert.h"
+#include "source/common/signal/fatal_action.h"
+#include "source/common/version/version.h"
 
 namespace Envoy {
-
-ABSL_CONST_INIT static absl::Mutex failure_mutex(absl::kConstInit);
-// Since we can't grab the failure mutex on fatal error (snagging locks under
-// fatal crash causing potential deadlocks) access the handler list as an atomic
-// operation, to minimize the chance that one thread is operating on the list
-// while the crash handler is attempting to access it.
-// This basically makes edits to the list thread-safe - if one thread is
-// modifying the list rather than crashing in the crash handler due to accessing
-// the list in a non-thread-safe manner, it simply won't log crash traces.
-using FailureFunctionList = std::list<const FatalErrorHandlerInterface*>;
-ABSL_CONST_INIT std::atomic<FailureFunctionList*> fatal_error_handlers{nullptr};
-
-void SignalAction::registerFatalErrorHandler(const FatalErrorHandlerInterface& handler) {
-#ifdef ENVOY_OBJECT_TRACE_ON_DUMP
-  absl::MutexLock l(&failure_mutex);
-  FailureFunctionList* list = fatal_error_handlers.exchange(nullptr, std::memory_order_relaxed);
-  if (list == nullptr) {
-    list = new FailureFunctionList;
-  }
-  list->push_back(&handler);
-  fatal_error_handlers.store(list, std::memory_order_release);
-#else
-  UNREFERENCED_PARAMETER(handler);
-#endif
-}
-
-void SignalAction::removeFatalErrorHandler(const FatalErrorHandlerInterface& handler) {
-#ifdef ENVOY_OBJECT_TRACE_ON_DUMP
-  absl::MutexLock l(&failure_mutex);
-  FailureFunctionList* list = fatal_error_handlers.exchange(nullptr, std::memory_order_relaxed);
-  list->remove(&handler);
-  if (list->empty()) {
-    delete list;
-  } else {
-    fatal_error_handlers.store(list, std::memory_order_release);
-  }
-#else
-  UNREFERENCED_PARAMETER(handler);
-#endif
-}
 
 constexpr int SignalAction::FATAL_SIGS[];
 
@@ -62,12 +23,30 @@ void SignalAction::sigHandler(int sig, siginfo_t* info, void* context) {
   }
   tracer.logTrace();
 
-  FailureFunctionList* list = fatal_error_handlers.exchange(nullptr, std::memory_order_relaxed);
-  if (list) {
-    // Finally after logging the stack trace, call any registered crash handlers.
-    for (const auto* handler : *list) {
-      handler->onFatalError();
-    }
+  // Finally after logging the stack trace, call the crash handlers
+  // in order from safe to unsafe.
+  auto status = FatalErrorHandler::runSafeActions();
+
+  switch (status) {
+  case FatalAction::Status::Success:
+    FatalErrorHandler::callFatalErrorHandlers(std::cerr);
+    FatalErrorHandler::runUnsafeActions();
+    break;
+  case FatalAction::Status::ActionManagerUnset:
+    FatalErrorHandler::callFatalErrorHandlers(std::cerr);
+    break;
+  case FatalAction::Status::RunningOnAnotherThread: {
+    // We should wait for some duration for the other thread to finish
+    // running. We should add support for this scenario, even though the
+    // probability of it occurring is low.
+    // TODO(kbaichoo): Implement a configurable call to sleep
+    PANIC("not implemented");
+    break;
+  }
+  case FatalAction::Status::AlreadyRanOnThisThread:
+    // We caused another fatal signal to be raised.
+    std::cerr << "Our FatalActions triggered a fatal signal.\n";
+    break;
   }
 
   signal(sig, SIG_DFL);
@@ -75,12 +54,16 @@ void SignalAction::sigHandler(int sig, siginfo_t* info, void* context) {
 }
 
 void SignalAction::installSigHandlers() {
+  // sigaltstack and backtrace() are incompatible on Apple platforms
+  // https://reviews.llvm.org/D28265
+#if !defined(__APPLE__)
   stack_t stack;
   stack.ss_sp = altstack_ + guard_size_; // Guard page at one end ...
   stack.ss_size = altstack_size_;        // ... guard page at the other
   stack.ss_flags = 0;
 
   RELEASE_ASSERT(sigaltstack(&stack, &previous_altstack_) == 0, "");
+#endif
 
   // Make sure VersionInfo::version() is initialized so we don't allocate std::string in signal
   // handlers.
@@ -99,13 +82,11 @@ void SignalAction::installSigHandlers() {
 }
 
 void SignalAction::removeSigHandlers() {
-#if defined(__APPLE__)
-  // ss_flags contains SS_DISABLE, but Darwin still checks the size, contrary to the man page
-  if (previous_altstack_.ss_size < MINSIGSTKSZ) {
-    previous_altstack_.ss_size = MINSIGSTKSZ;
-  }
-#endif
+// sigaltstack and backtrace() are incompatible on Apple platforms
+// https://reviews.llvm.org/D28265
+#if !defined(__APPLE__)
   RELEASE_ASSERT(sigaltstack(&previous_altstack_, nullptr) == 0, "");
+#endif
 
   int hidx = 0;
   for (const auto& sig : FATAL_SIGS) {

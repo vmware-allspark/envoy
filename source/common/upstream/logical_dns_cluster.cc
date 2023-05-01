@@ -1,4 +1,4 @@
-#include "common/upstream/logical_dns_cluster.h"
+#include "source/common/upstream/logical_dns_cluster.h"
 
 #include <chrono>
 #include <list>
@@ -12,12 +12,13 @@
 #include "envoy/config/endpoint/v3/endpoint.pb.h"
 #include "envoy/stats/scope.h"
 
-#include "common/common/fmt.h"
-#include "common/config/utility.h"
-#include "common/network/address_impl.h"
-#include "common/network/utility.h"
-#include "common/protobuf/protobuf.h"
-#include "common/protobuf/utility.h"
+#include "source/common/common/dns_utils.h"
+#include "source/common/common/fmt.h"
+#include "source/common/config/utility.h"
+#include "source/common/network/address_impl.h"
+#include "source/common/network/utility.h"
+#include "source/common/protobuf/protobuf.h"
+#include "source/common/protobuf/utility.h"
 
 namespace Envoy {
 namespace Upstream {
@@ -44,25 +45,24 @@ convertPriority(const envoy::config::endpoint::v3::ClusterLoadAssignment& load_a
 } // namespace
 
 LogicalDnsCluster::LogicalDnsCluster(
+    Server::Configuration::ServerFactoryContext& server_context,
     const envoy::config::cluster::v3::Cluster& cluster, Runtime::Loader& runtime,
     Network::DnsResolverSharedPtr dns_resolver,
     Server::Configuration::TransportSocketFactoryContextImpl& factory_context,
-    Stats::ScopePtr&& stats_scope, bool added_via_api)
-    : ClusterImplBase(cluster, runtime, factory_context, std::move(stats_scope), added_via_api),
+    Stats::ScopeSharedPtr&& stats_scope, bool added_via_api)
+    : ClusterImplBase(server_context, cluster, runtime, factory_context, std::move(stats_scope),
+                      added_via_api, factory_context.mainThreadDispatcher().timeSource()),
       dns_resolver_(dns_resolver),
       dns_refresh_rate_ms_(
           std::chrono::milliseconds(PROTOBUF_GET_MS_OR_DEFAULT(cluster, dns_refresh_rate, 5000))),
       respect_dns_ttl_(cluster.respect_dns_ttl()),
       resolve_timer_(
-          factory_context.dispatcher().createTimer([this]() -> void { startResolve(); })),
+          factory_context.mainThreadDispatcher().createTimer([this]() -> void { startResolve(); })),
       local_info_(factory_context.localInfo()),
-      load_assignment_(
-          cluster.has_load_assignment()
-              ? convertPriority(cluster.load_assignment())
-              : Config::Utility::translateClusterHosts(cluster.hidden_envoy_deprecated_hosts())) {
+      load_assignment_(convertPriority(cluster.load_assignment())) {
   failure_backoff_strategy_ =
       Config::Utility::prepareDnsRefreshStrategy<envoy::config::cluster::v3::Cluster>(
-          cluster, dns_refresh_rate_ms_.count(), factory_context.random());
+          cluster, dns_refresh_rate_ms_.count(), factory_context.api().randomGenerator());
 
   const auto& locality_lb_endpoints = load_assignment_.endpoints();
   if (locality_lb_endpoints.size() != 1 || locality_lb_endpoints[0].lb_endpoints().size() != 1) {
@@ -80,32 +80,40 @@ LogicalDnsCluster::LogicalDnsCluster(
   if (!socket_address.resolver_name().empty()) {
     throw EnvoyException("LOGICAL_DNS clusters must NOT have a custom resolver name set");
   }
+  dns_address_ = socket_address.address();
+  dns_port_ = socket_address.port_value();
 
-  dns_url_ = fmt::format("tcp://{}:{}", socket_address.address(), socket_address.port_value());
-  hostname_ = Network::Utility::hostFromTcpUrl(dns_url_);
-  Network::Utility::portFromTcpUrl(dns_url_);
+  if (lbEndpoint().endpoint().hostname().empty()) {
+    hostname_ = dns_address_;
+  } else {
+    hostname_ = lbEndpoint().endpoint().hostname();
+  }
   dns_lookup_family_ = getDnsLookupFamilyFromCluster(cluster);
 }
 
-void LogicalDnsCluster::startPreInit() { startResolve(); }
+void LogicalDnsCluster::startPreInit() {
+  startResolve();
+  if (!wait_for_warm_on_init_) {
+    onPreInitComplete();
+  }
+}
 
 LogicalDnsCluster::~LogicalDnsCluster() {
   if (active_dns_query_) {
-    active_dns_query_->cancel();
+    active_dns_query_->cancel(Network::ActiveDnsQuery::CancelReason::QueryAbandoned);
   }
 }
 
 void LogicalDnsCluster::startResolve() {
-  std::string dns_address = Network::Utility::hostFromTcpUrl(dns_url_);
-  ENVOY_LOG(debug, "starting async DNS resolution for {}", dns_address);
+  ENVOY_LOG(debug, "starting async DNS resolution for {}", dns_address_);
   info_->stats().update_attempt_.inc();
 
   active_dns_query_ = dns_resolver_->resolve(
-      dns_address, dns_lookup_family_,
-      [this, dns_address](Network::DnsResolver::ResolutionStatus status,
-                          std::list<Network::DnsResponse>&& response) -> void {
+      dns_address_, dns_lookup_family_,
+      [this](Network::DnsResolver::ResolutionStatus status,
+             std::list<Network::DnsResponse>&& response) -> void {
         active_dns_query_ = nullptr;
-        ENVOY_LOG(debug, "async DNS resolution complete for {}", dns_address);
+        ENVOY_LOG(debug, "async DNS resolution complete for {}", dns_address_);
 
         std::chrono::milliseconds final_refresh_rate = dns_refresh_rate_ms_;
 
@@ -114,15 +122,18 @@ void LogicalDnsCluster::startResolve() {
         // not stabilize back to 0 hosts.
         if (status == Network::DnsResolver::ResolutionStatus::Success && !response.empty()) {
           info_->stats().update_success_.inc();
+          const auto addrinfo = response.front().addrInfo();
           // TODO(mattklein123): Move port handling into the DNS interface.
-          ASSERT(response.front().address_ != nullptr);
+          ASSERT(addrinfo.address_ != nullptr);
           Network::Address::InstanceConstSharedPtr new_address =
-              Network::Utility::getAddressWithPort(*(response.front().address_),
-                                                   Network::Utility::portFromTcpUrl(dns_url_));
+              Network::Utility::getAddressWithPort(*(response.front().addrInfo().address_),
+                                                   dns_port_);
+          auto address_list = DnsUtils::generateAddressList(response, dns_port_);
 
           if (!logical_host_) {
-            logical_host_ = std::make_shared<LogicalHost>(
-                info_, hostname_, new_address, localityLbEndpoint(), lbEndpoint(), nullptr);
+            logical_host_ = std::make_shared<LogicalHost>(info_, hostname_, new_address,
+                                                          address_list, localityLbEndpoint(),
+                                                          lbEndpoint(), nullptr, time_source_);
 
             const auto& locality_lb_endpoint = localityLbEndpoint();
             PriorityStateManager priority_state_manager(*this, local_info_, nullptr);
@@ -135,28 +146,31 @@ void LogicalDnsCluster::startResolve() {
                 absl::nullopt, absl::nullopt, absl::nullopt);
           }
 
-          if (!current_resolved_address_ || !(*new_address == *current_resolved_address_)) {
+          if (!current_resolved_address_ ||
+              (*new_address != *current_resolved_address_ ||
+               DnsUtils::listChanged(address_list, current_resolved_address_list_))) {
             current_resolved_address_ = new_address;
+            current_resolved_address_list_ = address_list;
 
             // Make sure that we have an updated address for admin display, health
             // checking, and creating real host connections.
-            logical_host_->setNewAddress(new_address, lbEndpoint());
+            logical_host_->setNewAddresses(new_address, address_list, lbEndpoint());
           }
 
           // reset failure backoff strategy because there was a success.
           failure_backoff_strategy_->reset();
 
-          if (respect_dns_ttl_ && response.front().ttl_ != std::chrono::seconds(0)) {
-            final_refresh_rate = response.front().ttl_;
+          if (respect_dns_ttl_ && addrinfo.ttl_ != std::chrono::seconds(0)) {
+            final_refresh_rate = addrinfo.ttl_;
           }
-          ENVOY_LOG(debug, "DNS refresh rate reset for {}, refresh rate {} ms", dns_address,
+          ENVOY_LOG(debug, "DNS refresh rate reset for {}, refresh rate {} ms", dns_address_,
                     final_refresh_rate.count());
         } else {
           info_->stats().update_failure_.inc();
           final_refresh_rate =
               std::chrono::milliseconds(failure_backoff_strategy_->nextBackOffMs());
           ENVOY_LOG(debug, "DNS refresh rate reset for {}, (failure) refresh rate {} ms",
-                    dns_address, final_refresh_rate.count());
+                    dns_address_, final_refresh_rate.count());
         }
 
         onPreInitComplete();
@@ -166,13 +180,14 @@ void LogicalDnsCluster::startResolve() {
 
 std::pair<ClusterImplBaseSharedPtr, ThreadAwareLoadBalancerPtr>
 LogicalDnsClusterFactory::createClusterImpl(
+    Server::Configuration::ServerFactoryContext& server_context,
     const envoy::config::cluster::v3::Cluster& cluster, ClusterFactoryContext& context,
     Server::Configuration::TransportSocketFactoryContextImpl& socket_factory_context,
-    Stats::ScopePtr&& stats_scope) {
+    Stats::ScopeSharedPtr&& stats_scope) {
   auto selected_dns_resolver = selectDnsResolver(cluster, context);
 
   return std::make_pair(std::make_shared<LogicalDnsCluster>(
-                            cluster, context.runtime(), selected_dns_resolver,
+                            server_context, cluster, context.runtime(), selected_dns_resolver,
                             socket_factory_context, std::move(stats_scope), context.addedViaApi()),
                         nullptr);
 }

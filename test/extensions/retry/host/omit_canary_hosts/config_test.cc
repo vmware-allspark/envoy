@@ -1,10 +1,9 @@
 #include "envoy/registry/registry.h"
 #include "envoy/upstream/retry.h"
 
-#include "extensions/retry/host/omit_canary_hosts/config.h"
-#include "extensions/retry/host/well_known_names.h"
+#include "source/extensions/retry/host/omit_canary_hosts/config.h"
 
-#include "test/mocks/upstream/mocks.h"
+#include "test/mocks/upstream/host.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -19,7 +18,7 @@ namespace {
 
 TEST(OmitCanaryHostsRetryPredicateTest, PredicateTest) {
   auto factory = Registry::FactoryRegistry<Upstream::RetryHostPredicateFactory>::getFactory(
-      RetryHostPredicateValues::get().OmitCanaryHostsPredicate);
+      "envoy.retry_host_predicates.omit_canary_hosts");
 
   ASSERT_NE(nullptr, factory);
 
@@ -34,6 +33,19 @@ TEST(OmitCanaryHostsRetryPredicateTest, PredicateTest) {
 
   ASSERT_FALSE(predicate->shouldSelectAnotherHost(*host1));
   ASSERT_TRUE(predicate->shouldSelectAnotherHost(*host2));
+  predicate->onHostAttempted(host1);
+}
+
+TEST(OmitCanaryHostsRetryPredicateTest, EmptyConfig) {
+  auto factory = Registry::FactoryRegistry<Upstream::RetryHostPredicateFactory>::getFactory(
+      "envoy.retry_host_predicates.omit_canary_hosts");
+
+  ASSERT_NE(nullptr, factory);
+
+  ProtobufTypes::MessagePtr config = factory->createEmptyConfigProto();
+  EXPECT_TRUE(dynamic_cast<
+              envoy::extensions::retry::host::omit_canary_hosts::v3::OmitCanaryHostsPredicate*>(
+      config.get()));
 }
 
 } // namespace

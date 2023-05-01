@@ -1,7 +1,7 @@
 #pragma once
 
-#include "common/upstream/load_balancer_impl.h"
-#include "common/upstream/upstream_impl.h"
+#include "source/common/upstream/load_balancer_impl.h"
+#include "source/common/upstream/upstream_impl.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -10,7 +10,7 @@ namespace Aggregate {
 
 // AggregateLoadBalancerContext wraps the load balancer context to re-assign priority load
 // according the to host priority selected by the aggregate load balancer.
-class AggregateLoadBalancerContext : public Upstream::LoadBalancerContext {
+class AggregateLoadBalancerContext : public Upstream::LoadBalancerContextBase {
 public:
   AggregateLoadBalancerContext(Upstream::LoadBalancerContext* context,
                                Upstream::LoadBalancerBase::HostAvailability host_availability,
@@ -37,11 +37,13 @@ public:
   }
   const Upstream::HealthyAndDegradedLoad&
   determinePriorityLoad(const Upstream::PrioritySet&,
-                        const Upstream::HealthyAndDegradedLoad& original_priority_load) override {
+                        const Upstream::HealthyAndDegradedLoad& original_priority_load,
+                        const Upstream::RetryPriority::PriorityMappingFunc&) override {
     // Re-assign load. Set all traffic to the priority and availability selected in aggregate
     // cluster.
-    // TODO(yxue): allow determinePriorityLoad to affect the load of top level cluster and verify it
-    // works with current retry plugin
+    //
+    // Note: context_->determinePriorityLoad() was already called and its result handled in
+    // AggregateClusterLoadBalancer::LoadBalancerImpl::chooseHost().
     const size_t priorities = original_priority_load.healthy_priority_load_.get().size();
     priority_load_.healthy_priority_load_.get().assign(priorities, 0);
     priority_load_.degraded_priority_load_.get().assign(priorities, 0);
@@ -60,7 +62,7 @@ public:
   Network::Socket::OptionsSharedPtr upstreamSocketOptions() const override {
     return context_->upstreamSocketOptions();
   }
-  Network::TransportSocketOptionsSharedPtr upstreamTransportSocketOptions() const override {
+  Network::TransportSocketOptionsConstSharedPtr upstreamTransportSocketOptions() const override {
     return context_->upstreamTransportSocketOptions();
   }
 

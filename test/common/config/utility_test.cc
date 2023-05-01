@@ -6,26 +6,30 @@
 #include "envoy/config/core/v3/grpc_service.pb.h"
 #include "envoy/extensions/filters/http/cors/v3/cors.pb.h"
 
-#include "common/common/fmt.h"
-#include "common/config/api_version.h"
-#include "common/config/utility.h"
-#include "common/config/well_known_names.h"
-#include "common/protobuf/protobuf.h"
+#include "source/common/common/fmt.h"
+#include "source/common/config/api_version.h"
+#include "source/common/config/utility.h"
+#include "source/common/config/well_known_names.h"
+#include "source/common/protobuf/protobuf.h"
 
 #include "test/mocks/config/mocks.h"
 #include "test/mocks/grpc/mocks.h"
 #include "test/mocks/local_info/mocks.h"
 #include "test/mocks/stats/mocks.h"
-#include "test/mocks/upstream/mocks.h"
+#include "test/mocks/upstream/cluster_manager.h"
+#include "test/mocks/upstream/thread_local_cluster.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/logging.h"
 #include "test/test_common/utility.h"
 
+#include "absl/types/optional.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "udpa/type/v1/typed_struct.pb.h"
+#include "xds/type/v3/typed_struct.pb.h"
 
-using testing::_;
+using testing::Eq;
+using testing::Optional;
 using testing::Ref;
 using testing::Return;
 
@@ -71,12 +75,10 @@ TEST(UtilityTest, ConfigSourceInitFetchTimeout) {
 
 TEST(UtilityTest, TranslateApiConfigSource) {
   envoy::config::core::v3::ApiConfigSource api_config_source_rest_legacy;
-  Utility::translateApiConfigSource("test_rest_legacy_cluster", 10000,
-                                    ApiType::get().UnsupportedRestLegacy,
+  Utility::translateApiConfigSource("test_rest_legacy_cluster", 10000, ApiType::get().Rest,
                                     api_config_source_rest_legacy);
-  EXPECT_EQ(
-      envoy::config::core::v3::ApiConfigSource::hidden_envoy_deprecated_UNSUPPORTED_REST_LEGACY,
-      api_config_source_rest_legacy.api_type());
+  EXPECT_EQ(envoy::config::core::v3::ApiConfigSource::REST,
+            api_config_source_rest_legacy.api_type());
   EXPECT_EQ(10000,
             DurationUtil::durationToMilliseconds(api_config_source_rest_legacy.refresh_delay()));
   EXPECT_EQ("test_rest_legacy_cluster", api_config_source_rest_legacy.cluster_names(0));
@@ -99,12 +101,22 @@ TEST(UtilityTest, TranslateApiConfigSource) {
 
 TEST(UtilityTest, createTagProducer) {
   envoy::config::bootstrap::v3::Bootstrap bootstrap;
-  auto producer = Utility::createTagProducer(bootstrap);
-  ASSERT(producer != nullptr);
-  std::vector<Stats::Tag> tags;
+  auto producer = Utility::createTagProducer(bootstrap, {});
+  ASSERT_TRUE(producer != nullptr);
+  Stats::TagVector tags;
   auto extracted_name = producer->produceTags("http.config_test.rq_total", tags);
   ASSERT_EQ(extracted_name, "http.rq_total");
   ASSERT_EQ(tags.size(), 1);
+}
+
+TEST(UtilityTest, createTagProducerWithDefaultTgs) {
+  envoy::config::bootstrap::v3::Bootstrap bootstrap;
+  auto producer = Utility::createTagProducer(bootstrap, {{"foo", "bar"}});
+  ASSERT_TRUE(producer != nullptr);
+  Stats::TagVector tags;
+  auto extracted_name = producer->produceTags("http.config_test.rq_total", tags);
+  EXPECT_EQ(extracted_name, "http.rq_total");
+  EXPECT_EQ(tags.size(), 2);
 }
 
 TEST(UtilityTest, CheckFilesystemSubscriptionBackingPath) {
@@ -112,7 +124,7 @@ TEST(UtilityTest, CheckFilesystemSubscriptionBackingPath) {
 
   EXPECT_THROW_WITH_MESSAGE(
       Utility::checkFilesystemSubscriptionBackingPath("foo", *api), EnvoyException,
-      "envoy::api::v2::Path must refer to an existing path in the system: 'foo' does not exist");
+      "paths must refer to an existing path in the system: 'foo' does not exist");
   std::string test_path = TestEnvironment::temporaryDirectory();
   Utility::checkFilesystemSubscriptionBackingPath(test_path, *api);
 }
@@ -156,7 +168,8 @@ TEST(UtilityTest, FactoryForGrpcApiConfigSource) {
     envoy::config::core::v3::ApiConfigSource api_config_source;
     api_config_source.set_api_type(envoy::config::core::v3::ApiConfigSource::GRPC);
     EXPECT_THROW_WITH_REGEX(
-        Utility::factoryForGrpcApiConfigSource(async_client_manager, api_config_source, scope),
+        Utility::factoryForGrpcApiConfigSource(async_client_manager, api_config_source, scope,
+                                               false),
         EnvoyException, "API configs must have either a gRPC service or a cluster name defined:");
   }
 
@@ -165,11 +178,12 @@ TEST(UtilityTest, FactoryForGrpcApiConfigSource) {
     api_config_source.set_api_type(envoy::config::core::v3::ApiConfigSource::GRPC);
     api_config_source.add_grpc_services();
     api_config_source.add_grpc_services();
-    EXPECT_THROW_WITH_REGEX(
-        Utility::factoryForGrpcApiConfigSource(async_client_manager, api_config_source, scope),
-        EnvoyException,
-        "envoy::api::v2::core::ConfigSource::.DELTA_.GRPC must have a single gRPC service "
-        "specified:");
+    EXPECT_THROW_WITH_REGEX(Utility::factoryForGrpcApiConfigSource(async_client_manager,
+                                                                   api_config_source, scope, false),
+                            EnvoyException,
+                            fmt::format("{}::.DELTA_.GRPC must have a single gRPC service "
+                                        "specified:",
+                                        api_config_source.GetTypeName()));
   }
 
   {
@@ -177,11 +191,12 @@ TEST(UtilityTest, FactoryForGrpcApiConfigSource) {
     api_config_source.set_api_type(envoy::config::core::v3::ApiConfigSource::GRPC);
     api_config_source.add_cluster_names();
     // this also logs a warning for setting REST cluster names for a gRPC API config.
-    EXPECT_THROW_WITH_REGEX(
-        Utility::factoryForGrpcApiConfigSource(async_client_manager, api_config_source, scope),
-        EnvoyException,
-        "envoy::api::v2::core::ConfigSource::.DELTA_.GRPC must not have a cluster name "
-        "specified:");
+    EXPECT_THROW_WITH_REGEX(Utility::factoryForGrpcApiConfigSource(async_client_manager,
+                                                                   api_config_source, scope, false),
+                            EnvoyException,
+                            fmt::format("{}::.DELTA_.GRPC must not have a cluster name "
+                                        "specified:",
+                                        api_config_source.GetTypeName()));
   }
 
   {
@@ -189,11 +204,12 @@ TEST(UtilityTest, FactoryForGrpcApiConfigSource) {
     api_config_source.set_api_type(envoy::config::core::v3::ApiConfigSource::GRPC);
     api_config_source.add_cluster_names();
     api_config_source.add_cluster_names();
-    EXPECT_THROW_WITH_REGEX(
-        Utility::factoryForGrpcApiConfigSource(async_client_manager, api_config_source, scope),
-        EnvoyException,
-        "envoy::api::v2::core::ConfigSource::.DELTA_.GRPC must not have a cluster name "
-        "specified:");
+    EXPECT_THROW_WITH_REGEX(Utility::factoryForGrpcApiConfigSource(async_client_manager,
+                                                                   api_config_source, scope, false),
+                            EnvoyException,
+                            fmt::format("{}::.DELTA_.GRPC must not have a cluster name "
+                                        "specified:",
+                                        api_config_source.GetTypeName()));
   }
 
   {
@@ -201,20 +217,22 @@ TEST(UtilityTest, FactoryForGrpcApiConfigSource) {
     api_config_source.set_api_type(envoy::config::core::v3::ApiConfigSource::REST);
     api_config_source.add_grpc_services()->mutable_envoy_grpc()->set_cluster_name("foo");
     // this also logs a warning for configuring gRPC clusters for a REST API config.
-    EXPECT_THROW_WITH_REGEX(
-        Utility::factoryForGrpcApiConfigSource(async_client_manager, api_config_source, scope),
-        EnvoyException,
-        "envoy::api::v2::core::ConfigSource, if not a gRPC type, must not have a gRPC service "
-        "specified:");
+    EXPECT_THROW_WITH_REGEX(Utility::factoryForGrpcApiConfigSource(async_client_manager,
+                                                                   api_config_source, scope, false),
+                            EnvoyException,
+                            fmt::format("{}, if not a gRPC type, must not have a gRPC service "
+                                        "specified:",
+                                        api_config_source.GetTypeName()));
   }
 
   {
     envoy::config::core::v3::ApiConfigSource api_config_source;
     api_config_source.set_api_type(envoy::config::core::v3::ApiConfigSource::REST);
     api_config_source.add_cluster_names("foo");
-    EXPECT_THROW_WITH_REGEX(
-        Utility::factoryForGrpcApiConfigSource(async_client_manager, api_config_source, scope),
-        EnvoyException, "envoy::api::v2::core::ConfigSource type must be gRPC:");
+    EXPECT_THROW_WITH_REGEX(Utility::factoryForGrpcApiConfigSource(async_client_manager,
+                                                                   api_config_source, scope, false),
+                            EnvoyException,
+                            fmt::format("{} type must be gRPC:", api_config_source.GetTypeName()));
   }
 
   {
@@ -224,22 +242,23 @@ TEST(UtilityTest, FactoryForGrpcApiConfigSource) {
     envoy::config::core::v3::GrpcService expected_grpc_service;
     expected_grpc_service.mutable_envoy_grpc()->set_cluster_name("foo");
     EXPECT_CALL(async_client_manager,
-                factoryForGrpcService(ProtoEq(expected_grpc_service), Ref(scope), _));
-    Utility::factoryForGrpcApiConfigSource(async_client_manager, api_config_source, scope);
+                factoryForGrpcService(ProtoEq(expected_grpc_service), Ref(scope), false));
+    Utility::factoryForGrpcApiConfigSource(async_client_manager, api_config_source, scope, false);
   }
 
   {
     envoy::config::core::v3::ApiConfigSource api_config_source;
     api_config_source.set_api_type(envoy::config::core::v3::ApiConfigSource::GRPC);
     api_config_source.add_grpc_services()->mutable_envoy_grpc()->set_cluster_name("foo");
-    EXPECT_CALL(async_client_manager,
-                factoryForGrpcService(ProtoEq(api_config_source.grpc_services(0)), Ref(scope), _));
-    Utility::factoryForGrpcApiConfigSource(async_client_manager, api_config_source, scope);
+    EXPECT_CALL(
+        async_client_manager,
+        factoryForGrpcService(ProtoEq(api_config_source.grpc_services(0)), Ref(scope), true));
+    Utility::factoryForGrpcApiConfigSource(async_client_manager, api_config_source, scope, true);
   }
 }
 
 TEST(UtilityTest, PrepareDnsRefreshStrategy) {
-  NiceMock<Runtime::MockRandomGenerator> random;
+  NiceMock<Random::MockRandomGenerator> random;
 
   {
     // dns_failure_refresh_rate not set.
@@ -258,7 +277,7 @@ TEST(UtilityTest, PrepareDnsRefreshStrategy) {
     BackOffStrategyPtr strategy =
         Utility::prepareDnsRefreshStrategy<envoy::config::cluster::v3::Cluster>(cluster, 5000,
                                                                                 random);
-    EXPECT_NE(nullptr, dynamic_cast<JitteredBackOffStrategy*>(strategy.get()));
+    EXPECT_NE(nullptr, dynamic_cast<JitteredExponentialBackOffStrategy*>(strategy.get()));
   }
 
   {
@@ -282,8 +301,8 @@ TEST(UtilityTest, AnyWrongType) {
   typed_config.PackFrom(source_duration);
   ProtobufWkt::Timestamp out;
   EXPECT_THROW_WITH_REGEX(
-      Utility::translateOpaqueConfig(typed_config, ProtobufWkt::Struct(),
-                                     ProtobufMessage::getStrictValidationVisitor(), out),
+      Utility::translateOpaqueConfig(typed_config, ProtobufMessage::getStrictValidationVisitor(),
+                                     out),
       EnvoyException,
       R"(Unable to unpack as google.protobuf.Timestamp: \[type.googleapis.com/google.protobuf.Duration\] .*)");
 }
@@ -323,128 +342,104 @@ TEST(UtilityTest, TranslateAnyToFactoryConfig) {
   EXPECT_THAT(*config, ProtoEq(source_duration));
 }
 
-void packTypedStructIntoAny(ProtobufWkt::Any& typed_config, const Protobuf::Message& inner) {
-  udpa::type::v1::TypedStruct typed_struct;
-  (*typed_struct.mutable_type_url()) =
-      absl::StrCat("type.googleapis.com/", inner.GetDescriptor()->full_name());
-  MessageUtil::jsonConvert(inner, *typed_struct.mutable_value());
-  typed_config.PackFrom(typed_struct);
-}
+template <typename T> class UtilityTypedStructTest : public ::testing::Test {
+public:
+  static void packTypedStructIntoAny(ProtobufWkt::Any& typed_config,
+                                     const Protobuf::Message& inner) {
+    T typed_struct;
+    (*typed_struct.mutable_type_url()) =
+        absl::StrCat("type.googleapis.com/", inner.GetDescriptor()->full_name());
+    MessageUtil::jsonConvert(inner, *typed_struct.mutable_value());
+    typed_config.PackFrom(typed_struct);
+  }
+};
 
-// Verify that udpa.type.v1.TypedStruct can be translated into google.protobuf.Struct
-TEST(UtilityTest, TypedStructToStruct) {
+using TypedStructTypes = ::testing::Types<xds::type::v3::TypedStruct, udpa::type::v1::TypedStruct>;
+TYPED_TEST_SUITE(UtilityTypedStructTest, TypedStructTypes);
+
+// Verify that TypedStruct can be translated into google.protobuf.Struct
+TYPED_TEST(UtilityTypedStructTest, TypedStructToStruct) {
   ProtobufWkt::Any typed_config;
   ProtobufWkt::Struct untyped_struct;
   (*untyped_struct.mutable_fields())["foo"].set_string_value("bar");
-  packTypedStructIntoAny(typed_config, untyped_struct);
+  this->packTypedStructIntoAny(typed_config, untyped_struct);
 
   ProtobufWkt::Struct out;
-  Utility::translateOpaqueConfig(typed_config, ProtobufWkt::Struct(),
-                                 ProtobufMessage::getStrictValidationVisitor(), out);
+  Utility::translateOpaqueConfig(typed_config, ProtobufMessage::getStrictValidationVisitor(), out);
 
   EXPECT_THAT(out, ProtoEq(untyped_struct));
 }
 
-// Verify that regular Struct can be translated into an arbitrary message of correct type
+// Verify that TypedStruct can be translated into an arbitrary message of correct type
 // (v2 API, no upgrading).
-TEST(UtilityTest, StructToClusterV2) {
-  ProtobufWkt::Any typed_config;
-  API_NO_BOOST(envoy::api::v2::Cluster) cluster;
-  ProtobufWkt::Struct cluster_struct;
-  const std::string cluster_config_yaml = R"EOF(
-    drain_connections_on_host_removal: true
-  )EOF";
-  TestUtility::loadFromYaml(cluster_config_yaml, cluster);
-  TestUtility::loadFromYaml(cluster_config_yaml, cluster_struct);
-
-  {
-    API_NO_BOOST(envoy::api::v2::Cluster) out;
-    Utility::translateOpaqueConfig({}, cluster_struct, ProtobufMessage::getNullValidationVisitor(),
-                                   out);
-    EXPECT_THAT(out, ProtoEq(cluster));
-  }
-  {
-    API_NO_BOOST(envoy::api::v2::Cluster) out;
-    Utility::translateOpaqueConfig({}, cluster_struct,
-                                   ProtobufMessage::getStrictValidationVisitor(), out);
-    EXPECT_THAT(out, ProtoEq(cluster));
-  }
-}
-
-// Verify that regular Struct can be translated into an arbitrary message of correct type
-// (v3 API, upgrading).
-TEST(UtilityTest, StructToClusterV3) {
-  ProtobufWkt::Any typed_config;
-  API_NO_BOOST(envoy::config::cluster::v3::Cluster) cluster;
-  ProtobufWkt::Struct cluster_struct;
-  const std::string cluster_config_yaml = R"EOF(
-    ignore_health_on_host_removal: true
-  )EOF";
-  TestUtility::loadFromYaml(cluster_config_yaml, cluster);
-  TestUtility::loadFromYaml(cluster_config_yaml, cluster_struct);
-
-  {
-    API_NO_BOOST(envoy::config::cluster::v3::Cluster) out;
-    Utility::translateOpaqueConfig({}, cluster_struct, ProtobufMessage::getNullValidationVisitor(),
-                                   out);
-    EXPECT_THAT(out, ProtoEq(cluster));
-  }
-  {
-    API_NO_BOOST(envoy::config::cluster::v3::Cluster) out;
-    Utility::translateOpaqueConfig({}, cluster_struct,
-                                   ProtobufMessage::getStrictValidationVisitor(), out);
-    EXPECT_THAT(out, ProtoEq(cluster));
-  }
-}
-
-// Verify that udpa.type.v1.TypedStruct can be translated into an arbitrary message of correct type
-// (v2 API, no upgrading).
-TEST(UtilityTest, TypedStructToClusterV2) {
+TYPED_TEST(UtilityTypedStructTest, TypedStructToClusterV2) {
   ProtobufWkt::Any typed_config;
   API_NO_BOOST(envoy::api::v2::Cluster) cluster;
   const std::string cluster_config_yaml = R"EOF(
     drain_connections_on_host_removal: true
   )EOF";
   TestUtility::loadFromYaml(cluster_config_yaml, cluster);
-  packTypedStructIntoAny(typed_config, cluster);
+  this->packTypedStructIntoAny(typed_config, cluster);
 
   {
     API_NO_BOOST(envoy::api::v2::Cluster) out;
-    Utility::translateOpaqueConfig(typed_config, ProtobufWkt::Struct(),
-                                   ProtobufMessage::getNullValidationVisitor(), out);
+    Utility::translateOpaqueConfig(typed_config, ProtobufMessage::getNullValidationVisitor(), out);
     EXPECT_THAT(out, ProtoEq(cluster));
   }
   {
     API_NO_BOOST(envoy::api::v2::Cluster) out;
-    Utility::translateOpaqueConfig(typed_config, ProtobufWkt::Struct(),
-                                   ProtobufMessage::getStrictValidationVisitor(), out);
+    Utility::translateOpaqueConfig(typed_config, ProtobufMessage::getStrictValidationVisitor(),
+                                   out);
     EXPECT_THAT(out, ProtoEq(cluster));
   }
 }
 
-// Verify that udpa.type.v1.TypedStruct can be translated into an arbitrary message of correct type
+// Verify that TypedStruct can be translated into an arbitrary message of correct type
 // (v3 API, upgrading).
-TEST(UtilityTest, TypedStructToClusterV3) {
+TYPED_TEST(UtilityTypedStructTest, TypedStructToClusterV3) {
   ProtobufWkt::Any typed_config;
   API_NO_BOOST(envoy::config::cluster::v3::Cluster) cluster;
   const std::string cluster_config_yaml = R"EOF(
     ignore_health_on_host_removal: true
   )EOF";
   TestUtility::loadFromYaml(cluster_config_yaml, cluster);
-  packTypedStructIntoAny(typed_config, cluster);
+  this->packTypedStructIntoAny(typed_config, cluster);
 
   {
     API_NO_BOOST(envoy::config::cluster::v3::Cluster) out;
-    Utility::translateOpaqueConfig(typed_config, ProtobufWkt::Struct(),
-                                   ProtobufMessage::getNullValidationVisitor(), out);
+    Utility::translateOpaqueConfig(typed_config, ProtobufMessage::getNullValidationVisitor(), out);
     EXPECT_THAT(out, ProtoEq(cluster));
   }
   {
     API_NO_BOOST(envoy::config::cluster::v3::Cluster) out;
-    Utility::translateOpaqueConfig(typed_config, ProtobufWkt::Struct(),
-                                   ProtobufMessage::getStrictValidationVisitor(), out);
+    Utility::translateOpaqueConfig(typed_config, ProtobufMessage::getStrictValidationVisitor(),
+                                   out);
     EXPECT_THAT(out, ProtoEq(cluster));
   }
+}
+
+// Verify that translation from TypedStruct into message of incorrect type fails
+TYPED_TEST(UtilityTypedStructTest, TypedStructToInvalidType) {
+  ProtobufWkt::Any typed_config;
+  envoy::config::bootstrap::v3::Bootstrap bootstrap;
+  const std::string bootstrap_config_yaml = R"EOF(
+    admin:
+      access_log:
+      - name: envoy.access_loggers.file
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+          path: /dev/null
+      address:
+        pipe:
+          path: "/"
+  )EOF";
+  TestUtility::loadFromYaml(bootstrap_config_yaml, bootstrap);
+  this->packTypedStructIntoAny(typed_config, bootstrap);
+
+  ProtobufWkt::Any out;
+  EXPECT_THROW_WITH_REGEX(Utility::translateOpaqueConfig(
+                              typed_config, ProtobufMessage::getStrictValidationVisitor(), out),
+                          EnvoyException, "Unable to parse JSON as proto");
 }
 
 // Verify that Any can be translated into an arbitrary message of correct type
@@ -459,8 +454,7 @@ TEST(UtilityTest, AnyToClusterV2) {
   typed_config.PackFrom(cluster);
 
   API_NO_BOOST(envoy::api::v2::Cluster) out;
-  Utility::translateOpaqueConfig(typed_config, ProtobufWkt::Struct(),
-                                 ProtobufMessage::getStrictValidationVisitor(), out);
+  Utility::translateOpaqueConfig(typed_config, ProtobufMessage::getStrictValidationVisitor(), out);
   EXPECT_THAT(out, ProtoEq(cluster));
 }
 
@@ -476,30 +470,8 @@ TEST(UtilityTest, AnyToClusterV3) {
   typed_config.PackFrom(cluster);
 
   API_NO_BOOST(envoy::config::cluster::v3::Cluster) out;
-  Utility::translateOpaqueConfig(typed_config, ProtobufWkt::Struct(),
-                                 ProtobufMessage::getStrictValidationVisitor(), out);
+  Utility::translateOpaqueConfig(typed_config, ProtobufMessage::getStrictValidationVisitor(), out);
   EXPECT_THAT(out, ProtoEq(cluster));
-}
-
-// Verify that translation from udpa.type.v1.TypedStruct into message of incorrect type fails
-TEST(UtilityTest, TypedStructToInvalidType) {
-  ProtobufWkt::Any typed_config;
-  envoy::config::bootstrap::v3::Bootstrap bootstrap;
-  const std::string bootstrap_config_yaml = R"EOF(
-    admin:
-      access_log_path: /dev/null
-      address:
-        pipe:
-          path: "/"
-  )EOF";
-  TestUtility::loadFromYaml(bootstrap_config_yaml, bootstrap);
-  packTypedStructIntoAny(typed_config, bootstrap);
-
-  ProtobufWkt::Any out;
-  EXPECT_THROW_WITH_REGEX(
-      Utility::translateOpaqueConfig(typed_config, ProtobufWkt::Struct(),
-                                     ProtobufMessage::getStrictValidationVisitor(), out),
-      EnvoyException, "Unable to parse JSON as proto");
 }
 
 // Verify that ProtobufWkt::Empty can load into a typed factory with an empty config proto
@@ -509,108 +481,124 @@ TEST(UtilityTest, EmptyToEmptyConfig) {
   typed_config.PackFrom(empty_config);
 
   envoy::extensions::filters::http::cors::v3::Cors out;
-  Utility::translateOpaqueConfig(typed_config, ProtobufWkt::Struct(),
-                                 ProtobufMessage::getStrictValidationVisitor(), out);
+  Utility::translateOpaqueConfig(typed_config, ProtobufMessage::getStrictValidationVisitor(), out);
   EXPECT_THAT(out, ProtoEq(envoy::extensions::filters::http::cors::v3::Cors()));
 }
 
 TEST(CheckApiConfigSourceSubscriptionBackingClusterTest, GrpcClusterTestAcrossTypes) {
   envoy::config::core::v3::ConfigSource config;
   auto* api_config_source = config.mutable_api_config_source();
-  Upstream::ClusterManager::ClusterInfoMap cluster_map;
+  Upstream::ClusterManager::ClusterSet primary_clusters;
 
   // API of type GRPC
   api_config_source->set_api_type(envoy::config::core::v3::ApiConfigSource::GRPC);
 
   // GRPC cluster without GRPC services.
   EXPECT_THROW_WITH_REGEX(
-      Utility::checkApiConfigSourceSubscriptionBackingCluster(cluster_map, *api_config_source),
+      Utility::checkApiConfigSourceSubscriptionBackingCluster(primary_clusters, *api_config_source),
       EnvoyException, "API configs must have either a gRPC service or a cluster name defined:");
 
   // Non-existent cluster.
   api_config_source->add_grpc_services()->mutable_envoy_grpc()->set_cluster_name("foo_cluster");
   EXPECT_THROW_WITH_MESSAGE(
-      Utility::checkApiConfigSourceSubscriptionBackingCluster(cluster_map, *api_config_source),
+      Utility::checkApiConfigSourceSubscriptionBackingCluster(primary_clusters, *api_config_source),
       EnvoyException,
-      "envoy::api::v2::core::ConfigSource must have a statically defined non-EDS cluster: "
-      "'foo_cluster' does not exist, was added via api, or is an EDS cluster");
-
-  // Dynamic Cluster.
-  Upstream::MockClusterMockPrioritySet cluster;
-  cluster_map.emplace("foo_cluster", cluster);
-  EXPECT_CALL(cluster, info());
-  EXPECT_CALL(*cluster.info_, addedViaApi()).WillOnce(Return(true));
-  EXPECT_THROW_WITH_MESSAGE(
-      Utility::checkApiConfigSourceSubscriptionBackingCluster(cluster_map, *api_config_source),
-      EnvoyException,
-      "envoy::api::v2::core::ConfigSource must have a statically defined non-EDS cluster: "
-      "'foo_cluster' does not exist, was added via api, or is an EDS cluster");
-
-  // EDS Cluster backing EDS Cluster.
-  EXPECT_CALL(cluster, info()).Times(2);
-  EXPECT_CALL(*cluster.info_, addedViaApi());
-  EXPECT_CALL(*cluster.info_, type()).WillOnce(Return(envoy::config::cluster::v3::Cluster::EDS));
-  EXPECT_THROW_WITH_MESSAGE(
-      Utility::checkApiConfigSourceSubscriptionBackingCluster(cluster_map, *api_config_source),
-      EnvoyException,
-      "envoy::api::v2::core::ConfigSource must have a statically defined non-EDS cluster: "
-      "'foo_cluster' does not exist, was added via api, or is an EDS cluster");
+      fmt::format("{} must have a statically defined non-EDS cluster: "
+                  "'foo_cluster' does not exist, was added via api, or is an EDS cluster",
+                  api_config_source->GetTypeName()));
 
   // All ok.
-  EXPECT_CALL(cluster, info()).Times(2);
-  EXPECT_CALL(*cluster.info_, addedViaApi());
-  EXPECT_CALL(*cluster.info_, type());
-  Utility::checkApiConfigSourceSubscriptionBackingCluster(cluster_map, *api_config_source);
+  primary_clusters.insert("foo_cluster");
+  Utility::checkApiConfigSourceSubscriptionBackingCluster(primary_clusters, *api_config_source);
 
   // API with cluster_names set should be rejected.
   api_config_source->add_cluster_names("foo_cluster");
   EXPECT_THROW_WITH_REGEX(
-      Utility::checkApiConfigSourceSubscriptionBackingCluster(cluster_map, *api_config_source),
+      Utility::checkApiConfigSourceSubscriptionBackingCluster(primary_clusters, *api_config_source),
       EnvoyException,
-      "envoy::api::v2::core::ConfigSource::.DELTA_.GRPC must not have a cluster name "
-      "specified:");
+      fmt::format("{}::.DELTA_.GRPC must not have a cluster name "
+                  "specified:",
+                  api_config_source->GetTypeName()));
 }
 
 TEST(CheckApiConfigSourceSubscriptionBackingClusterTest, RestClusterTestAcrossTypes) {
   envoy::config::core::v3::ConfigSource config;
   auto* api_config_source = config.mutable_api_config_source();
-  Upstream::ClusterManager::ClusterInfoMap cluster_map;
+  Upstream::ClusterManager::ClusterSet primary_clusters;
   api_config_source->set_api_type(envoy::config::core::v3::ApiConfigSource::REST);
 
   // Non-existent cluster.
   api_config_source->add_cluster_names("foo_cluster");
   EXPECT_THROW_WITH_MESSAGE(
-      Utility::checkApiConfigSourceSubscriptionBackingCluster(cluster_map, *api_config_source),
+      Utility::checkApiConfigSourceSubscriptionBackingCluster(primary_clusters, *api_config_source),
       EnvoyException,
-      "envoy::api::v2::core::ConfigSource must have a statically defined non-EDS cluster: "
-      "'foo_cluster' does not exist, was added via api, or is an EDS cluster");
-
-  // Dynamic Cluster.
-  Upstream::MockClusterMockPrioritySet cluster;
-  cluster_map.emplace("foo_cluster", cluster);
-  EXPECT_CALL(cluster, info());
-  EXPECT_CALL(*cluster.info_, addedViaApi()).WillOnce(Return(true));
-  EXPECT_THROW_WITH_MESSAGE(
-      Utility::checkApiConfigSourceSubscriptionBackingCluster(cluster_map, *api_config_source),
-      EnvoyException,
-      "envoy::api::v2::core::ConfigSource must have a statically defined non-EDS cluster: "
-      "'foo_cluster' does not exist, was added via api, or is an EDS cluster");
-
-  // EDS Cluster backing EDS Cluster.
-  EXPECT_CALL(cluster, info()).Times(2);
-  EXPECT_CALL(*cluster.info_, addedViaApi());
-  EXPECT_CALL(*cluster.info_, type()).WillOnce(Return(envoy::config::cluster::v3::Cluster::EDS));
-  EXPECT_THROW_WITH_MESSAGE(
-      Utility::checkApiConfigSourceSubscriptionBackingCluster(cluster_map, *api_config_source),
-      EnvoyException,
-      "envoy::api::v2::core::ConfigSource must have a statically defined non-EDS cluster: "
-      "'foo_cluster' does not exist, was added via api, or is an EDS cluster");
+      fmt::format("{} must have a statically defined non-EDS cluster: "
+                  "'foo_cluster' does not exist, was added via api, or is an EDS cluster",
+                  api_config_source->GetTypeName()));
 
   // All ok.
-  EXPECT_CALL(cluster, info()).Times(2);
-  EXPECT_CALL(*cluster.info_, addedViaApi());
-  EXPECT_CALL(*cluster.info_, type());
-  Utility::checkApiConfigSourceSubscriptionBackingCluster(cluster_map, *api_config_source);
+  primary_clusters.insert("foo_cluster");
+  Utility::checkApiConfigSourceSubscriptionBackingCluster(primary_clusters, *api_config_source);
+}
+
+// Validates CheckCluster functionality.
+TEST(UtilityTest, CheckCluster) {
+  NiceMock<Upstream::MockClusterManager> cm;
+
+  // Validate that proper error is thrown, when cluster is not available.
+  EXPECT_THROW_WITH_MESSAGE(Utility::checkCluster("prefix", "foo", cm, false), EnvoyException,
+                            "prefix: unknown cluster 'foo'");
+
+  // Validate that proper error is thrown, when dynamic cluster is passed when it is not expected.
+  cm.initializeClusters({"foo"}, {});
+  ON_CALL(*cm.active_clusters_["foo"]->info_, addedViaApi()).WillByDefault(Return(true));
+  EXPECT_THROW_WITH_MESSAGE(Utility::checkCluster("prefix", "foo", cm, false), EnvoyException,
+                            "prefix: invalid cluster 'foo': currently only "
+                            "static (non-CDS) clusters are supported");
+  EXPECT_NO_THROW(Utility::checkCluster("prefix", "foo", cm, true));
+
+  // Validate that bootstrap cluster does not throw any exceptions.
+  ON_CALL(*cm.active_clusters_["foo"]->info_, addedViaApi()).WillByDefault(Return(false));
+  EXPECT_NO_THROW(Utility::checkCluster("prefix", "foo", cm, true));
+  EXPECT_NO_THROW(Utility::checkCluster("prefix", "foo", cm, false));
+}
+
+// Validates getGrpcControlPlane() functionality.
+TEST(UtilityTest, GetGrpcControlPlane) {
+  {
+    // Google gRPC.
+    envoy::config::core::v3::ApiConfigSource api_config_source;
+    const std::string config_yaml = R"EOF(
+      api_type: GRPC
+      grpc_services:
+        google_grpc:
+          target_uri: trafficdirector.googleapis.com
+    )EOF";
+    TestUtility::loadFromYaml(config_yaml, api_config_source);
+    EXPECT_THAT(Utility::getGrpcControlPlane(api_config_source),
+                Optional(Eq("trafficdirector.googleapis.com")));
+  }
+  {
+    // Envoy gRPC.
+    envoy::config::core::v3::ApiConfigSource api_config_source;
+    const std::string config_yaml = R"EOF(
+      api_type: GRPC
+      grpc_services:
+        envoy_grpc:
+          cluster_name: some_xds_cluster
+    )EOF";
+    TestUtility::loadFromYaml(config_yaml, api_config_source);
+    EXPECT_THAT(Utility::getGrpcControlPlane(api_config_source), Optional(Eq("some_xds_cluster")));
+  }
+  {
+    // No control plane.
+    envoy::config::core::v3::ApiConfigSource api_config_source;
+    const std::string config_yaml = R"EOF(
+      api_type: GRPC
+    )EOF";
+    TestUtility::loadFromYaml(config_yaml, api_config_source);
+    EXPECT_EQ(absl::nullopt, Utility::getGrpcControlPlane(api_config_source));
+  }
 }
 
 } // namespace

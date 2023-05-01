@@ -1,7 +1,6 @@
 #pragma once
 
 #include <string>
-#include <unordered_map>
 
 #include "envoy/access_log/access_log.h"
 #include "envoy/api/api.h"
@@ -10,9 +9,11 @@
 #include "envoy/stats/stats_macros.h"
 #include "envoy/stats/store.h"
 
-#include "common/buffer/buffer_impl.h"
-#include "common/common/logger.h"
-#include "common/common/thread.h"
+#include "source/common/buffer/buffer_impl.h"
+#include "source/common/common/logger.h"
+#include "source/common/common/thread.h"
+
+#include "absl/container/node_hash_map.h"
 
 namespace Envoy {
 
@@ -43,7 +44,7 @@ public:
 
   // AccessLog::AccessLogManager
   void reopen() override;
-  AccessLogFileSharedPtr createAccessLog(const std::string& file_name) override;
+  AccessLogFileSharedPtr createAccessLog(const Filesystem::FilePathAndType& file_info) override;
 
 private:
   const std::chrono::milliseconds file_flush_interval_msec_;
@@ -51,7 +52,7 @@ private:
   Event::Dispatcher& dispatcher_;
   Thread::BasicLockable& lock_;
   AccessLogFileStats file_stats_;
-  std::unordered_map<std::string, AccessLogFileSharedPtr> access_logs_;
+  absl::node_hash_map<std::string, AccessLogFileSharedPtr> access_logs_;
 };
 
 /**
@@ -83,7 +84,7 @@ public:
 private:
   void doWrite(Buffer::Instance& buffer);
   void flushThreadFunc();
-  void open();
+  Api::IoCallBoolResult open();
   void createFlushStructures();
 
   // return default flags set which used by open
