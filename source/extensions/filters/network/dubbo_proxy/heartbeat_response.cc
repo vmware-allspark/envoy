@@ -1,4 +1,4 @@
-#include "extensions/filters/network/dubbo_proxy/heartbeat_response.h"
+#include "source/extensions/filters/network/dubbo_proxy/heartbeat_response.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -8,8 +8,8 @@ namespace DubboProxy {
 DubboFilters::DirectResponse::ResponseType
 HeartbeatResponse::encode(MessageMetadata& metadata, DubboProxy::Protocol& protocol,
                           Buffer::Instance& buffer) const {
-  ASSERT(metadata.response_status() == ResponseStatus::Ok);
-  ASSERT(metadata.message_type() == MessageType::HeartbeatResponse);
+  ASSERT(metadata.responseStatus() == ResponseStatus::Ok);
+  ASSERT(metadata.messageType() == MessageType::HeartbeatResponse);
 
   if (!protocol.encode(buffer, metadata, "")) {
     throw EnvoyException("failed to encode heartbeat message");

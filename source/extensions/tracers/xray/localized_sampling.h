@@ -5,12 +5,11 @@
 #include <vector>
 
 #include "envoy/common/time.h"
-#include "envoy/runtime/runtime.h"
 
-#include "common/common/logger.h"
-
-#include "extensions/tracers/xray/reservoir.h"
-#include "extensions/tracers/xray/sampling_strategy.h"
+#include "source/common/common/logger.h"
+#include "source/common/common/random_generator.h"
+#include "source/extensions/tracers/xray/reservoir.h"
+#include "source/extensions/tracers/xray/sampling_strategy.h"
 
 #include "absl/strings/string_view.h"
 
@@ -74,13 +73,7 @@ public:
    * Set the percentage of requests to sample _after_ sampling |fixed_target| requests per second.
    */
   void setRate(double rate) { rate_ = rate; }
-
-  const std::string& host() const { return host_; }
-  const std::string& httpMethod() const { return http_method_; }
-  const std::string& urlPath() const { return url_path_; }
-  uint32_t fixedTarget() const { return fixed_target_; }
   double rate() const { return rate_; }
-  const Reservoir& reservoir() const { return reservoir_; }
   Reservoir& reservoir() { return reservoir_; }
 
 private:
@@ -132,7 +125,7 @@ public:
   std::vector<LocalizedSamplingRule>& customRules() { return custom_rules_; }
 
   /**
-   * @return true if the this manifest has a set of custom rules; otherwise false.
+   * @return true if this manifest has a set of custom rules; otherwise false.
    */
   bool hasCustomRules() const { return !custom_rules_.empty(); }
 
@@ -143,30 +136,23 @@ private:
 
 class LocalizedSamplingStrategy : public SamplingStrategy {
 public:
-  LocalizedSamplingStrategy(const std::string& sampling_rules_json, Runtime::RandomGenerator& rng,
+  LocalizedSamplingStrategy(const std::string& sampling_rules_json, Random::RandomGenerator& rng,
                             TimeSource& time_source)
-      : SamplingStrategy(rng), default_manifest_(LocalizedSamplingManifest::createDefault()),
-        custom_manifest_(sampling_rules_json), time_source_(time_source),
-        use_default_(!custom_manifest_.hasCustomRules()) {}
+      : SamplingStrategy(rng), manifest_(sampling_rules_json), time_source_(time_source) {}
 
   /**
-   * Determines if an incoming request matches one of the sampling rules in the local manifests.
+   * Determines if an incoming request matches one of the sampling rules in the local manifest.
    * If a match is found, then the request might be traced based on the sampling percentages etc.
    * determined by the matching rule.
    */
   bool shouldTrace(const SamplingRequest& sampling_request) override;
 
-  /**
-   * Determines whether default rules are in effect. Mainly for unit testing purposes.
-   */
-  bool usingDefaultManifest() const { return use_default_; }
+  const LocalizedSamplingManifest manifest() const { return manifest_; }
 
 private:
   bool shouldTrace(LocalizedSamplingRule& rule);
-  LocalizedSamplingManifest default_manifest_;
-  LocalizedSamplingManifest custom_manifest_;
+  LocalizedSamplingManifest manifest_;
   TimeSource& time_source_;
-  bool use_default_;
 };
 
 } // namespace XRay

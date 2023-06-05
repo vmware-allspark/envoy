@@ -23,28 +23,16 @@ Configuration
 The ZooKeeper proxy filter should be chained with the TCP proxy filter as shown
 in the configuration snippet below:
 
-.. code-block:: yaml
-
-  filter_chains:
-  - filters:
-    - name: envoy.filters.network.zookeeper_proxy
-      typed_config:
-        "@type": type.googleapis.com/envoy.config.filter.network.zookeeper_proxy.v1alpha1.ZooKeeperProxy
-        stat_prefix: zookeeper
-    - name: envoy.filters.network.tcp_proxy
-      typed_config:
-        "@type": type.googleapis.com/envoy.config.filter.network.tcp_proxy.v2.TcpProxy
-        stat_prefix: tcp
-        cluster: ...
-
+.. literalinclude:: _include/zookeeper-filter-proxy.yaml
+    :language: yaml
 
 .. _config_network_filters_zookeeper_proxy_stats:
 
 Statistics
 ----------
 
-Every configured ZooKeeper proxy filter has statistics rooted at *zookeeper.<stat_prefix>.* with the
-following statistics:
+Every configured ZooKeeper proxy filter has statistics rooted at *<stat_prefix>.zookeeper.*. The
+following counters are available:
 
 .. csv-table::
   :header: Name, Type, Description
@@ -102,6 +90,48 @@ following statistics:
   checkwatches_resp, Counter, Number of checkwatches responses
   removewatches_resp, Counter, Number of removewatches responses
   check_resp, Counter, Number of check responses
+
+
+.. _config_network_filters_zookeeper_proxy_latency_stats:
+
+Per opcode latency statistics
+-----------------------------
+
+The filter will gather latency statistics in the *<stat_prefix>.zookeeper.<opcode>_response_latency* namespace.
+Latency stats are in milliseconds:
+
+.. csv-table::
+  :header: Name, Type, Description
+  :widths: 1, 1, 2
+
+  connect_response_latency, Histogram, Opcode execution time in milliseconds
+  ping_response_latency, Histogram, Opcode execution time in milliseconds
+  auth_response_latency, Histogram, Opcode execution time in milliseconds
+  watch_event, Histogram, Opcode execution time in milliseconds
+  getdata_response_latency, Histogram, Opcode execution time in milliseconds
+  create_response_latency, Histogram, Opcode execution time in milliseconds
+  create2_response_latency, Histogram, Opcode execution time in milliseconds
+  createcontainer_response_latency, Histogram, Opcode execution time in milliseconds
+  createttl_response_latency, Histogram, Opcode execution time in milliseconds
+  setdata_response_latency, Histogram, Opcode execution time in milliseconds
+  getchildren_response_latency, Histogram, Opcode execution time in milliseconds
+  getchildren2_response_latency, Histogram, Opcode execution time in milliseconds
+  getephemerals_response_latency, Histogram, Opcode execution time in milliseconds
+  getallchildrennumber_response_latency, Histogram, Opcode execution time in milliseconds
+  remove_response_latency, Histogram, Opcode execution time in milliseconds
+  exists_response_latency, Histogram, Opcode execution time in milliseconds
+  getacl_response_latency, Histogram, Opcode execution time in milliseconds
+  setacl_response_latency, Histogram, Opcode execution time in milliseconds
+  sync_response_latency, Histogram, Opcode execution time in milliseconds
+  multi_response_latency, Histogram, Opcode execution time in milliseconds
+  reconfig_response_latency, Histogram, Opcode execution time in milliseconds
+  close_response_latency, Histogram, Opcode execution time in milliseconds
+  setauth_response_latency, Histogram, Opcode execution time in milliseconds
+  setwatches_response_latency, Histogram, Opcode execution time in milliseconds
+  checkwatches_response_latency, Histogram, Opcode execution time in milliseconds
+  removewatches_response_latency, Histogram, Opcode execution time in milliseconds
+  check_response_latency, Histogram, Opcode execution time in milliseconds
+
 
 .. _config_network_filters_zookeeper_proxy_dynamic_metadata:
 

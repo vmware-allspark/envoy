@@ -1,4 +1,4 @@
-#include "common/config/pausable_ack_queue.h"
+#include "source/common/config/pausable_ack_queue.h"
 
 #include "gtest/gtest.h"
 
@@ -47,6 +47,15 @@ TEST(PausableAckQueueTest, TestPauseResume) {
   EXPECT_EQ(4, p.size());
 
   // validate that both front() and popFront() honor pause state
+  EXPECT_EQ("nonce2", p.front().nonce_);
+  EXPECT_EQ("type2", p.front().type_url_);
+
+  // validate the above result is invariant even if we nest pauses.
+  p.pause("type1");
+  EXPECT_EQ(4, p.size());
+  EXPECT_EQ("nonce2", p.front().nonce_);
+  EXPECT_EQ("type2", p.front().type_url_);
+  p.resume("type1");
   EXPECT_EQ("nonce2", p.front().nonce_);
   EXPECT_EQ("type2", p.front().type_url_);
 

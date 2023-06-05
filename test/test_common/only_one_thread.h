@@ -1,7 +1,7 @@
 #pragma once
 
-#include "common/common/assert.h"
-#include "common/common/thread.h"
+#include "source/common/common/assert.h"
+#include "source/common/common/thread.h"
 
 namespace Envoy {
 namespace Thread {
@@ -20,7 +20,7 @@ public:
 
 private:
   ThreadFactory& thread_factory_;
-  ThreadId thread_advancing_time_ GUARDED_BY(mutex_);
+  ThreadId thread_advancing_time_ ABSL_GUARDED_BY(mutex_);
   mutable MutexBasicLockable mutex_;
 };
 

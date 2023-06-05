@@ -4,8 +4,8 @@
 #include <list>
 #include <string>
 
-#include "extensions/filters/network/common/redis/client_impl.h"
-#include "extensions/filters/network/common/redis/codec_impl.h"
+#include "source/extensions/filters/network/common/redis/client_impl.h"
+#include "source/extensions/filters/network/common/redis/codec_impl.h"
 
 #include "test/test_common/printers.h"
 
@@ -87,7 +87,7 @@ public:
   MOCK_METHOD(void, close, ());
   MOCK_METHOD(PoolRequest*, makeRequest_,
               (const Common::Redis::RespValue& request, ClientCallbacks& callbacks));
-  MOCK_METHOD(void, initialize, (const std::string& password));
+  MOCK_METHOD(void, initialize, (const std::string& username, const std::string& password));
 
   std::list<Network::ConnectionCallbacks*> callbacks_;
   std::list<ClientCallbacks*> client_callbacks_;
@@ -99,14 +99,14 @@ public:
   ~MockClientCallbacks() override;
 
   void onResponse(Common::Redis::RespValuePtr&& value) override { onResponse_(value); }
-  bool onRedirection(Common::Redis::RespValuePtr&& value, const std::string& host_address,
+  void onRedirection(Common::Redis::RespValuePtr&& value, const std::string& host_address,
                      bool ask_redirection) override {
-    return onRedirection_(value, host_address, ask_redirection);
+    onRedirection_(value, host_address, ask_redirection);
   }
 
   MOCK_METHOD(void, onResponse_, (Common::Redis::RespValuePtr & value));
   MOCK_METHOD(void, onFailure, ());
-  MOCK_METHOD(bool, onRedirection_,
+  MOCK_METHOD(void, onRedirection_,
               (Common::Redis::RespValuePtr & value, const std::string& host_address,
                bool ask_redirection));
 };

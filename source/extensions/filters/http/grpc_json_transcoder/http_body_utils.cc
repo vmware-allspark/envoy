@@ -1,23 +1,70 @@
-#include "extensions/filters/http/grpc_json_transcoder/http_body_utils.h"
+#include "source/extensions/filters/http/grpc_json_transcoder/http_body_utils.h"
 
 #include "google/api/httpbody.pb.h"
 
+using Envoy::Protobuf::io::CodedInputStream;
 using Envoy::Protobuf::io::CodedOutputStream;
 using Envoy::Protobuf::io::StringOutputStream;
+using Envoy::Protobuf::io::ZeroCopyInputStream;
 
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
 namespace GrpcJsonTranscoder {
 
+namespace {
+
+// Embedded messages are treated the same way as strings (wire type 2).
+constexpr uint32_t ProtobufLengthDelimitedField = 2;
+
+bool parseMessageByFieldPath(CodedInputStream* input,
+                             absl::Span<const ProtobufWkt::Field* const> field_path,
+                             Protobuf::Message* message) {
+  if (field_path.empty()) {
+    return message->MergeFromCodedStream(input);
+  }
+
+  const uint32_t expected_tag = (field_path.front()->number() << 3) | ProtobufLengthDelimitedField;
+  for (;;) {
+    const uint32_t tag = input->ReadTag();
+    if (tag == expected_tag) {
+      uint32_t length = 0;
+      if (!input->ReadVarint32(&length)) {
+        return false;
+      }
+      auto limit = input->IncrementRecursionDepthAndPushLimit(length);
+      if (!parseMessageByFieldPath(input, field_path.subspan(1), message)) {
+        return false;
+      }
+      if (!input->DecrementRecursionDepthAndPopLimit(limit.first)) {
+        return false;
+      }
+    } else if (tag == 0) {
+      return true;
+    } else {
+      if (!Protobuf::internal::WireFormatLite::SkipField(input, tag)) {
+        return false;
+      }
+    }
+  }
+}
+} // namespace
+
+bool HttpBodyUtils::parseMessageByFieldPath(
+    ZeroCopyInputStream* stream, const std::vector<const ProtobufWkt::Field*>& field_path,
+    Protobuf::Message* message) {
+  CodedInputStream input(stream);
+  input.SetRecursionLimit(field_path.size());
+
+  return GrpcJsonTranscoder::parseMessageByFieldPath(&input, absl::MakeConstSpan(field_path),
+                                                     message);
+}
+
 void HttpBodyUtils::appendHttpBodyEnvelope(
-    Buffer::Instance& output, const std::vector<const Protobuf::Field*>& request_body_field_path,
+    Buffer::Instance& output, const std::vector<const ProtobufWkt::Field*>& request_body_field_path,
     std::string content_type, uint64_t content_length) {
   // Manually encode the protobuf envelope for the body.
   // See https://developers.google.com/protocol-buffers/docs/encoding#embedded for wire format.
-
-  // Embedded messages are treated the same way as strings (wire type 2).
-  constexpr uint32_t ProtobufLengthDelimitedField = 2;
 
   std::string proto_envelope;
   {
@@ -36,7 +83,7 @@ void HttpBodyUtils::appendHttpBodyEnvelope(
     std::vector<uint32_t> message_sizes;
     message_sizes.reserve(request_body_field_path.size());
     for (auto it = request_body_field_path.rbegin(); it != request_body_field_path.rend(); ++it) {
-      const Protobuf::Field* field = *it;
+      const ProtobufWkt::Field* field = *it;
       const uint64_t message_size = envelope_size + content_length;
       const uint32_t field_number = (field->number() << 3) | ProtobufLengthDelimitedField;
       const uint64_t field_size = CodedOutputStream::VarintSize32(field_number) +
@@ -53,7 +100,7 @@ void HttpBodyUtils::appendHttpBodyEnvelope(
 
     // Serialize body field definition manually to avoid the copy of the body.
     for (size_t i = 0; i < request_body_field_path.size(); ++i) {
-      const Protobuf::Field* field = request_body_field_path[i];
+      const ProtobufWkt::Field* field = request_body_field_path[i];
       const uint32_t field_number = (field->number() << 3) | ProtobufLengthDelimitedField;
       const uint64_t message_size = message_sizes[i];
       coded_stream.WriteTag(field_number);

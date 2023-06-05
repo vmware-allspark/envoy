@@ -1,10 +1,9 @@
 #include <string>
 
-#include "common/buffer/buffer_impl.h"
-#include "common/json/json_loader.h"
-
-#include "extensions/filters/network/mongo_proxy/bson_impl.h"
-#include "extensions/filters/network/mongo_proxy/codec_impl.h"
+#include "source/common/buffer/buffer_impl.h"
+#include "source/common/json/json_loader.h"
+#include "source/extensions/filters/network/mongo_proxy/bson_impl.h"
+#include "source/extensions/filters/network/mongo_proxy/codec_impl.h"
 
 #include "test/test_common/printers.h"
 
@@ -332,10 +331,12 @@ TEST_F(MongoCodecImplTest, QueryToStringWithEscape) {
   query.numberToReturn(-1);
   query.query(Bson::DocumentImpl::create()->addString("string_need_esc", "{\"foo\": \"bar\n\"}"));
 
-  EXPECT_EQ(R"EOF({"opcode": "OP_QUERY", "id": 1, "response_to": 1, "flags": "0x4", )EOF"
-            R"EOF("collection": "test", "skip": 20, "return": -1, "query": )EOF"
-            R"EOF({"string_need_esc": "{\"foo\": \"bar\n\"}"}, "fields": {}})EOF",
-            query.toString(true));
+  const std::string expectedQuery =
+      R"EOF({"opcode": "OP_QUERY", "id": 1, "response_to": 1, "flags": "0x4", )EOF"
+      R"EOF("collection": "test", "skip": 20, "return": -1, "query": )EOF"
+      R"EOF({"string_need_esc": "{\"foo\": \"bar\n\"}"}, "fields": {}})EOF";
+
+  EXPECT_EQ(query.toString(true), expectedQuery);
 
   EXPECT_NO_THROW(Json::Factory::loadFromString(query.toString(true)));
   EXPECT_NO_THROW(Json::Factory::loadFromString(query.toString(false)));

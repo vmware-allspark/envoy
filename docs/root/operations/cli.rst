@@ -8,9 +8,9 @@ following are the command line options that Envoy supports.
 
 .. option:: -c <path string>, --config-path <path string>
 
-  *(optional)* The path to the v2 :ref:`JSON/YAML/proto3 configuration
+  *(optional)* The path to the :ref:`JSON/YAML/proto3 configuration
   file <config>`. If this flag is missing, :option:`--config-yaml` is required.
-  This will be parsed as a :ref:`v2 bootstrap configuration file
+  This will be parsed as a :ref:`bootstrap configuration file
   <config_overview_bootstrap>`.
   Valid extensions are ``.json``, ``.yaml``, ``.pb`` and ``.pb_text``, which indicate
   JSON, YAML, `binary proto3
@@ -21,7 +21,7 @@ following are the command line options that Envoy supports.
 
 .. option:: --config-yaml <yaml string>
 
-  *(optional)* The YAML string for a v2 bootstrap configuration. If :option:`--config-path` is also set,
+  *(optional)* The YAML string for a bootstrap configuration. If :option:`--config-path` is also set,
   the values in this YAML string will override and merge with the bootstrap loaded from :option:`--config-path`.
   Because YAML is a superset of JSON, a JSON string may also be passed to :option:`--config-yaml`.
 
@@ -59,10 +59,25 @@ following are the command line options that Envoy supports.
   set this option. However, if Envoy needs to be run multiple times on the same machine, each
   running Envoy will need a unique base ID so that the shared memory regions do not conflict.
 
+.. option:: --use-dynamic-base-id
+
+  *(optional)* Selects an unused base ID to use when allocating shared memory regions. Using
+  preselected values with :option:`--base-id` is preferred, however. If this option is enabled,
+  it supersedes the :option:`--base-id` value. This flag may not be used when the value of
+  :option:`--restart-epoch` is non-zero. Instead, for subsequent hot restarts, set
+  :option:`--base-id` option with the selected base ID. See :option:`--base-id-path`.
+
+.. option:: --base-id-path <path_string>
+
+  *(optional)* Writes the base ID to the given path. While this option is compatible with
+  :option:`--base-id`, its intended use is to provide access to the dynamic base ID selected by
+  :option:`--use-dynamic-base-id`.
+
 .. option:: --concurrency <integer>
 
   *(optional)* The number of :ref:`worker threads <arch_overview_threading>` to run. If not
-  specified defaults to the number of hardware threads on the machine.
+  specified defaults to the number of hardware threads on the machine. If set to zero, Envoy will
+  still run one worker thread.
 
 .. option:: -l <string>, --log-level <string>
 
@@ -71,9 +86,9 @@ following are the command line options that Envoy supports.
 
 .. option:: --component-log-level <string>
 
-  *(optional)* The comma separated list of logging level per component. Non developers should generally 
-  never set this option. For example, if you want `upstream` component to run at `debug` level and 
-  `connection` component to run at `trace` level, you should pass ``upstream:debug,connection:trace`` to 
+  *(optional)* The comma separated list of logging level per component. Non developers should generally
+  never set this option. For example, if you want ``upstream`` component to run at ``debug`` level and
+  ``connection`` component to run at ``trace`` level, you should pass ``upstream:debug,connection:trace`` to
   this flag. See ``ALL_LOGGER_IDS`` in :repo:`/source/common/common/logger.h` for a list of components.
 
 .. option:: --cpuset-threads
@@ -92,15 +107,17 @@ following are the command line options that Envoy supports.
 .. option:: --log-format <format string>
 
    *(optional)* The format string to use for laying out the log message metadata. If this is not
-   set, a default format string ``"[%Y-%m-%d %T.%e][%t][%l][%n] %v"`` is used.
+   set, a default format string ``"[%Y-%m-%d %T.%e][%t][%l][%n] [%g:%#] %v"`` is used.
 
-   When used in conjunction with ``--log-format-escaped``, the logger can be configured
+   When used in conjunction with :option:`--log-format-escaped`, the logger can be configured
    to log in a format that is parsable by log viewers. Known integrations are documented
    in the :ref:`application logging configuration <config_application_logs>` section.
 
    The supported format flags are (with example output):
 
    :%v:	The actual message to log ("some user text")
+   :%_:	The actual message to log, but with escaped newlines (from (if using ``%v``) "some user text\nbelow", to "some user text\\nbelow")
+   :%j:	The actual message to log as JSON escaped string (https://tools.ietf.org/html/rfc7159#page-8).
    :%t:	Thread id ("1232")
    :%P:	Process id ("3456")
    :%n:	Logger's name ("filter")
@@ -129,13 +146,18 @@ following are the command line options that Envoy supports.
    :%T, %X:	ISO 8601 time format (HH:MM:SS), equivalent to %H:%M:%S ("13:25:06")
    :%z:	ISO 8601 offset from UTC in timezone ([+/-]HH:MM) ("-07:00")
    :%%:	The % sign ("%")
+   :%@: Source file and line ("my_file.cc:123")
+   :%s: Basename of the source file ("my_file.cc")
+   :%g: Full relative path of the source file ("/some/dir/my_file.cc")
+   :%#: Source line ("123")
+   :%!: Source function ("myFunc")
 
 .. option:: --log-format-escaped
 
   *(optional)* This flag enables application log sanitization to escape C-style escape sequences.
   This can be used to prevent a single log line from spanning multiple lines in the underlying log.
   This sanitizes all escape sequences in `this list <https://en.cppreference.com/w/cpp/language/escape>`_.
-  Note that each line's trailing whitespace characters (such as EOL characters) will not be escaped.
+  Note that each line's final EOL character will not be escaped to preserve line format.
 
 .. option:: --restart-epoch <integer>
 
@@ -145,6 +167,29 @@ following are the command line options that Envoy supports.
   or whether to open an existing one. It should be incremented every time a hot restart takes place.
   The :ref:`hot restart wrapper <operations_hot_restarter>` sets the *RESTART_EPOCH* environment
   variable which should be passed to this option in most cases.
+
+.. option:: --enable-fine-grain-logging
+
+  *(optional)* Enables fine-grain logger with file level log control and runtime update at administration
+  interface. If enabled, main log macros including ``ENVOY_LOG``, ``ENVOY_CONN_LOG``, ``ENVOY_STREAM_LOG`` and
+  ``ENVOY_FLUSH_LOG`` will use a per-file logger, and the usage doesn't need ``Envoy::Logger::Loggable`` any
+  more. The administration interface usage is similar. Please see :ref:`Administration interface
+  <operations_admin_interface>` for more detail.
+
+.. option:: --socket-path <path string>
+
+  *(optional)* The output file path to the socket address for :ref:`hot restart <arch_overview_hot_restart>`.
+  Default to "@envoy_domain_socket" which will be created in the abstract namespace. Suffix _{role}_{id}
+  is appended to provide name. All envoy processes wanting to participate in hot-restart together must
+  use the same value for this option.
+
+  **NOTE**: The path started with "@" will be created in the abstract namespace.
+
+.. option:: --socket-mode <string>
+
+  *(optional)* The socket file permission for :ref:`hot restart <arch_overview_hot_restart>`.
+  This must be a valid octal file permission, such as 644. The default value is 600.
+  This flag may not be used when :option:`--socket-path` is start with "@" or not set.
 
 .. option:: --hot-restart-version
 
@@ -156,15 +201,15 @@ following are the command line options that Envoy supports.
 
   *(optional)* Defines the local service cluster name where Envoy is running. The
   local service cluster name is first sourced from the :ref:`Bootstrap node
-  <envoy_api_field_config.bootstrap.v2.Bootstrap.node>` message's :ref:`cluster
-  <envoy_api_field_core.Node.cluster>` field. This CLI option provides an alternative
+  <envoy_v3_api_field_config.bootstrap.v3.Bootstrap.node>` message's :ref:`cluster
+  <envoy_v3_api_field_config.core.v3.Node.cluster>` field. This CLI option provides an alternative
   method for specifying this value and will override any value set in bootstrap
   configuration. It should be set if any of the following features are used:
   :ref:`statsd <arch_overview_statistics>`, :ref:`health check cluster
-  verification <envoy_api_field_core.HealthCheck.HttpHealthCheck.service_name>`,
-  :ref:`runtime override directory <envoy_api_msg_config.bootstrap.v2.Runtime>`,
+  verification <envoy_v3_api_field_config.core.v3.HealthCheck.HttpHealthCheck.service_name_matcher>`,
+  :ref:`runtime override directory <envoy_v3_api_msg_config.bootstrap.v3.Runtime>`,
   :ref:`user agent addition
-  <envoy_api_field_config.filter.network.http_connection_manager.v2.HttpConnectionManager.add_user_agent>`,
+  <envoy_v3_api_field_extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.add_user_agent>`,
   :ref:`HTTP global rate limiting <config_http_filters_rate_limit>`,
   :ref:`CDS <config_cluster_manager_cds>`, and :ref:`HTTP tracing
   <arch_overview_tracing>`, either via this CLI option or in the bootstrap
@@ -174,8 +219,8 @@ following are the command line options that Envoy supports.
 
   *(optional)* Defines the local service node name where Envoy is running. The
   local service node name is first sourced from the :ref:`Bootstrap node
-  <envoy_api_field_config.bootstrap.v2.Bootstrap.node>` message's :ref:`id
-  <envoy_api_field_core.Node.id>` field. This CLI option provides an alternative
+  <envoy_v3_api_field_config.bootstrap.v3.Bootstrap.node>` message's :ref:`id
+  <envoy_v3_api_field_config.core.v3.Node.id>` field. This CLI option provides an alternative
   method for specifying this value and will override any value set in bootstrap
   configuration. It should be set if any of the following features are used:
   :ref:`statsd <arch_overview_statistics>`, :ref:`CDS
@@ -187,12 +232,12 @@ following are the command line options that Envoy supports.
 
   *(optional)* Defines the local service zone where Envoy is running. The local
   service zone is first sourced from the :ref:`Bootstrap node
-  <envoy_api_field_config.bootstrap.v2.Bootstrap.node>` message's :ref:`locality.zone
-  <envoy_api_field_core.Locality.zone>` field. This CLI option provides an
+  <envoy_v3_api_field_config.bootstrap.v3.Bootstrap.node>` message's :ref:`locality.zone
+  <envoy_v3_api_field_config.core.v3.Locality.zone>` field. This CLI option provides an
   alternative method for specifying this value and will override any value set
   in bootstrap configuration. It should be set if discovery service routing is
   used and the discovery service exposes :ref:`zone data
-  <envoy_api_msg_endpoint.LocalityLbEndpoints>`, either via this CLI option or in
+  <envoy_v3_api_msg_config.endpoint.v3.LocalityLbEndpoints>`, either via this CLI option or in
   the bootstrap configuration. The meaning of zone is context dependent, e.g.
   `Availability Zone (AZ)
   <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-regions-availability-zones.html>`_
@@ -211,14 +256,22 @@ following are the command line options that Envoy supports.
 
 .. option:: --drain-time-s <integer>
 
-  *(optional)* The time in seconds that Envoy will drain connections during 
+  *(optional)* The time in seconds that Envoy will drain connections during
   a :ref:`hot restart <arch_overview_hot_restart>` or when individual listeners are being
-  modified or removed via :ref:`LDS <arch_overview_dynamic_config_lds>`. 
-  Defaults to 600 seconds (10 minutes). Generally the drain time should be less than 
-  the parent shutdown time set via the :option:`--parent-shutdown-time-s` option. How the two 
+  modified or removed via :ref:`LDS <arch_overview_dynamic_config_lds>`.
+  Defaults to 600 seconds (10 minutes). Generally the drain time should be less than
+  the parent shutdown time set via the :option:`--parent-shutdown-time-s` option. How the two
   settings are configured depends on the specific deployment. In edge scenarios, it might be
   desirable to have a very long drain time. In service to service scenarios, it might be possible
   to make the drain and shutdown time much shorter (e.g., 60s/90s).
+
+.. option:: --drain-strategy <string>
+
+  *(optional)* Determine behaviour of Envoy during the hot restart drain sequence. During the drain sequence, the drain manager encourages draining through terminating connections on request completion, sending "Connection: CLOSE" on HTTP1, and sending GOAWAY on HTTP2.
+
+  * ``gradual``: *(default)* The percentage of requests encouraged to drain increases to 100% as the drain time elapses.
+
+  * ``immediate``: All requests are encouraged to drain as soon as the drain sequence begins.
 
 .. option:: --parent-shutdown-time-s <integer>
 
@@ -234,7 +287,7 @@ following are the command line options that Envoy supports.
 .. option:: --enable-mutex-tracing
 
   *(optional)* This flag enables the collection of mutex contention statistics
-  (:ref:`MutexStats <envoy_api_msg_admin.v2alpha.MutexStats>`) as well as a contention endpoint
+  (:ref:`MutexStats <envoy_v3_api_msg_admin.v3.MutexStats>`) as well as a contention endpoint
   (:http:get:`/contention`). Mutex tracing is not enabled by default, since it incurs a slight performance
   penalty for those Envoys which already experience mutex contention.
 
@@ -260,13 +313,28 @@ following are the command line options that Envoy supports.
   and these occurrences are counted in the :ref:`server.dynamic_unknown_fields <server_statistics>`
   statistic.
 
+.. option:: --ignore-unknown-dynamic-fields
+
+  *(optional)* This flag disables validation of protobuf configuration for unknown fields in dynamic
+  configuration. Unlike setting :option:`--reject-unknown-dynamic-fields` to false, it does not log warnings
+  or count occurrences of unknown fields, in the interest of configuration processing speed. If
+  :option:`--reject-unknown-dynamic-fields` is set to true, this flag has no effect.
+
+  .. attention::
+
+    In addition to not logging warnings or counting occurrences of unknown fields, setting this
+    option also disables counting and warnings of deprecated fields as well as work-in-progress
+    message and fields. It is *strongly* recommended that this option is not set on at least a
+    small portion of the fleet (staging, canary, etc.) in order to monitor for unknown,
+    deprecated, or work-in-progress usage.
+
 .. option:: --disable-extensions <extension list>
 
   *(optional)* This flag disabled the provided list of comma-separated extension names. Disabled
   extensions cannot be used by static or dynamic configuration, though they are still linked into
   Envoy and may run start-up code or have other runtime effects. Extension names are created by
   joining the extension category and name with a forward slash,
-  e.g. ``grpc_credentials/envoy.grpc_credentials.file_based_metadata``.
+  e.g. ``envoy.grpc_credentials/envoy.grpc_credentials.file_based_metadata``.
 
 .. option:: --version
 
@@ -284,3 +352,16 @@ following are the command line options that Envoy supports.
   * build mode - either ``RELEASE`` or ``DEBUG``,
 
   * TLS library - either ``BoringSSL`` or ``BoringSSL-FIPS``.
+
+.. option:: --enable-core-dump
+
+  *(optional)* This flag is intended for Linux-based systems and it's a no-op for all other platforms.
+  It enables core dumps by invoking `prctl <https://man7.org/linux/man-pages/man2/prctl.2.html>`_ using the
+  PR_SET_DUMPABLE option. This is useful for container environments when using capabilities, given that when
+  Envoy has more capabilities than its base environment core dumping will be disabled by the kernel.
+
+.. option:: --stats-tag
+
+  *(optional)* This flag provides a universal tag for all stats generated by Envoy. The format is ``tag:value``. Only
+  alphanumeric values are allowed for tag names. For tag values all characters are permitted except for '.' (dot).
+  This flag can be repeated multiple times to set multiple universal tags. Multiple values for the same tag name are not allowed.

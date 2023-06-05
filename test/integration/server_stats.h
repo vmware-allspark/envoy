@@ -1,5 +1,6 @@
 #pragma once
 
+#include "envoy/event/dispatcher.h"
 #include "envoy/stats/stats.h"
 
 namespace Envoy {
@@ -13,29 +14,63 @@ public:
    * Wait for a counter to == a given value.
    * @param name counter name.
    * @param value target value.
+   * @param timeout amount of time to wait before asserting false, or 0 for no timeout.
+   * @param dispatcher the dispatcher to run non-blocking periodically during the wait.
    */
-  virtual void waitForCounterEq(const std::string& name, uint64_t value) PURE;
+  virtual void
+  waitForCounterEq(const std::string& name, uint64_t value,
+                   std::chrono::milliseconds timeout = std::chrono::milliseconds::zero(),
+                   Event::Dispatcher* dispatcher = nullptr) PURE;
 
   /**
    * Wait for a counter to >= a given value.
    * @param name counter name.
    * @param value target value.
+   * @param timeout amount of time to wait before asserting false, or 0 for no timeout.
    */
-  virtual void waitForCounterGe(const std::string& name, uint64_t value) PURE;
+  virtual void
+  waitForCounterGe(const std::string& name, uint64_t value,
+                   std::chrono::milliseconds timeout = std::chrono::milliseconds::zero()) PURE;
+
+  /**
+   * Wait for a counter to exist.
+   * @param name counter name.
+   */
+  virtual void waitForCounterExists(const std::string& name) PURE;
+
+  /**
+   * Wait until a histogram has samples.
+   * @param name histogram name.
+   */
+  virtual void waitUntilHistogramHasSamples(
+      const std::string& name,
+      std::chrono::milliseconds timeout = std::chrono::milliseconds::zero()) PURE;
 
   /**
    * Wait for a gauge to >= a given value.
    * @param name gauge name.
    * @param value target value.
+   * @param timeout amount of time to wait before asserting false, or 0 for no timeout.
    */
-  virtual void waitForGaugeGe(const std::string& name, uint64_t value) PURE;
+  virtual void
+  waitForGaugeGe(const std::string& name, uint64_t value,
+                 std::chrono::milliseconds timeout = std::chrono::milliseconds::zero()) PURE;
 
   /**
    * Wait for a gauge to == a given value.
    * @param name gauge name.
    * @param value target value.
+   * @param timeout amount of time to wait before asserting false, or 0 for no timeout.
    */
-  virtual void waitForGaugeEq(const std::string& name, uint64_t value) PURE;
+  virtual void
+  waitForGaugeEq(const std::string& name, uint64_t value,
+                 std::chrono::milliseconds timeout = std::chrono::milliseconds::zero()) PURE;
+
+  /**
+   * Wait for a gauge to be destroyed. Note that MockStatStore does not destroy stat.
+   * @param name gauge name.
+   */
+  virtual void waitForGaugeDestroyed(const std::string& name) PURE;
 
   /**
    * Counter lookup. This is not thread safe, since we don't get a consistent
@@ -62,6 +97,11 @@ public:
    * @return std::vector<Stats::GaugeSharedPtr> snapshot of server counters.
    */
   virtual std::vector<Stats::GaugeSharedPtr> gauges() PURE;
+
+  /**
+   * @return std::vector<Stats::ParentHistogramSharedPtr> snapshot of server histograms.
+   */
+  virtual std::vector<Stats::ParentHistogramSharedPtr> histograms() PURE;
 };
 
 } // namespace Envoy

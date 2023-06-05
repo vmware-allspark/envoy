@@ -1,8 +1,8 @@
 #include "test/common/http/http2/frame_replay.h"
 
-#include "common/common/hex.h"
-#include "common/common/macros.h"
-#include "common/http/utility.h"
+#include "source/common/common/hex.h"
+#include "source/common/common/macros.h"
+#include "source/common/http/utility.h"
 
 #include "test/common/http/common.h"
 #include "test/test_common/environment.h"
@@ -89,13 +89,16 @@ ServerCodecFrameInjector::ServerCodecFrameInjector() : CodecFrameInjector("clien
       }));
 }
 
-void CodecFrameInjector::write(const Frame& frame, Http::Connection& connection) {
+Http::Status CodecFrameInjector::write(const Frame& frame, Http::Connection& connection) {
   Buffer::OwnedImpl buffer;
   buffer.add(frame.data(), frame.size());
   ENVOY_LOG_MISC(trace, "{} write: {}", injector_name_, Hex::encode(frame.data(), frame.size()));
-  while (buffer.length() > 0) {
-    connection.dispatch(buffer);
+  auto status = Http::okStatus();
+  while (buffer.length() > 0 && status.ok()) {
+    status = connection.dispatch(buffer);
   }
+  ENVOY_LOG_MISC(trace, "Status: {}", status.message());
+  return status;
 }
 
 } // namespace Http2

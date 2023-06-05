@@ -3,7 +3,7 @@
 #include "envoy/extensions/filters/network/tcp_proxy/v3/tcp_proxy.pb.h"
 #include "envoy/extensions/filters/network/tcp_proxy/v3/tcp_proxy.pb.validate.h"
 
-#include "extensions/filters/network/common/factory_base.h"
+#include "source/extensions/filters/network/common/factory_base.h"
 
 #include "test/integration/http_integration.h"
 #include "test/test_common/environment.h"
@@ -38,41 +38,47 @@ private:
     return Network::FilterFactoryCb();
   }
 
-  Upstream::ProtocolOptionsConfigConstSharedPtr createProtocolOptionsTyped(
-      const envoy::extensions::filters::network::tcp_proxy::v3::TcpProxy&) override {
+  Upstream::ProtocolOptionsConfigConstSharedPtr
+  createProtocolOptionsTyped(const envoy::extensions::filters::network::tcp_proxy::v3::TcpProxy&,
+                             Server::Configuration::ProtocolOptionsFactoryContext&) override {
     return nullptr;
   }
 };
 
 // Pretty-printing of parameterized test names.
 std::string dynamicValidationTestParamsToString(
-    const ::testing::TestParamInfo<std::tuple<Network::Address::IpVersion, bool>>& params) {
+    const ::testing::TestParamInfo<std::tuple<Network::Address::IpVersion, bool, bool>>& params) {
   return fmt::format(
-      "{}_{}",
+      "{}_{}_{}",
       TestUtility::ipTestParamsToString(
           ::testing::TestParamInfo<Network::Address::IpVersion>(std::get<0>(params.param), 0)),
-      std::get<1>(params.param) ? "with_reject_unknown_fields" : "without_reject_unknown_fields");
+      std::get<1>(params.param) ? "with_reject_unknown_fields" : "without_reject_unknown_fields",
+      std::get<2>(params.param) ? "with_ignore_unknown_fields" : "without_ignore_unknown_fields");
 }
 
 // Validate unknown field handling in dynamic configuration.
 class DynamicValidationIntegrationTest
-    : public testing::TestWithParam<std::tuple<Network::Address::IpVersion, bool>>,
+    : public testing::TestWithParam<std::tuple<Network::Address::IpVersion, bool, bool>>,
       public HttpIntegrationTest {
 public:
   DynamicValidationIntegrationTest()
-      : HttpIntegrationTest(Http::CodecClient::Type::HTTP2, std::get<0>(GetParam())),
-        reject_unknown_dynamic_fields_(std::get<1>(GetParam())) {
-    setUpstreamProtocol(FakeHttpConnection::Type::HTTP2);
+      : HttpIntegrationTest(Http::CodecType::HTTP2, std::get<0>(GetParam())),
+        reject_unknown_dynamic_fields_(std::get<1>(GetParam())),
+        ignore_unknown_dynamic_fields_(std::get<2>(GetParam())) {
+    setUpstreamProtocol(Http::CodecType::HTTP2);
   }
 
   void createEnvoy() override {
     registerPort("upstream_0", fake_upstreams_.back()->localAddress()->ip()->port());
-    createApiTestServer(api_filesystem_config_, {"http"}, reject_unknown_dynamic_fields_,
-                        reject_unknown_dynamic_fields_, allow_lds_rejection_);
+    createApiTestServer(api_filesystem_config_, {"http"},
+                        {reject_unknown_dynamic_fields_, reject_unknown_dynamic_fields_,
+                         ignore_unknown_dynamic_fields_},
+                        allow_lds_rejection_);
   }
 
   ApiFilesystemConfig api_filesystem_config_;
   const bool reject_unknown_dynamic_fields_;
+  const bool ignore_unknown_dynamic_fields_;
   bool allow_lds_rejection_{};
 
 private:
@@ -83,13 +89,14 @@ private:
 
 INSTANTIATE_TEST_SUITE_P(
     IpVersions, DynamicValidationIntegrationTest,
-    testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()), testing::Bool()),
+    testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()), testing::Bool(),
+                     testing::Bool()),
     dynamicValidationTestParamsToString);
 
 // Protocol options in CDS with unknown fields are rejected if and only if strict.
 TEST_P(DynamicValidationIntegrationTest, CdsProtocolOptionsRejected) {
   api_filesystem_config_ = {
-      "test/config/integration/server_xds.bootstrap.yaml",
+      "test/config/integration/server_xds.bootstrap.yml",
       "test/config/integration/server_xds.cds.with_unknown_field.yaml",
       "test/config/integration/server_xds.eds.yaml",
       "test/config/integration/server_xds.lds.yaml",
@@ -103,7 +110,11 @@ TEST_P(DynamicValidationIntegrationTest, CdsProtocolOptionsRejected) {
     EXPECT_EQ(0, test_server_->counter("server.dynamic_unknown_fields")->value());
   } else {
     EXPECT_EQ(1, test_server_->counter("cluster_manager.cds.update_success")->value());
-    EXPECT_EQ(1, test_server_->counter("server.dynamic_unknown_fields")->value());
+    if (ignore_unknown_dynamic_fields_) {
+      EXPECT_EQ(0, test_server_->counter("server.dynamic_unknown_fields")->value());
+    } else {
+      EXPECT_EQ(1, test_server_->counter("server.dynamic_unknown_fields")->value());
+    }
   }
 }
 
@@ -111,7 +122,7 @@ TEST_P(DynamicValidationIntegrationTest, CdsProtocolOptionsRejected) {
 TEST_P(DynamicValidationIntegrationTest, LdsFilterRejected) {
   allow_lds_rejection_ = true;
   api_filesystem_config_ = {
-      "test/config/integration/server_xds.bootstrap.yaml",
+      "test/config/integration/server_xds.bootstrap.yml",
       "test/config/integration/server_xds.cds.yaml",
       "test/config/integration/server_xds.eds.yaml",
       "test/config/integration/server_xds.lds.with_unknown_field.yaml",
@@ -127,7 +138,11 @@ TEST_P(DynamicValidationIntegrationTest, LdsFilterRejected) {
   } else {
     EXPECT_EQ(1, test_server_->counter("listener_manager.lds.update_success")->value());
     EXPECT_EQ(1, test_server_->counter("http.router.rds.route_config_0.update_success")->value());
-    EXPECT_EQ(1, test_server_->counter("server.dynamic_unknown_fields")->value());
+    if (ignore_unknown_dynamic_fields_) {
+      EXPECT_EQ(0, test_server_->counter("server.dynamic_unknown_fields")->value());
+    } else {
+      EXPECT_EQ(1, test_server_->counter("server.dynamic_unknown_fields")->value());
+    }
   }
   EXPECT_EQ(1, test_server_->counter("cluster_manager.cds.update_success")->value());
   EXPECT_EQ(1, test_server_->counter("cluster.cluster_1.update_success")->value());
@@ -138,7 +153,7 @@ TEST_P(DynamicValidationIntegrationTest, LdsFilterRejected) {
 TEST_P(DynamicValidationIntegrationTest, LdsFilterRejectedTypedStruct) {
   allow_lds_rejection_ = true;
   api_filesystem_config_ = {
-      "test/config/integration/server_xds.bootstrap.yaml",
+      "test/config/integration/server_xds.bootstrap.yml",
       "test/config/integration/server_xds.cds.yaml",
       "test/config/integration/server_xds.eds.yaml",
       "test/config/integration/server_xds.lds.with_unknown_field.typed_struct.yaml",
@@ -154,7 +169,11 @@ TEST_P(DynamicValidationIntegrationTest, LdsFilterRejectedTypedStruct) {
   } else {
     EXPECT_EQ(1, test_server_->counter("listener_manager.lds.update_success")->value());
     EXPECT_EQ(1, test_server_->counter("http.router.rds.route_config_0.update_success")->value());
-    EXPECT_EQ(1, test_server_->counter("server.dynamic_unknown_fields")->value());
+    if (ignore_unknown_dynamic_fields_) {
+      EXPECT_EQ(0, test_server_->counter("server.dynamic_unknown_fields")->value());
+    } else {
+      EXPECT_EQ(1, test_server_->counter("server.dynamic_unknown_fields")->value());
+    }
   }
   EXPECT_EQ(1, test_server_->counter("cluster_manager.cds.update_success")->value());
   EXPECT_EQ(1, test_server_->counter("cluster.cluster_1.update_success")->value());
@@ -163,7 +182,7 @@ TEST_P(DynamicValidationIntegrationTest, LdsFilterRejectedTypedStruct) {
 // Unknown fields in RDS cause config load failure if and only if strict.
 TEST_P(DynamicValidationIntegrationTest, RdsFailedBySubscription) {
   api_filesystem_config_ = {
-      "test/config/integration/server_xds.bootstrap.yaml",
+      "test/config/integration/server_xds.bootstrap.yml",
       "test/config/integration/server_xds.cds.yaml",
       "test/config/integration/server_xds.eds.yaml",
       "test/config/integration/server_xds.lds.yaml",
@@ -178,7 +197,11 @@ TEST_P(DynamicValidationIntegrationTest, RdsFailedBySubscription) {
     EXPECT_EQ(0, test_server_->counter("server.dynamic_unknown_fields")->value());
   } else {
     EXPECT_EQ(1, test_server_->counter("http.router.rds.route_config_0.update_success")->value());
-    EXPECT_EQ(1, test_server_->counter("server.dynamic_unknown_fields")->value());
+    if (ignore_unknown_dynamic_fields_) {
+      EXPECT_EQ(0, test_server_->counter("server.dynamic_unknown_fields")->value());
+    } else {
+      EXPECT_EQ(1, test_server_->counter("server.dynamic_unknown_fields")->value());
+    }
   }
   EXPECT_EQ(1, test_server_->counter("cluster_manager.cds.update_success")->value());
   EXPECT_EQ(1, test_server_->counter("cluster.cluster_1.update_success")->value());
@@ -187,7 +210,7 @@ TEST_P(DynamicValidationIntegrationTest, RdsFailedBySubscription) {
 // Unknown fields in EDS cause config load failure if and only if strict.
 TEST_P(DynamicValidationIntegrationTest, EdsFailedBySubscription) {
   api_filesystem_config_ = {
-      "test/config/integration/server_xds.bootstrap.yaml",
+      "test/config/integration/server_xds.bootstrap.yml",
       "test/config/integration/server_xds.cds.yaml",
       "test/config/integration/server_xds.eds.with_unknown_field.yaml",
       "test/config/integration/server_xds.lds.yaml",
@@ -204,7 +227,11 @@ TEST_P(DynamicValidationIntegrationTest, EdsFailedBySubscription) {
     EXPECT_EQ(0, test_server_->counter("server.dynamic_unknown_fields")->value());
   } else {
     EXPECT_EQ(1, test_server_->counter("cluster.cluster_1.update_success")->value());
-    EXPECT_EQ(1, test_server_->counter("server.dynamic_unknown_fields")->value());
+    if (ignore_unknown_dynamic_fields_) {
+      EXPECT_EQ(0, test_server_->counter("server.dynamic_unknown_fields")->value());
+    } else {
+      EXPECT_EQ(1, test_server_->counter("server.dynamic_unknown_fields")->value());
+    }
   }
 }
 

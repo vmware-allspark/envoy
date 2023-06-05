@@ -7,13 +7,16 @@
 #include "envoy/data/tap/v3/common.pb.h"
 #include "envoy/data/tap/v3/wrapper.pb.h"
 
-#include "extensions/common/tap/tap.h"
-#include "extensions/common/tap/tap_matcher.h"
+#include "source/extensions/common/matcher/matcher.h"
+#include "source/extensions/common/tap/tap.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace Common {
 namespace Tap {
+
+using Matcher = Envoy::Extensions::Common::Matcher::Matcher;
+using MatcherPtr = Envoy::Extensions::Common::Matcher::MatcherPtr;
 
 /**
  * Common utilities for tapping.
@@ -53,7 +56,9 @@ public:
       const uint32_t start_offset_trim = std::min<uint32_t>(start_offset, slice.len_);
       slice.len_ -= start_offset_trim;
       start_offset -= start_offset_trim;
-      slice.mem_ = static_cast<char*>(slice.mem_) + start_offset_trim;
+      if (slice.mem_ != nullptr) {
+        slice.mem_ = static_cast<char*>(slice.mem_) + start_offset_trim;
+      }
 
       const uint32_t final_length = std::min<uint32_t>(length, slice.len_);
       slice.len_ = final_length;
@@ -73,7 +78,8 @@ public:
   class PerTapSinkHandleManagerImpl : public PerTapSinkHandleManager {
   public:
     PerTapSinkHandleManagerImpl(TapConfigBaseImpl& parent, uint64_t trace_id)
-        : parent_(parent), handle_(parent.sink_to_use_->createPerTapSinkHandle(trace_id)) {}
+        : parent_(parent),
+          handle_(parent.sink_to_use_->createPerTapSinkHandle(trace_id, parent.sink_type_)) {}
 
     // PerTapSinkHandleManager
     void submitTrace(TraceWrapperPtr&& trace) override;
@@ -96,7 +102,7 @@ public:
   bool streaming() const override { return streaming_; }
 
 protected:
-  TapConfigBaseImpl(envoy::config::tap::v3::TapConfig&& proto_config,
+  TapConfigBaseImpl(const envoy::config::tap::v3::TapConfig& proto_config,
                     Common::Tap::Sink* admin_streamer);
 
 private:
@@ -110,6 +116,7 @@ private:
   Sink* sink_to_use_;
   SinkPtr sink_;
   envoy::config::tap::v3::OutputSink::Format sink_format_;
+  envoy::config::tap::v3::OutputSink::OutputSinkTypeCase sink_type_;
   std::vector<MatcherPtr> matchers_;
 };
 
@@ -121,7 +128,9 @@ public:
   FilePerTapSink(const envoy::config::tap::v3::FilePerTapSink& config) : config_(config) {}
 
   // Sink
-  PerTapSinkHandlePtr createPerTapSinkHandle(uint64_t trace_id) override {
+  PerTapSinkHandlePtr
+  createPerTapSinkHandle(uint64_t trace_id,
+                         envoy::config::tap::v3::OutputSink::OutputSinkTypeCase) override {
     return std::make_unique<FilePerTapSinkHandle>(*this, trace_id);
   }
 

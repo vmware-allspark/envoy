@@ -1,7 +1,7 @@
 #include <thread>
 
-#include "common/event/timer_impl.h"
-#include "common/shared_pool/shared_pool.h"
+#include "source/common/event/timer_impl.h"
+#include "source/common/shared_pool/shared_pool.h"
 
 #include "test/mocks/event/mocks.h"
 #include "test/test_common/thread_factory_for_test.h"
@@ -15,7 +15,8 @@ namespace SharedPool {
 
 class SharedPoolTest : public testing::Test {
 protected:
-  SharedPoolTest() : api_(Api::createApiForTest()), dispatcher_(api_->allocateDispatcher()) {
+  SharedPoolTest()
+      : api_(Api::createApiForTest()), dispatcher_(api_->allocateDispatcher("test_thread")) {
     dispatcher_thread_ = api_->threadFactory().createThread([this]() {
       // Must create a keepalive timer to keep the dispatcher from exiting.
       std::chrono::milliseconds time_interval(500);

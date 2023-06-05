@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include "extensions/filters/network/mongo_proxy/codec.h"
+#include "source/extensions/filters/network/mongo_proxy/codec.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -40,7 +40,7 @@ public:
   /**
    * @return the value of maxTimeMS or 0 if not given.
    */
-  int32_t max_time() { return max_time_; }
+  int32_t maxTime() { return max_time_; }
 
   /**
    * @return the type of a query message.

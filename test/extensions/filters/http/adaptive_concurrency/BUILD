@@ -1,5 +1,3 @@
-licenses(["notice"])  # Apache 2
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_package",
@@ -9,12 +7,14 @@ load(
     "envoy_extension_cc_test",
 )
 
+licenses(["notice"])  # Apache 2
+
 envoy_package()
 
 envoy_extension_cc_test(
     name = "adaptive_concurrency_filter_test",
     srcs = ["adaptive_concurrency_filter_test.cc"],
-    extension_name = "envoy.filters.http.adaptive_concurrency",
+    extension_names = ["envoy.filters.http.adaptive_concurrency"],
     deps = [
         "//source/common/http:header_map_lib",
         "//source/common/http:headers_lib",
@@ -33,7 +33,7 @@ envoy_extension_cc_test(
         "adaptive_concurrency_filter_integration_test.cc",
         "adaptive_concurrency_filter_integration_test.h",
     ],
-    extension_name = "envoy.filters.http.adaptive_concurrency",
+    extension_names = ["envoy.filters.http.adaptive_concurrency"],
     deps = [
         "//source/extensions/filters/http/adaptive_concurrency:config",
         "//source/extensions/filters/http/fault:config",

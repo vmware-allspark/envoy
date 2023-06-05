@@ -1,31 +1,66 @@
-licenses(["notice"])  # Apache 2
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_package",
 )
 
+licenses(["notice"])  # Apache 2
+
 envoy_package()
 
 filegroup(
     name = "configs",
-    srcs = [
-        "cors/backend/front-envoy.yaml",
-        "cors/backend/service-envoy.yaml",
-        "cors/frontend/front-envoy.yaml",
-        "cors/frontend/service-envoy.yaml",
-        "front-proxy/front-envoy.yaml",
-        "front-proxy/service-envoy.yaml",
-        "grpc-bridge/client/envoy-proxy.yaml",
-        "grpc-bridge/server/envoy-proxy.yaml",
-        "jaeger-tracing/front-envoy-jaeger.yaml",
-        "jaeger-tracing/service1-envoy-jaeger.yaml",
-        "jaeger-tracing/service2-envoy-jaeger.yaml",
-        "load-reporting-service/service-envoy-w-lrs.yaml",
-        "lua/envoy.yaml",
-        "lua/lib/mylibrary.lua",
-        "zipkin-tracing/front-envoy-zipkin.yaml",
-        "zipkin-tracing/service1-envoy-zipkin.yaml",
-        "zipkin-tracing/service2-envoy-zipkin.yaml",
+    srcs = glob(
+        [
+            "**/*.yaml",
+        ],
+        exclude = [
+            "cache/responses.yaml",
+            "dynamic-config-fs/**/*",
+            "jaeger-native-tracing/*",
+            "opentelemetry/otel-collector-config.yaml",
+            "**/*docker-compose*.yaml",
+            # Contrib extensions tested over in contrib.
+            "mysql/*",
+            "postgres/*",
+            "kafka/*.yaml",
+        ],
+    ),
+)
+
+genrule(
+    name = "contrib_configs",
+    srcs = glob(
+        [
+            "mysql/*.yaml",
+            "postgres/*.yaml",
+            "kafka/*.yaml",
+        ],
+        exclude = [
+            "**/*docker-compose*.yaml",
+        ],
+    ),
+    outs = ["example_configs.tar"],
+    cmd = (
+        "$(location //configs:configgen.sh) NO_CONFIGGEN $(@D) $(SRCS)"
+    ),
+    tools = [
+        "//configs:configgen.sh",
+    ],
+)
+
+filegroup(
+    name = "certs",
+    srcs = glob(["_extra_certs/*.pem"]),
+)
+
+filegroup(
+    name = "lua",
+    srcs = glob(["**/*.lua"]),
+)
+
+filegroup(
+    name = "files",
+    srcs = glob(["**/*"]) + [
+        "//examples/wasm-cc:files",
     ],
 )

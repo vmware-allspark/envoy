@@ -1,16 +1,16 @@
-licenses(["notice"])  # Apache 2
-
-# ZooKeeper proxy L7 network filter.
-# Public docs: docs/root/configuration/network_filters/zookeeper_proxy_filter.rst
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_cc_extension",
     "envoy_cc_library",
-    "envoy_package",
+    "envoy_extension_package",
 )
 
-envoy_package()
+licenses(["notice"])  # Apache 2
+
+# ZooKeeper proxy L7 network filter.
+# Public docs: https://envoyproxy.io/docs/envoy/latest/configuration/listeners/network_filters/zookeeper_proxy_filter
+
+envoy_extension_package()
 
 envoy_cc_library(
     name = "proxy_lib",
@@ -25,10 +25,10 @@ envoy_cc_library(
         "utils.h",
     ],
     deps = [
-        "//include/envoy/network:filter_interface",
-        "//include/envoy/server:filter_config_interface",
-        "//include/envoy/stats:stats_interface",
-        "//include/envoy/stats:stats_macros",
+        "//envoy/network:filter_interface",
+        "//envoy/server:filter_config_interface",
+        "//envoy/stats:stats_interface",
+        "//envoy/stats:stats_macros",
         "//source/common/buffer:buffer_lib",
         "//source/common/common:enum_to_int",
         "//source/common/network:filter_lib",
@@ -43,8 +43,6 @@ envoy_cc_extension(
     name = "config",
     srcs = ["config.cc"],
     hdrs = ["config.h"],
-    security_posture = "requires_trusted_downstream_and_upstream",
-    status = "alpha",
     deps = [
         ":proxy_lib",
         "//source/extensions/filters/network:well_known_names",

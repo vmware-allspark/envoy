@@ -6,24 +6,40 @@ set -e
 
 export PPROF_PATH=/thirdparty_build/bin/pprof
 
-[ -z "${NUM_CPUS}" ] && NUM_CPUS=`grep -c ^processor /proc/cpuinfo`
+[ -z "${NUM_CPUS}" ] && NUM_CPUS=$(grep -c ^processor /proc/cpuinfo)
 [ -z "${ENVOY_SRCDIR}" ] && export ENVOY_SRCDIR=/source
 [ -z "${ENVOY_BUILD_TARGET}" ] && export ENVOY_BUILD_TARGET=//source/exe:envoy-static
+[ -z "${ENVOY_BUILD_DEBUG_INFORMATION}" ] && export ENVOY_BUILD_DEBUG_INFORMATION=//source/exe:envoy-static.dwp
+[ -z "${ENVOY_CONTRIB_BUILD_TARGET}" ] && export ENVOY_CONTRIB_BUILD_TARGET=//contrib/exe:envoy-static
+[ -z "${ENVOY_CONTRIB_BUILD_DEBUG_INFORMATION}" ] && export ENVOY_CONTRIB_BUILD_DEBUG_INFORMATION=//contrib/exe:envoy-static.dwp
+[ -z "${ENVOY_BUILD_ARCH}" ] && {
+    ENVOY_BUILD_ARCH=$(uname -m)
+    export ENVOY_BUILD_ARCH
+}
+
+read -ra BAZEL_BUILD_EXTRA_OPTIONS <<< "${BAZEL_BUILD_EXTRA_OPTIONS:-}"
+read -ra BAZEL_EXTRA_TEST_OPTIONS <<< "${BAZEL_EXTRA_TEST_OPTIONS:-}"
+read -ra BAZEL_OPTIONS <<< "${BAZEL_OPTIONS:-}"
+
 echo "ENVOY_SRCDIR=${ENVOY_SRCDIR}"
 echo "ENVOY_BUILD_TARGET=${ENVOY_BUILD_TARGET}"
+echo "ENVOY_BUILD_ARCH=${ENVOY_BUILD_ARCH}"
 
 function setup_gcc_toolchain() {
-  if [[ ! -z "${ENVOY_STDLIB}" && "${ENVOY_STDLIB}" != "libstdc++" ]]; then
+  if [[ -n "${ENVOY_STDLIB}" && "${ENVOY_STDLIB}" != "libstdc++" ]]; then
     echo "gcc toolchain doesn't support ${ENVOY_STDLIB}."
     exit 1
   fi
+
+  BAZEL_BUILD_OPTIONS+=("--config=gcc")
+
   if [[ -z "${ENVOY_RBE}" ]]; then
     export CC=gcc
     export CXX=g++
     export BAZEL_COMPILER=gcc
     echo "$CC/$CXX toolchain configured"
   else
-    export BAZEL_BUILD_OPTIONS="--config=remote-gcc ${BAZEL_BUILD_OPTIONS}"
+    BAZEL_BUILD_OPTIONS+=("--config=remote-gcc")
   fi
 }
 
@@ -31,27 +47,19 @@ function setup_clang_toolchain() {
   ENVOY_STDLIB="${ENVOY_STDLIB:-libc++}"
   if [[ -z "${ENVOY_RBE}" ]]; then
     if [[ "${ENVOY_STDLIB}" == "libc++" ]]; then
-      export BAZEL_BUILD_OPTIONS="--config=libc++ ${BAZEL_BUILD_OPTIONS}"
+      BAZEL_BUILD_OPTIONS+=("--config=libc++")
     else
-      export BAZEL_BUILD_OPTIONS="--config=clang ${BAZEL_BUILD_OPTIONS}"
+      BAZEL_BUILD_OPTIONS+=("--config=clang")
     fi
   else
     if [[ "${ENVOY_STDLIB}" == "libc++" ]]; then
-      export BAZEL_BUILD_OPTIONS="--config=remote-clang-libc++ ${BAZEL_BUILD_OPTIONS}"
+      BAZEL_BUILD_OPTIONS+=("--config=remote-clang-libc++")
     else
-      export BAZEL_BUILD_OPTIONS="--config=remote-clang ${BAZEL_BUILD_OPTIONS}"
+      BAZEL_BUILD_OPTIONS+=("--config=remote-clang")
     fi
   fi
   echo "clang toolchain with ${ENVOY_STDLIB} configured"
 }
-
-# Create a fake home. Python site libs tries to do getpwuid(3) if we don't and the CI
-# Docker image gets confused as it has no passwd entry when running non-root
-# unless we do this.
-FAKE_HOME=/tmp/fake_home
-mkdir -p "${FAKE_HOME}"
-export HOME="${FAKE_HOME}"
-export PYTHONUSERBASE="${FAKE_HOME}"
 
 export BUILD_DIR=${BUILD_DIR:-/build}
 if [[ ! -d "${BUILD_DIR}" ]]
@@ -61,14 +69,13 @@ then
 fi
 
 # Environment setup.
-export USER=bazel
-export TEST_TMPDIR=${BUILD_DIR}/tmp
-export BAZEL="bazel"
-export PATH=/opt/llvm/bin:$PATH
+export TEST_TMPDIR="${TEST_TMPDIR:-$BUILD_DIR/tmp}"
+export LLVM_ROOT="${LLVM_ROOT:-/opt/llvm}"
+export PATH=${LLVM_ROOT}/bin:${PATH}
 export CLANG_FORMAT="${CLANG_FORMAT:-clang-format}"
 
 if [[ -f "/etc/redhat-release" ]]; then
-  export BAZEL_BUILD_EXTRA_OPTIONS+="--copt=-DENVOY_IGNORE_GLIBCXX_USE_CXX11_ABI_ERROR=1"
+  BAZEL_BUILD_EXTRA_OPTIONS+=("--copt=-DENVOY_IGNORE_GLIBCXX_USE_CXX11_ABI_ERROR=1")
 fi
 
 function cleanup() {
@@ -80,19 +87,36 @@ function cleanup() {
 cleanup
 trap cleanup EXIT
 
-export LLVM_ROOT="${LLVM_ROOT:-/opt/llvm}"
 "$(dirname "$0")"/../bazel/setup_clang.sh "${LLVM_ROOT}"
 
-[[ "${BUILD_REASON}" != "PullRequest" ]] && BAZEL_EXTRA_TEST_OPTIONS+=" --nocache_test_results --test_output=all"
+if [[ "${BUILD_REASON}" != "PullRequest" ]]; then
+    VERSION_DEV="$(cut -d- -f2 "${ENVOY_SRCDIR}/VERSION.txt")"
+    # Use uncached test results for non-release commits to a branch.
+    if [[ $VERSION_DEV == "dev" ]]; then
+        BAZEL_EXTRA_TEST_OPTIONS+=("--nocache_test_results")
+    fi
+fi
 
-export BAZEL_QUERY_OPTIONS="${BAZEL_OPTIONS}"
-export BAZEL_BUILD_OPTIONS="--verbose_failures ${BAZEL_OPTIONS} --action_env=HOME --action_env=PYTHONUSERBASE \
-  --local_cpu_resources=${NUM_CPUS} --show_task_finish --experimental_generate_json_trace_profile \
-  --test_env=HOME --test_env=PYTHONUSERBASE --test_output=errors \
-  --repository_cache=${BUILD_DIR}/repository_cache --experimental_repository_cache_hardlinks \
-  ${BAZEL_BUILD_EXTRA_OPTIONS} ${BAZEL_EXTRA_TEST_OPTIONS}"
+# Use https://docs.bazel.build/versions/master/command-line-reference.html#flag--experimental_repository_cache_hardlinks
+# to save disk space.
+BAZEL_BUILD_OPTIONS=(
+  "${BAZEL_OPTIONS[@]}"
+  "--verbose_failures"
+  "--experimental_generate_json_trace_profile"
+  "--test_output=errors"
+  "--noshow_progress"
+  "--noshow_loading_progress"
+  "--repository_cache=${BUILD_DIR}/repository_cache"
+  "--experimental_repository_cache_hardlinks"
+  "--action_env=CLANG_FORMAT"
+  "${BAZEL_BUILD_EXTRA_OPTIONS[@]}"
+  "${BAZEL_EXTRA_TEST_OPTIONS[@]}")
 
-[[ "${BAZEL_EXPUNGE}" == "1" ]] && "${BAZEL}" clean --expunge
+[[ "${ENVOY_BUILD_ARCH}" == "aarch64" ]] && BAZEL_BUILD_OPTIONS+=(
+  "--flaky_test_attempts=2"
+  "--test_env=HEAPCHECK=")
+
+[[ "${BAZEL_EXPUNGE}" == "1" ]] && bazel clean --expunge
 
 # Also setup some space for building Envoy standalone.
 export ENVOY_BUILD_DIR="${BUILD_DIR}"/envoy
@@ -103,8 +127,10 @@ export ENVOY_DELIVERY_DIR="${ENVOY_BUILD_DIR}"/source/exe
 mkdir -p "${ENVOY_DELIVERY_DIR}"
 
 # This is where we copy the coverage report to.
-export ENVOY_COVERAGE_DIR="${ENVOY_BUILD_DIR}"/generated/coverage
-mkdir -p "${ENVOY_COVERAGE_DIR}"
+export ENVOY_COVERAGE_ARTIFACT="${ENVOY_BUILD_DIR}"/generated/coverage.tar.gz
+
+# This is where we copy the fuzz coverage report to.
+export ENVOY_FUZZ_COVERAGE_ARTIFACT="${ENVOY_BUILD_DIR}"/generated/fuzz_coverage.tar.gz
 
 # This is where we dump failed test logs for CI collection.
 export ENVOY_FAILED_TEST_LOGS="${ENVOY_BUILD_DIR}"/generated/failed-testlogs
@@ -122,6 +148,7 @@ export BUILDOZER_BIN="${BUILDOZER_BIN:-/usr/local/bin/buildozer}"
 # source tree is different than the current workspace, the setup step is
 # skipped.
 if [[ "$1" != "-nofetch" && "${ENVOY_SRCDIR}" == "$(bazel info workspace)" ]]; then
+  # shellcheck source=ci/filter_example_setup.sh
   . "$(dirname "$0")"/filter_example_setup.sh
 else
   echo "Skip setting up Envoy Filter Example."

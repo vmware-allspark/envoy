@@ -1,4 +1,6 @@
-#include "common/http/async_client_utility.h"
+#include "source/common/http/async_client_utility.h"
+
+#include "source/common/common/assert.h"
 
 namespace Envoy {
 namespace Http {

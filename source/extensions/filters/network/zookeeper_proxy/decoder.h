@@ -5,10 +5,11 @@
 
 #include "envoy/common/platform.h"
 
-#include "common/buffer/buffer_impl.h"
-#include "common/common/logger.h"
+#include "source/common/buffer/buffer_impl.h"
+#include "source/common/common/logger.h"
+#include "source/extensions/filters/network/zookeeper_proxy/utils.h"
 
-#include "extensions/filters/network/zookeeper_proxy/utils.h"
+#include "absl/container/node_hash_map.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -169,7 +170,7 @@ private:
   const uint32_t max_packet_bytes_;
   BufferHelper helper_;
   TimeSource& time_source_;
-  std::unordered_map<int32_t, RequestBegin> requests_by_xid_;
+  absl::node_hash_map<int32_t, RequestBegin> requests_by_xid_;
 };
 
 } // namespace ZooKeeperProxy

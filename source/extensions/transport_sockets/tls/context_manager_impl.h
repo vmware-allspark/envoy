@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <list>
 
@@ -8,7 +9,7 @@
 #include "envoy/ssl/private_key/private_key.h"
 #include "envoy/stats/scope.h"
 
-#include "extensions/transport_sockets/tls/private_key/private_key_manager_impl.h"
+#include "source/extensions/transport_sockets/tls/private_key/private_key_manager_impl.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -24,8 +25,8 @@ namespace Tls {
  */
 class ContextManagerImpl final : public Envoy::Ssl::ContextManager {
 public:
-  ContextManagerImpl(TimeSource& time_source) : time_source_(time_source) {}
-  ~ContextManagerImpl() override;
+  explicit ContextManagerImpl(TimeSource& time_source);
+  ~ContextManagerImpl() override = default;
 
   // Ssl::ContextManager
   Ssl::ClientContextSharedPtr
@@ -34,16 +35,17 @@ public:
   Ssl::ServerContextSharedPtr
   createSslServerContext(Stats::Scope& scope, const Envoy::Ssl::ServerContextConfig& config,
                          const std::vector<std::string>& server_names) override;
-  size_t daysUntilFirstCertExpires() const override;
+  absl::optional<uint32_t> daysUntilFirstCertExpires() const override;
+  absl::optional<uint64_t> secondsUntilFirstOcspResponseExpires() const override;
   void iterateContexts(std::function<void(const Envoy::Ssl::Context&)> callback) override;
   Ssl::PrivateKeyMethodManager& privateKeyMethodManager() override {
     return private_key_method_manager_;
   };
+  void removeContext(const Envoy::Ssl::ContextSharedPtr& old_context) override;
 
 private:
-  void removeEmptyContexts();
   TimeSource& time_source_;
-  std::list<std::weak_ptr<Envoy::Ssl::Context>> contexts_;
+  absl::flat_hash_set<Envoy::Ssl::ContextSharedPtr> contexts_;
   PrivateKeyMethodManagerImpl private_key_method_manager_{};
 };
 

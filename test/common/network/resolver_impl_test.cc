@@ -7,9 +7,9 @@
 #include "envoy/network/resolver.h"
 #include "envoy/registry/registry.h"
 
-#include "common/common/thread.h"
-#include "common/network/address_impl.h"
-#include "common/network/resolver_impl.h"
+#include "source/common/common/thread.h"
+#include "source/common/network/address_impl.h"
+#include "source/common/network/resolver_impl.h"
 
 #include "test/mocks/network/mocks.h"
 #include "test/test_common/environment.h"
@@ -61,6 +61,22 @@ TEST(ResolverTest, FromProtoAddress) {
   envoy::config::core::v3::Address pipe_address;
   pipe_address.mutable_pipe()->set_path("/foo/bar");
   EXPECT_EQ("/foo/bar", resolveProtoAddress(pipe_address)->asString());
+}
+
+TEST(ResolverTest, InternalListenerNameFromProtoAddress) {
+  envoy::config::core::v3::Address internal_listener_address;
+  internal_listener_address.mutable_envoy_internal_address()->set_server_listener_name(
+      "internal_listener_foo");
+  EXPECT_EQ("envoy://internal_listener_foo/",
+            resolveProtoAddress(internal_listener_address)->asString());
+}
+
+TEST(ResolverTest, UninitializedInternalAddressFromProtoAddress) {
+  envoy::config::core::v3::Address internal_address;
+  internal_address.mutable_envoy_internal_address();
+  EXPECT_THROW_WITH_MESSAGE(
+      resolveProtoAddress(internal_address), EnvoyException,
+      fmt::format("Failed to resolve address:{}", internal_address.DebugString()));
 }
 
 // Validate correct handling of ipv4_compat field.
@@ -156,8 +172,7 @@ TEST(ResolverTest, NonStandardResolver) {
 
 TEST(ResolverTest, UninitializedAddress) {
   envoy::config::core::v3::Address address;
-  EXPECT_THROW_WITH_MESSAGE(resolveProtoAddress(address), EnvoyException,
-                            "Address must be a socket or pipe: ");
+  EXPECT_THROW_WITH_MESSAGE(resolveProtoAddress(address), EnvoyException, "Address must be set: ");
 }
 
 TEST(ResolverTest, NoSuchResolver) {

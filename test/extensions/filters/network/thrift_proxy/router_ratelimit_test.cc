@@ -6,15 +6,16 @@
 #include "envoy/extensions/filters/network/thrift_proxy/v3/thrift_proxy.pb.validate.h"
 #include "envoy/ratelimit/ratelimit.h"
 
-#include "common/protobuf/utility.h"
-
-#include "extensions/filters/network/thrift_proxy/config.h"
-#include "extensions/filters/network/thrift_proxy/metadata.h"
-#include "extensions/filters/network/thrift_proxy/router/router_ratelimit_impl.h"
+#include "source/common/network/address_impl.h"
+#include "source/common/protobuf/utility.h"
+#include "source/extensions/filters/network/thrift_proxy/config.h"
+#include "source/extensions/filters/network/thrift_proxy/metadata.h"
+#include "source/extensions/filters/network/thrift_proxy/router/rds_impl.h"
+#include "source/extensions/filters/network/thrift_proxy/router/router_ratelimit_impl.h"
 
 #include "test/extensions/filters/network/thrift_proxy/mocks.h"
 #include "test/mocks/ratelimit/mocks.h"
-#include "test/mocks/server/mocks.h"
+#include "test/mocks/server/factory_context.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -31,10 +32,34 @@ namespace {
 
 class ThriftRateLimitConfigurationTest : public testing::Test {
 public:
+  ThriftRateLimitConfigurationTest() {
+    route_config_provider_manager_ =
+        std::make_unique<RouteConfigProviderManagerImpl>(factory_context_.admin_);
+  }
+
+  void initializeClusters(const std::vector<std::string>& cluster_names) {
+    factory_context_.server_factory_context_.cluster_manager_.initializeClusters(cluster_names, {});
+  }
+  void initialize(envoy::extensions::filters::network::thrift_proxy::v3::ThriftProxy& config,
+                  const std::vector<std::string>& cluster_names) {
+    initializeClusters(cluster_names);
+    initialize(config);
+  }
+
+  void initialize(const std::string& yaml, const std::vector<std::string>& cluster_names) {
+    initializeClusters(cluster_names);
+    initialize(yaml);
+  }
+
   void initialize(const std::string& yaml) {
     envoy::extensions::filters::network::thrift_proxy::v3::ThriftProxy config;
     TestUtility::loadFromYaml(yaml, config);
-    config_ = std::make_unique<ThriftProxy::ConfigImpl>(config, factory_context_);
+    initialize(config);
+  }
+
+  void initialize(envoy::extensions::filters::network::thrift_proxy::v3::ThriftProxy& config) {
+    config_ = std::make_unique<ThriftProxy::ConfigImpl>(config, factory_context_,
+                                                        *route_config_provider_manager_);
   }
 
   MessageMetadata& genMetadata(const std::string& method_name) {
@@ -43,8 +68,9 @@ public:
     return *metadata_;
   }
 
-  std::unique_ptr<ThriftProxy::ConfigImpl> config_;
   NiceMock<Server::Configuration::MockFactoryContext> factory_context_;
+  std::unique_ptr<RouteConfigProviderManagerImpl> route_config_provider_manager_;
+  std::unique_ptr<ThriftProxy::ConfigImpl> config_;
   Network::Address::Ipv4Instance default_remote_address_{"10.0.0.1"};
   MessageMetadataSharedPtr metadata_;
 };
@@ -63,8 +89,7 @@ route_config:
     - match: { method_name: "bar" }
       route: { cluster: thrift }
 )EOF";
-
-  initialize(yaml);
+  initialize(yaml, {"thrift"});
 
   EXPECT_EQ(0U, config_->route(genMetadata("bar"), 0)
                     ->routeEntry()
@@ -82,7 +107,7 @@ route_config:
       route: { cluster: thrift }
 )EOF";
 
-  initialize(yaml);
+  initialize(yaml, {"thrift"});
 
   auto route = config_->route(genMetadata("bar"), 0)->routeEntry();
   EXPECT_EQ(0U, route->rateLimitPolicy().getApplicableRateLimit(0).size());
@@ -102,7 +127,7 @@ route_config:
               - remote_address: {}
 )EOF";
 
-  initialize(yaml);
+  initialize(yaml, {"thrift"});
 
   auto route = config_->route(genMetadata("foo"), 0)->routeEntry();
   EXPECT_FALSE(route->rateLimitPolicy().empty());
@@ -138,7 +163,7 @@ route_config:
               - source_cluster: {}
 )EOF";
 
-  initialize(yaml);
+  initialize(yaml, {"thrift"});
 
   auto route = config_->route(genMetadata("foo"), 0)->routeEntry();
   std::vector<std::reference_wrapper<const RateLimitPolicyEntry>> rate_limits =
@@ -167,6 +192,125 @@ route_config:
               testing::ContainerEq(descriptors));
 
   rate_limits = route->rateLimitPolicy().getApplicableRateLimit(10);
+  EXPECT_TRUE(rate_limits.empty());
+}
+
+// Test that rate limiter stages work with weighted cluster route entries.
+TEST_F(ThriftRateLimitConfigurationTest, WeightedClusterStages) {
+  envoy::extensions::filters::network::thrift_proxy::v3::ThriftProxy config;
+  {
+    auto* route_config = config.mutable_route_config();
+    route_config->set_name("config");
+    auto* route = route_config->add_routes();
+    route->mutable_match()->set_method_name("foo");
+    auto* action = route->mutable_route();
+    auto* cluster1 = action->mutable_weighted_clusters()->add_clusters();
+    cluster1->set_name("thrift");
+    cluster1->mutable_weight()->set_value(50);
+    auto* cluster2 = action->mutable_weighted_clusters()->add_clusters();
+    cluster2->set_name("thrift2");
+    cluster2->mutable_weight()->set_value(50);
+
+    auto* limit1 = action->add_rate_limits();
+    limit1->mutable_stage()->set_value(1);
+    limit1->add_actions()->mutable_remote_address();
+
+    action->add_rate_limits()->add_actions()->mutable_destination_cluster();
+
+    auto* limit3 = action->add_rate_limits();
+    limit3->add_actions()->mutable_destination_cluster();
+    limit3->add_actions()->mutable_source_cluster();
+  }
+  initialize(config, {"thrift", "thrift2"});
+
+  auto route = config_->route(genMetadata("foo"), 0)->routeEntry();
+  std::vector<std::reference_wrapper<const RateLimitPolicyEntry>> rate_limits =
+      route->rateLimitPolicy().getApplicableRateLimit(0);
+  EXPECT_EQ(2U, rate_limits.size());
+
+  std::vector<Envoy::RateLimit::Descriptor> descriptors;
+  for (const RateLimitPolicyEntry& rate_limit : rate_limits) {
+    rate_limit.populateDescriptors(*route, descriptors, "service_cluster", *metadata_,
+                                   default_remote_address_);
+  }
+  EXPECT_THAT(std::vector<Envoy::RateLimit::Descriptor>(
+                  {{{{"destination_cluster", "thrift"}}},
+                   {{{"destination_cluster", "thrift"}, {"source_cluster", "service_cluster"}}}}),
+              testing::ContainerEq(descriptors));
+
+  descriptors.clear();
+  rate_limits = route->rateLimitPolicy().getApplicableRateLimit(1);
+  EXPECT_EQ(1U, rate_limits.size());
+
+  for (const RateLimitPolicyEntry& rate_limit : rate_limits) {
+    rate_limit.populateDescriptors(*route, descriptors, "service_cluster", *metadata_,
+                                   default_remote_address_);
+  }
+  EXPECT_THAT(std::vector<Envoy::RateLimit::Descriptor>({{{{"remote_address", "10.0.0.1"}}}}),
+              testing::ContainerEq(descriptors));
+
+  rate_limits = route->rateLimitPolicy().getApplicableRateLimit(10);
+  EXPECT_TRUE(rate_limits.empty());
+}
+
+// Test that rate limiter stages work with dynamic route entries.
+TEST_F(ThriftRateLimitConfigurationTest, ClusterHeaderStages) {
+  envoy::extensions::filters::network::thrift_proxy::v3::ThriftProxy config;
+  {
+    auto* route_config = config.mutable_route_config();
+    route_config->set_name("config");
+    auto* route = route_config->add_routes();
+    route->mutable_match()->set_method_name("foo");
+    auto* action = route->mutable_route();
+    action->set_cluster_header("header_name");
+
+    auto* limit1 = action->add_rate_limits();
+    limit1->mutable_stage()->set_value(1);
+    limit1->add_actions()->mutable_remote_address();
+
+    action->add_rate_limits()->add_actions()->mutable_destination_cluster();
+
+    auto* limit3 = action->add_rate_limits();
+    limit3->add_actions()->mutable_destination_cluster();
+    limit3->add_actions()->mutable_source_cluster();
+  }
+  initialize(config);
+
+  auto& metadata = genMetadata("foo");
+  metadata.requestHeaders().addCopy(Http::LowerCaseString{"header_name"}, "thrift");
+
+  // Keep hold of route, it's a newly minted shared pointer.
+  auto route = config_->route(metadata, 0);
+  auto* route_entry = route->routeEntry();
+
+  std::vector<std::reference_wrapper<const RateLimitPolicyEntry>> rate_limits =
+      route_entry->rateLimitPolicy().getApplicableRateLimit(0);
+
+  EXPECT_EQ(2U, rate_limits.size());
+
+  std::vector<Envoy::RateLimit::Descriptor> descriptors;
+  for (const RateLimitPolicyEntry& rate_limit : rate_limits) {
+    rate_limit.populateDescriptors(*route_entry, descriptors, "service_cluster", *metadata_,
+                                   default_remote_address_);
+  }
+
+  EXPECT_THAT(std::vector<Envoy::RateLimit::Descriptor>(
+                  {{{{"destination_cluster", "thrift"}}},
+                   {{{"destination_cluster", "thrift"}, {"source_cluster", "service_cluster"}}}}),
+              testing::ContainerEq(descriptors));
+
+  descriptors.clear();
+  rate_limits = route_entry->rateLimitPolicy().getApplicableRateLimit(1);
+  EXPECT_EQ(1U, rate_limits.size());
+
+  for (const RateLimitPolicyEntry& rate_limit : rate_limits) {
+    rate_limit.populateDescriptors(*route_entry, descriptors, "service_cluster", *metadata_,
+                                   default_remote_address_);
+  }
+  EXPECT_THAT(std::vector<Envoy::RateLimit::Descriptor>({{{{"remote_address", "10.0.0.1"}}}}),
+              testing::ContainerEq(descriptors));
+
+  rate_limits = route_entry->rateLimitPolicy().getApplicableRateLimit(10);
   EXPECT_TRUE(rate_limits.empty());
 }
 
@@ -267,7 +411,7 @@ actions:
   )EOF";
 
   initialize(yaml);
-  metadata_.headers().addCopy(Http::LowerCaseString{"x-header-name"}, "test_value");
+  metadata_.requestHeaders().addCopy(Http::LowerCaseString{"x-header-name"}, "test_value");
 
   rate_limit_entry_->populateDescriptors(route_, descriptors_, "service_cluster", metadata_,
                                          default_remote_address_);
@@ -284,7 +428,7 @@ actions:
   )EOF";
 
   initialize(yaml);
-  metadata_.headers().addCopy(Http::LowerCaseString{"x-not-header-name"}, "test_value");
+  metadata_.requestHeaders().addCopy(Http::LowerCaseString{"x-not-header-name"}, "test_value");
 
   rate_limit_entry_->populateDescriptors(route_, descriptors_, "service_cluster", metadata_,
                                          default_remote_address_);
@@ -345,11 +489,12 @@ actions:
       descriptor_value: fake_value
       headers:
         - name: x-header-name
-          exact_match: test_value
+          string_match:
+            exact: test_value
   )EOF";
 
   initialize(yaml);
-  metadata_.headers().addCopy(Http::LowerCaseString{"x-header-name"}, "test_value");
+  metadata_.requestHeaders().addCopy(Http::LowerCaseString{"x-header-name"}, "test_value");
 
   rate_limit_entry_->populateDescriptors(route_, descriptors_, "service_cluster", metadata_,
                                          default_remote_address_);
@@ -364,11 +509,12 @@ actions:
       descriptor_value: fake_value
       headers:
         - name: x-header-name
-          exact_match: test_value
+          string_match:
+            exact: test_value
   )EOF";
 
   initialize(yaml);
-  metadata_.headers().addCopy(Http::LowerCaseString{"x-header-name"}, "not_test_value");
+  metadata_.requestHeaders().addCopy(Http::LowerCaseString{"x-header-name"}, "not_test_value");
 
   rate_limit_entry_->populateDescriptors(route_, descriptors_, "service_cluster", metadata_,
                                          default_remote_address_);
@@ -383,11 +529,12 @@ actions:
       expect_match: false
       headers:
         - name: x-header-name
-          exact_match: test_value
+          string_match:
+            exact: test_value
   )EOF";
 
   initialize(yaml);
-  metadata_.headers().addCopy(Http::LowerCaseString{"x-header-name"}, "test_value");
+  metadata_.requestHeaders().addCopy(Http::LowerCaseString{"x-header-name"}, "test_value");
 
   rate_limit_entry_->populateDescriptors(route_, descriptors_, "service_cluster", metadata_,
                                          default_remote_address_);
@@ -402,11 +549,12 @@ actions:
       expect_match: false
       headers:
         - name: x-header-name
-          exact_match: test_value
+          string_match:
+            exact: test_value
   )EOF";
 
   initialize(yaml);
-  metadata_.headers().addCopy(Http::LowerCaseString{"x-header-name"}, "not_test_value");
+  metadata_.requestHeaders().addCopy(Http::LowerCaseString{"x-header-name"}, "not_test_value");
 
   rate_limit_entry_->populateDescriptors(route_, descriptors_, "service_cluster", metadata_,
                                          default_remote_address_);
@@ -439,7 +587,8 @@ actions:
       descriptor_value: fake_value
       headers:
         - name: x-header-name
-          exact_match: test_value
+          string_match:
+            exact: test_value
   )EOF";
 
   initialize(yaml);

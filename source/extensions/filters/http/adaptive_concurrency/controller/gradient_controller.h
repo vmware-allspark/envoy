@@ -3,12 +3,15 @@
 #include <chrono>
 #include <vector>
 
+#include "envoy/common/random_generator.h"
+#include "envoy/common/time.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/extensions/filters/http/adaptive_concurrency/v3/adaptive_concurrency.pb.h"
 #include "envoy/runtime/runtime.h"
 #include "envoy/stats/stats_macros.h"
 
-#include "extensions/filters/http/adaptive_concurrency/controller/controller.h"
+#include "source/common/common/thread_synchronizer.h"
+#include "source/extensions/filters/http/adaptive_concurrency/controller/controller.h"
 
 #include "absl/base/thread_annotations.h"
 #include "absl/strings/numbers.h"
@@ -210,23 +213,28 @@ class GradientController : public ConcurrencyController {
 public:
   GradientController(GradientControllerConfig config, Event::Dispatcher& dispatcher,
                      Runtime::Loader& runtime, const std::string& stats_prefix, Stats::Scope& scope,
-                     Runtime::RandomGenerator& random);
+                     Random::RandomGenerator& random, TimeSource& time_source);
+
+  // Used in unit tests to validate worker thread interactions.
+  Thread::ThreadSynchronizer& synchronizer() { return synchronizer_; }
+
+  // True if there is a minRTT sampling window active.
+  bool inMinRTTSamplingWindow() const { return deferred_limit_value_.load() > 0; }
 
   // ConcurrencyController.
   RequestForwardingAction forwardingDecision() override;
-  void recordLatencySample(std::chrono::nanoseconds rq_latency) override;
+  void recordLatencySample(MonotonicTime rq_send_time) override;
   void cancelLatencySample() override;
   uint32_t concurrencyLimit() const override { return concurrency_limit_.load(); }
 
 private:
   static GradientControllerStats generateStats(Stats::Scope& scope,
                                                const std::string& stats_prefix);
-  void updateMinRTT();
+  void updateMinRTT() ABSL_EXCLUSIVE_LOCKS_REQUIRED(sample_mutation_mtx_);
   std::chrono::microseconds processLatencySamplesAndClear()
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(sample_mutation_mtx_);
   uint32_t calculateNewLimit() ABSL_EXCLUSIVE_LOCKS_REQUIRED(sample_mutation_mtx_);
   void enterMinRTTSamplingWindow();
-  bool inMinRTTSamplingWindow() const { return deferred_limit_value_.load() > 0; }
   void resetSampleWindow() ABSL_EXCLUSIVE_LOCKS_REQUIRED(sample_mutation_mtx_);
   void updateConcurrencyLimit(const uint32_t new_limit)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(sample_mutation_mtx_);
@@ -237,7 +245,8 @@ private:
   Event::Dispatcher& dispatcher_;
   Stats::Scope& scope_;
   GradientControllerStats stats_;
-  Runtime::RandomGenerator& random_;
+  Random::RandomGenerator& random_;
+  TimeSource& time_source_;
 
   // Protects data related to latency sampling and RTT values. In addition to protecting the latency
   // sample histogram, the mutex ensures that the minRTT calculation window and the sample window
@@ -274,8 +283,15 @@ private:
   // after remaining at the minimum limit for too long.
   uint32_t consecutive_min_concurrency_set_ ABSL_GUARDED_BY(sample_mutation_mtx_);
 
+  // We will disregard sampling any requests admitted before this timestamp to prevent sampling
+  // requests admitted before the start of a minRTT window and potentially skewing the minRTT.
+  MonotonicTime min_rtt_epoch_;
+
   Event::TimerPtr min_rtt_calc_timer_;
   Event::TimerPtr sample_reset_timer_;
+
+  // Used for testing only.
+  Thread::ThreadSynchronizer synchronizer_;
 };
 using GradientControllerSharedPtr = std::shared_ptr<GradientController>;
 

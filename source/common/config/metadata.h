@@ -2,7 +2,6 @@
 
 #include <memory>
 #include <string>
-#include <unordered_map>
 
 #include "envoy/config/core/v3/base.pb.h"
 #include "envoy/config/typed_metadata.h"
@@ -11,8 +10,10 @@
 #include "envoy/singleton/manager.h"
 #include "envoy/type/metadata/v3/metadata.pb.h"
 
-#include "common/protobuf/protobuf.h"
-#include "common/shared_pool/shared_pool.h"
+#include "source/common/protobuf/protobuf.h"
+#include "source/common/shared_pool/shared_pool.h"
+
+#include "absl/container/node_hash_map.h"
 
 namespace Envoy {
 namespace Config {
@@ -115,15 +116,28 @@ protected:
    */
   void populateFrom(const envoy::config::core::v3::Metadata& metadata) {
     auto& data_by_key = metadata.filter_metadata();
-    for (const auto& it : Registry::FactoryRegistry<factoryClass>::factories()) {
-      const auto& meta_iter = data_by_key.find(it.first);
+    auto& typed_data_by_key = metadata.typed_filter_metadata();
+    for (const auto& [factory_name, factory] :
+         Registry::FactoryRegistry<factoryClass>::factories()) {
+      const auto& typed_meta_iter = typed_data_by_key.find(factory_name);
+      // If the key exists in Any metadata, and parse() does not return nullptr,
+      // populate data_.
+      if (typed_meta_iter != typed_data_by_key.end()) {
+        auto result = factory->parse(typed_meta_iter->second);
+        if (result != nullptr) {
+          data_[factory->name()] = std::move(result);
+          continue;
+        }
+      }
+      // Fall back cases to parsing Struct metadata and populate data_.
+      const auto& meta_iter = data_by_key.find(factory_name);
       if (meta_iter != data_by_key.end()) {
-        data_[it.second->name()] = it.second->parse(meta_iter->second);
+        data_[factory->name()] = factory->parse(meta_iter->second);
       }
     }
   }
 
-  std::unordered_map<std::string, std::unique_ptr<const TypedMetadata::Object>> data_;
+  absl::node_hash_map<std::string, std::unique_ptr<const TypedMetadata::Object>> data_;
 };
 
 } // namespace Config

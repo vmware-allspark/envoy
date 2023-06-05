@@ -2,10 +2,11 @@
 
 #include "envoy/common/exception.h"
 
-#include "extensions/filters/network/dubbo_proxy/filters/filter.h"
-#include "extensions/filters/network/dubbo_proxy/metadata.h"
-#include "extensions/filters/network/dubbo_proxy/protocol.h"
-#include "extensions/filters/network/dubbo_proxy/serializer.h"
+#include "source/common/common/utility.h"
+#include "source/extensions/filters/network/dubbo_proxy/filters/filter.h"
+#include "source/extensions/filters/network/dubbo_proxy/metadata.h"
+#include "source/extensions/filters/network/dubbo_proxy/protocol.h"
+#include "source/extensions/filters/network/dubbo_proxy/serializer.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -32,7 +33,7 @@ struct AppExceptionBase : public EnvoyException,
     metadata.setResponseStatus<T>(status_);
     metadata.setMessageType(MessageType::Response);
     if (!protocol.encode(buffer, metadata, what(), response_type_)) {
-      throw EnvoyException("Failed to encode local reply message");
+      ExceptionUtil::throwEnvoyException("Failed to encode local reply message");
     }
 
     return ResponseType::Exception;

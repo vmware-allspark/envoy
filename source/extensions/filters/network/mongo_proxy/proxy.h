@@ -16,16 +16,15 @@
 #include "envoy/stats/scope.h"
 #include "envoy/stats/stats_macros.h"
 
-#include "common/buffer/buffer_impl.h"
-#include "common/common/logger.h"
-#include "common/network/filter_impl.h"
-#include "common/protobuf/utility.h"
-#include "common/singleton/const_singleton.h"
-
-#include "extensions/filters/common/fault/fault_config.h"
-#include "extensions/filters/network/mongo_proxy/codec.h"
-#include "extensions/filters/network/mongo_proxy/mongo_stats.h"
-#include "extensions/filters/network/mongo_proxy/utility.h"
+#include "source/common/buffer/buffer_impl.h"
+#include "source/common/common/logger.h"
+#include "source/common/network/filter_impl.h"
+#include "source/common/protobuf/utility.h"
+#include "source/common/singleton/const_singleton.h"
+#include "source/extensions/filters/common/fault/fault_config.h"
+#include "source/extensions/filters/network/mongo_proxy/codec.h"
+#include "source/extensions/filters/network/mongo_proxy/mongo_stats.h"
+#include "source/extensions/filters/network/mongo_proxy/utility.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -167,12 +166,12 @@ private:
   // Increment counters related to queries. 'names' is passed by non-const
   // reference so the implementation can mutate it without copying, though it
   // always restores it to its prior state prior to return.
-  void chargeQueryStats(Stats::StatNameVec& names, QueryMessageInfo::QueryType query_type);
+  void chargeQueryStats(Stats::ElementVec& names, QueryMessageInfo::QueryType query_type);
 
   // Add samples to histograms related to replies. 'names' is passed by
   // non-const reference so the implementation can mutate it without copying,
   // though it always restores it to its prior state prior to return.
-  void chargeReplyStats(ActiveQuery& active_query, Stats::StatNameVec& names,
+  void chargeReplyStats(ActiveQuery& active_query, Stats::ElementVec& names,
                         const ReplyMessage& message);
 
   void doDecode(Buffer::Instance& buffer);
@@ -183,7 +182,6 @@ private:
   void tryInjectDelay();
 
   std::unique_ptr<Decoder> decoder_;
-  std::string stat_prefix_;
   MongoProxyStats stats_;
   Runtime::Loader& runtime_;
   const Network::DrainDecision& drain_decision_;

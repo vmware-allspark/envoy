@@ -1,18 +1,27 @@
 #pragma once
 
 #include "envoy/event/file_event.h"
+#include "envoy/extensions/filters/listener/proxy_protocol/v3/proxy_protocol.pb.h"
 #include "envoy/network/filter.h"
 #include "envoy/stats/scope.h"
 #include "envoy/stats/stats_macros.h"
 
-#include "common/common/logger.h"
+#include "source/common/common/logger.h"
+#include "source/extensions/common/proxy_protocol/proxy_protocol_header.h"
 
+#include "absl/container/flat_hash_map.h"
 #include "proxy_protocol_header.h"
+
+using Envoy::Extensions::Common::ProxyProtocol::PROXY_PROTO_V2_ADDR_LEN_UNIX;
+using Envoy::Extensions::Common::ProxyProtocol::PROXY_PROTO_V2_HEADER_LEN;
 
 namespace Envoy {
 namespace Extensions {
 namespace ListenerFilters {
 namespace ProxyProtocol {
+
+using KeyValuePair =
+    envoy::extensions::filters::listener::proxy_protocol::v3::ProxyProtocol::KeyValuePair;
 
 /**
  * All stats for the proxy protocol. @see stats_macros.h
@@ -32,16 +41,41 @@ struct ProxyProtocolStats {
 /**
  * Global configuration for Proxy Protocol listener filter.
  */
-class Config {
+class Config : public Logger::Loggable<Logger::Id::filter> {
 public:
-  Config(Stats::Scope& scope);
+  Config(
+      Stats::Scope& scope,
+      const envoy::extensions::filters::listener::proxy_protocol::v3::ProxyProtocol& proto_config);
 
   ProxyProtocolStats stats_;
+
+  /**
+   * Return null if the type of TLV is not needed otherwise a pointer to the KeyValuePair for
+   * emitting to dynamic metadata.
+   */
+  const KeyValuePair* isTlvTypeNeeded(uint8_t type) const;
+
+  /**
+   * Number of TLV types that need to be parsed and saved to dynamic metadata.
+   */
+  size_t numberOfNeededTlvTypes() const;
+
+  /**
+   * Filter configuration that determines if we should pass-through requests without
+   * proxy protocol. Should only be configured to true for trusted downstreams.
+   */
+  bool allowRequestsWithoutProxyProtocol() const;
+
+private:
+  absl::flat_hash_map<uint8_t, KeyValuePair> tlv_types_;
+  const bool allow_requests_without_proxy_protocol_;
 };
 
 using ConfigSharedPtr = std::shared_ptr<Config>;
 
-enum ProxyProtocolVersion { Unknown = -1, InProgress = -2, V1 = 1, V2 = 2 };
+enum ProxyProtocolVersion { Unknown = 0, V1 = 1, V2 = 2 };
+
+enum class ReadOrParseState { Done, TryAgainLater, Error, SkipFilter };
 
 /**
  * Implementation the PROXY Protocol listener filter
@@ -59,6 +93,8 @@ public:
 
   // Network::ListenerFilter
   Network::FilterStatus onAccept(Network::ListenerFilterCallbacks& cb) override;
+  Network::FilterStatus onData(Network::ListenerFilterBuffer& buffer) override;
+  size_t maxReadBytes() const override { return max_proxy_protocol_len_; }
 
 private:
   static const size_t MAX_PROXY_PROTO_LEN_V2 =
@@ -66,45 +102,37 @@ private:
   static const size_t MAX_PROXY_PROTO_LEN_V1 = 108;
 
   void onRead();
-  void onReadWorker();
+  ReadOrParseState parseBuffer(Network::ListenerFilterBuffer& buffer);
 
   /**
    * Helper function that attempts to read the proxy header
    * (delimited by \r\n if V1 format, or with length if V2)
-   * throws EnvoyException on any socket errors.
-   * @return bool true valid header, false if more data is needed.
+   * @return ReadOrParseState
    */
-  bool readProxyHeader(os_fd_t fd);
+  ReadOrParseState readProxyHeader(Network::ListenerFilterBuffer& buffer);
+
+  bool parseTlvs(const uint8_t* buf, size_t len);
+  ReadOrParseState readExtensions(Network::ListenerFilterBuffer& buffer);
 
   /**
-   * Parse (and discard unknown) header extensions (until hdr.extensions_length == 0)
+   * Given a char * & len, parse the header as per spec.
+   * @return bool true if parsing succeeded, false if parsing failed.
    */
-  bool parseExtensions(os_fd_t fd);
-
-  /**
-   * Given a char * & len, parse the header as per spec
-   */
-  void parseV1Header(char* buf, size_t len);
-  void parseV2Header(char* buf);
-  size_t lenV2Address(char* buf);
+  bool parseV1Header(const char* buf, size_t len);
+  bool parseV2Header(const char* buf);
+  absl::optional<size_t> lenV2Address(const char* buf);
 
   Network::ListenerFilterCallbacks* cb_{};
-  Event::FileEventPtr file_event_;
-
-  // The offset in buf_ that has been fully read
-  size_t buf_off_{};
 
   // The index in buf_ where the search for '\r\n' should continue from
   size_t search_index_{1};
 
   ProxyProtocolVersion header_version_{Unknown};
 
-  // Stores the portion of the first line that has been read so far.
-  char buf_[MAX_PROXY_PROTO_LEN_V2];
-
   ConfigSharedPtr config_;
 
   absl::optional<WireHeader> proxy_protocol_header_;
+  size_t max_proxy_protocol_len_{MAX_PROXY_PROTO_LEN_V2};
 };
 
 } // namespace ProxyProtocol

@@ -1,19 +1,19 @@
-#include "common/http/rest_api_fetcher.h"
+#include "source/common/http/rest_api_fetcher.h"
 
 #include <chrono>
 #include <cstdint>
 #include <string>
 
-#include "common/common/enum_to_int.h"
-#include "common/config/utility.h"
-#include "common/http/message_impl.h"
-#include "common/http/utility.h"
+#include "source/common/common/enum_to_int.h"
+#include "source/common/config/utility.h"
+#include "source/common/http/message_impl.h"
+#include "source/common/http/utility.h"
 
 namespace Envoy {
 namespace Http {
 
 RestApiFetcher::RestApiFetcher(Upstream::ClusterManager& cm, const std::string& remote_cluster_name,
-                               Event::Dispatcher& dispatcher, Runtime::RandomGenerator& random,
+                               Event::Dispatcher& dispatcher, Random::RandomGenerator& random,
                                std::chrono::milliseconds refresh_interval,
                                std::chrono::milliseconds request_timeout)
     : remote_cluster_name_(remote_cluster_name), cm_(cm), random_(random),
@@ -39,9 +39,9 @@ void RestApiFetcher::onSuccess(const Http::AsyncClient::Request& request,
     return;
   }
 
-  try {
-    parseResponse(*response);
-  } catch (EnvoyException& e) {
+  TRY_ASSERT_MAIN_THREAD { parseResponse(*response); }
+  END_TRY
+  catch (EnvoyException& e) {
     onFetchFailure(Config::ConfigUpdateFailureReason::UpdateRejected, &e);
   }
 
@@ -60,9 +60,14 @@ void RestApiFetcher::refresh() {
   RequestMessagePtr message(new RequestMessageImpl());
   createRequest(*message);
   message->headers().setHost(remote_cluster_name_);
-  active_request_ = cm_.httpAsyncClientForCluster(remote_cluster_name_)
-                        .send(std::move(message), *this,
-                              AsyncClient::RequestOptions().setTimeout(request_timeout_));
+  const auto thread_local_cluster = cm_.getThreadLocalCluster(remote_cluster_name_);
+  if (thread_local_cluster != nullptr) {
+    active_request_ = thread_local_cluster->httpAsyncClient().send(
+        std::move(message), *this, AsyncClient::RequestOptions().setTimeout(request_timeout_));
+  } else {
+    onFetchFailure(Config::ConfigUpdateFailureReason::ConnectionFailure, nullptr);
+    requestComplete();
+  }
 }
 
 void RestApiFetcher::requestComplete() {

@@ -1,10 +1,11 @@
 #pragma once
 
 #include "envoy/api/api.h"
+#include "envoy/config/bootstrap/v3/bootstrap.pb.h"
 #include "envoy/event/timer.h"
 #include "envoy/filesystem/filesystem.h"
 
-#include "common/api/api_impl.h"
+#include "source/common/api/api_impl.h"
 
 namespace Envoy {
 namespace Api {
@@ -16,10 +17,15 @@ namespace Api {
 class ValidationImpl : public Impl {
 public:
   ValidationImpl(Thread::ThreadFactory& thread_factory, Stats::Store& stats_store,
-                 Event::TimeSystem& time_system, Filesystem::Instance& file_system);
+                 Event::TimeSystem& time_system, Filesystem::Instance& file_system,
+                 Random::RandomGenerator& random_generator,
+                 const envoy::config::bootstrap::v3::Bootstrap& bootstrap);
 
-  Event::DispatcherPtr allocateDispatcher() override;
-  Event::DispatcherPtr allocateDispatcher(Buffer::WatermarkFactoryPtr&& watermark_factory) override;
+  Event::DispatcherPtr allocateDispatcher(const std::string& name) override;
+  Event::DispatcherPtr allocateDispatcher(const std::string& name,
+                                          const Event::ScaledRangeTimerManagerFactory&) override;
+  Event::DispatcherPtr allocateDispatcher(const std::string& name,
+                                          Buffer::WatermarkFactoryPtr&& watermark_factory) override;
 
 private:
   Event::TimeSystem& time_system_;
