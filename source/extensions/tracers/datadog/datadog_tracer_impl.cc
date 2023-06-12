@@ -1,16 +1,14 @@
-#include "extensions/tracers/datadog/datadog_tracer_impl.h"
+#include "source/extensions/tracers/datadog/datadog_tracer_impl.h"
 
-#include "envoy/config/trace/v3/trace.pb.h"
+#include "envoy/config/trace/v3/datadog.pb.h"
 
-#include "common/common/enum_to_int.h"
-#include "common/common/fmt.h"
-#include "common/common/utility.h"
-#include "common/config/utility.h"
-#include "common/http/message_impl.h"
-#include "common/http/utility.h"
-#include "common/tracing/http_tracer_impl.h"
-
-#include "extensions/tracers/well_known_names.h"
+#include "source/common/common/enum_to_int.h"
+#include "source/common/common/fmt.h"
+#include "source/common/common/utility.h"
+#include "source/common/config/utility.h"
+#include "source/common/http/message_impl.h"
+#include "source/common/http/utility.h"
+#include "source/common/version/version.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -23,23 +21,40 @@ Driver::TlsTracer::TlsTracer(const std::shared_ptr<opentracing::Tracer>& tracer,
 
 Driver::Driver(const envoy::config::trace::v3::DatadogConfig& datadog_config,
                Upstream::ClusterManager& cluster_manager, Stats::Scope& scope,
-               ThreadLocal::SlotAllocator& tls, Runtime::Loader& runtime)
+               ThreadLocal::SlotAllocator& tls, Runtime::Loader&)
     : OpenTracingDriver{scope},
       cm_(cluster_manager), tracer_stats_{DATADOG_TRACER_STATS(
                                 POOL_COUNTER_PREFIX(scope, "tracing.datadog."))},
-      tls_(tls.allocateSlot()), runtime_(runtime) {
+      tls_(tls.allocateSlot()) {
 
-  Config::Utility::checkCluster(TracerNames::get().Datadog, datadog_config.collector_cluster(), cm_,
+  Config::Utility::checkCluster("envoy.tracers.datadog", datadog_config.collector_cluster(), cm_,
                                 /* allow_added_via_api */ true);
   cluster_ = datadog_config.collector_cluster();
+  hostname_ = !datadog_config.collector_hostname().empty() ? datadog_config.collector_hostname()
+                                                           : datadog_config.collector_cluster();
 
   // Default tracer options.
+  tracer_options_.version = absl::StrCat("envoy ", Envoy::VersionInfo::version());
   tracer_options_.operation_name_override = "envoy.proxy";
   tracer_options_.service = "envoy";
   tracer_options_.inject = std::set<datadog::opentracing::PropagationStyle>{
       datadog::opentracing::PropagationStyle::Datadog};
   tracer_options_.extract = std::set<datadog::opentracing::PropagationStyle>{
       datadog::opentracing::PropagationStyle::Datadog};
+  tracer_options_.log_func = [](datadog::opentracing::LogLevel level,
+                                opentracing::string_view message) {
+    switch (level) {
+    case datadog::opentracing::LogLevel::debug:
+      ENVOY_LOG(debug, "{}", message);
+      break;
+    case datadog::opentracing::LogLevel::info:
+      ENVOY_LOG(info, "{}", message);
+      break;
+    case datadog::opentracing::LogLevel::error:
+      ENVOY_LOG(error, "{}", message);
+      break;
+    }
+  };
 
   // Configuration overrides for tracer options.
   if (!datadog_config.service_name().empty()) {
@@ -90,24 +105,20 @@ void TraceReporter::flushTraces() {
     Http::RequestMessagePtr message(new Http::RequestMessageImpl());
     message->headers().setReferenceMethod(Http::Headers::get().MethodValues.Post);
     message->headers().setReferencePath(encoder_->path());
-    message->headers().setReferenceHost(driver_.cluster());
+    message->headers().setReferenceHost(driver_.hostname());
     for (auto& h : encoder_->headers()) {
       message->headers().setReferenceKey(lower_case_headers_.at(h.first), h.second);
     }
 
-    Buffer::InstancePtr body(new Buffer::OwnedImpl());
-    body->add(encoder_->payload());
-    message->body() = std::move(body);
+    message->body().add(encoder_->payload());
     ENVOY_LOG(debug, "submitting {} trace(s) to {} with payload size {}", pendingTraces,
               encoder_->path(), encoder_->payload().size());
 
-    if (collector_cluster_.exists()) {
+    if (collector_cluster_.threadLocalCluster().has_value()) {
       Http::AsyncClient::Request* request =
-          driver_.clusterManager()
-              .httpAsyncClientForCluster(collector_cluster_.info()->name())
-              .send(
-                  std::move(message), *this,
-                  Http::AsyncClient::RequestOptions().setTimeout(std::chrono::milliseconds(1000U)));
+          collector_cluster_.threadLocalCluster()->get().httpAsyncClient().send(
+              std::move(message), *this,
+              Http::AsyncClient::RequestOptions().setTimeout(std::chrono::milliseconds(1000U)));
       if (request) {
         active_requests_.add(*request);
       }
@@ -138,7 +149,7 @@ void TraceReporter::onSuccess(const Http::AsyncClient::Request& request,
   } else {
     ENVOY_LOG(debug, "traces successfully submitted to datadog agent");
     driver_.tracerStats().reports_sent_.inc();
-    encoder_->handleResponse(http_response->body()->toString());
+    encoder_->handleResponse(http_response->bodyAsString());
   }
 }
 

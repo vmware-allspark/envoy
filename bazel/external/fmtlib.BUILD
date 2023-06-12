@@ -2,9 +2,6 @@ licenses(["notice"])  # Apache 2
 
 cc_library(
     name = "fmtlib",
-    srcs = glob([
-        "fmt/*.cc",
-    ]),
     hdrs = glob([
         "include/fmt/*.h",
     ]),

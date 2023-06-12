@@ -11,7 +11,9 @@
 #include "envoy/stream_info/stream_info.h"
 #include "envoy/tracing/http_tracer.h"
 
-#include "common/singleton/const_singleton.h"
+#include "source/common/http/headers.h"
+#include "source/common/http/utility.h"
+#include "source/common/singleton/const_singleton.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -32,6 +34,32 @@ struct TracingConstantValues {
 using TracingConstants = ConstSingleton<TracingConstantValues>;
 
 /**
+ * Possible constant response code details values for a check call.
+ */
+struct ResponseCodeDetailsValues {
+  // The ext_authz filter denied the downstream request/connection.
+  const std::string AuthzDenied = "ext_authz_denied";
+  // The ext_authz filter encountered a failure, and was configured to fail-closed.
+  const std::string AuthzError = "ext_authz_error";
+};
+using ResponseCodeDetails = ConstSingleton<ResponseCodeDetailsValues>;
+
+/**
+ * Constant auth related HTTP headers. All lower case. This group of headers can
+ * contain prefix override headers.
+ */
+class HeaderValues {
+public:
+  const char* prefix() const { return ThreadSafeSingleton<Http::PrefixValue>::get().prefix(); }
+
+  const Http::LowerCaseString EnvoyAuthPartialBody{absl::StrCat(prefix(), "-auth-partial-body")};
+  const Http::LowerCaseString EnvoyAuthHeadersToRemove{
+      absl::StrCat(prefix(), "-auth-headers-to-remove")};
+};
+
+using Headers = ConstSingleton<HeaderValues>;
+
+/**
  * Possible async results for a check call.
  */
 enum class CheckStatus {
@@ -49,14 +77,38 @@ enum class CheckStatus {
 struct Response {
   // Call status.
   CheckStatus status;
-  // Optional http headers used on either denied or ok responses.
+  // A set of HTTP headers returned by the authorization server, that will be optionally appended
+  // to the request to the upstream server.
   Http::HeaderVector headers_to_append;
-  // Optional http headers used on either denied or ok responses.
+  // A set of HTTP headers returned by the authorization server, will be optionally set
+  // (using "setCopy") to the request to the upstream server.
+  Http::HeaderVector headers_to_set;
+  // A set of HTTP headers returned by the authorization server, will be optionally added
+  // (using "addCopy") to the request to the upstream server.
   Http::HeaderVector headers_to_add;
+  // A set of HTTP headers returned by the authorization server, will be optionally added
+  // (using "addCopy") to the response sent back to the downstream client on OK auth
+  // responses.
+  Http::HeaderVector response_headers_to_add;
+  // A set of HTTP headers returned by the authorization server, will be optionally set (using
+  // "setCopy") to the response sent back to the downstream client on OK auth responses.
+  Http::HeaderVector response_headers_to_set;
+  // A set of HTTP headers consumed by the authorization server, will be removed
+  // from the request to the upstream server.
+  std::vector<Envoy::Http::LowerCaseString> headers_to_remove;
+  // A set of query string parameters to be set (possibly overwritten) on the
+  // request to the upstream server.
+  Http::Utility::QueryParamsVector query_parameters_to_set;
+  // A set of query string parameters to remove from the request to the upstream server.
+  std::vector<std::string> query_parameters_to_remove;
   // Optional http body used only on denied response.
   std::string body;
   // Optional http status used only on denied response.
   Http::Code status_code{};
+
+  // A set of metadata returned by the authorization server, that will be emitted as filter's
+  // dynamic metadata that other filters can leverage.
+  ProtobufWkt::Struct dynamic_metadata;
 };
 
 using ResponsePtr = std::unique_ptr<Response>;

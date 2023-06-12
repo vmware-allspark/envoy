@@ -10,7 +10,7 @@ configuration sitting behind an Envoy cluster used as an HTTP L7 edge reverse pr
 reverse proxy provides the following features:
 
 * Terminates TLS.
-* Supports both HTTP/1.1 and HTTP/2.
+* Supports HTTP/1.1, HTTP/2, and HTTP/3.
 * Full HTTP L7 routing support.
 * Talks to the service to service Envoy clusters via the standard :ref:`ingress port
   <deployment_type_service_to_service_ingress>` and using the discovery service for host
@@ -21,6 +21,5 @@ reverse proxy provides the following features:
 Configuration template
 ^^^^^^^^^^^^^^^^^^^^^^
 
-The source distribution includes an example front proxy configuration that is very similar to
-the version that Lyft runs in production. See :ref:`here <install_ref_configs>` for more
-information.
+The source distribution includes an example front proxy configuration. See
+:ref:`here <install_sandboxes_front_proxy>` for more information.

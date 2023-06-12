@@ -11,21 +11,19 @@ namespace {
 class StatTestUtilityTest : public testing::Test {
 protected:
   StatTestUtilityTest()
-      : symbol_table_(SymbolTableCreator::makeSymbolTable()), test_store_(*symbol_table_),
-        dynamic_(*symbol_table_), symbolic_(*symbol_table_) {
-    symbol_table_creator_test_peer_.setUseFakeSymbolTables(false);
-  }
+      : test_store_(symbol_table_), test_scope_(test_store_.rootScope()), dynamic_(symbol_table_),
+        symbolic_(symbol_table_) {}
 
-  TestUtil::SymbolTableCreatorTestPeer symbol_table_creator_test_peer_;
-  SymbolTablePtr symbol_table_;
+  SymbolTableImpl symbol_table_;
   TestUtil::TestStore test_store_;
+  ScopeSharedPtr test_scope_;
   StatNameDynamicPool dynamic_;
   StatNamePool symbolic_;
 };
 
 TEST_F(StatTestUtilityTest, Counters) {
-  test_store_.counterFromStatName(dynamic_.add("dynamic.stat")).inc();
-  test_store_.counterFromStatName(symbolic_.add("symbolic.stat")).inc();
+  test_scope_->counterFromStatName(dynamic_.add("dynamic.stat")).inc();
+  test_scope_->counterFromStatName(symbolic_.add("symbolic.stat")).inc();
   EXPECT_EQ(1, test_store_.counter("dynamic.stat").value());
   EXPECT_FALSE(test_store_.findCounterByString("dynamic.stat2"));
   EXPECT_EQ(1, test_store_.counter("symbolic.stat").value());
@@ -33,8 +31,8 @@ TEST_F(StatTestUtilityTest, Counters) {
 }
 
 TEST_F(StatTestUtilityTest, Gauges) {
-  test_store_.counterFromStatName(dynamic_.add("dynamic.stat")).inc();
-  test_store_.counterFromStatName(symbolic_.add("symbolic.stat")).inc();
+  test_scope_->counterFromStatName(dynamic_.add("dynamic.stat")).inc();
+  test_scope_->counterFromStatName(symbolic_.add("symbolic.stat")).inc();
   EXPECT_EQ(1, test_store_.counter("dynamic.stat").value());
   EXPECT_FALSE(test_store_.findGaugeByString("dynamic.stat2"));
   EXPECT_EQ(1, test_store_.counter("symbolic.stat").value());
@@ -42,8 +40,8 @@ TEST_F(StatTestUtilityTest, Gauges) {
 }
 
 TEST_F(StatTestUtilityTest, Histograms) {
-  test_store_.counterFromStatName(dynamic_.add("dynamic.stat")).inc();
-  test_store_.counterFromStatName(symbolic_.add("symbolic.stat")).inc();
+  test_scope_->counterFromStatName(dynamic_.add("dynamic.stat")).inc();
+  test_scope_->counterFromStatName(symbolic_.add("symbolic.stat")).inc();
   EXPECT_EQ(1, test_store_.counter("dynamic.stat").value());
   EXPECT_FALSE(test_store_.findHistogramByString("dynamic.stat2"));
   EXPECT_EQ(1, test_store_.counter("symbolic.stat").value());

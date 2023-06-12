@@ -1,23 +1,81 @@
-#include "extensions/filters/http/cors/cors_filter.h"
+#include "source/extensions/filters/http/cors/cors_filter.h"
+
+#include <algorithm>
 
 #include "envoy/http/codes.h"
+#include "envoy/http/header_map.h"
 #include "envoy/stats/scope.h"
 
-#include "common/common/empty_string.h"
-#include "common/common/enum_to_int.h"
-#include "common/http/header_map_impl.h"
-#include "common/http/headers.h"
+#include "source/common/common/empty_string.h"
+#include "source/common/common/enum_to_int.h"
+#include "source/common/http/header_map_impl.h"
+#include "source/common/http/headers.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace HttpFilters {
 namespace Cors {
 
+struct HttpResponseCodeDetailValues {
+  const absl::string_view CorsResponse = "cors_response";
+};
+using HttpResponseCodeDetails = ConstSingleton<HttpResponseCodeDetailValues>;
+
+Http::RegisterCustomInlineHeader<Http::CustomInlineHeaderRegistry::Type::RequestHeaders>
+    access_control_request_headers_handle(Http::CustomHeaders::get().AccessControlRequestHeaders);
+Http::RegisterCustomInlineHeader<Http::CustomInlineHeaderRegistry::Type::RequestHeaders>
+    access_control_request_method_handle(Http::CustomHeaders::get().AccessControlRequestMethod);
+Http::RegisterCustomInlineHeader<Http::CustomInlineHeaderRegistry::Type::RequestHeaders>
+    origin_handle(Http::CustomHeaders::get().Origin);
+Http::RegisterCustomInlineHeader<Http::CustomInlineHeaderRegistry::Type::ResponseHeaders>
+    access_control_allow_origin_handle(Http::CustomHeaders::get().AccessControlAllowOrigin);
+Http::RegisterCustomInlineHeader<Http::CustomInlineHeaderRegistry::Type::ResponseHeaders>
+    access_control_allow_credentials_handle(
+        Http::CustomHeaders::get().AccessControlAllowCredentials);
+Http::RegisterCustomInlineHeader<Http::CustomInlineHeaderRegistry::Type::ResponseHeaders>
+    access_control_allow_methods_handle(Http::CustomHeaders::get().AccessControlAllowMethods);
+Http::RegisterCustomInlineHeader<Http::CustomInlineHeaderRegistry::Type::ResponseHeaders>
+    access_control_allow_headers_handle(Http::CustomHeaders::get().AccessControlAllowHeaders);
+Http::RegisterCustomInlineHeader<Http::CustomInlineHeaderRegistry::Type::ResponseHeaders>
+    access_control_max_age_handle(Http::CustomHeaders::get().AccessControlMaxAge);
+Http::RegisterCustomInlineHeader<Http::CustomInlineHeaderRegistry::Type::ResponseHeaders>
+    access_control_expose_headers_handle(Http::CustomHeaders::get().AccessControlExposeHeaders);
+Http::RegisterCustomInlineHeader<Http::CustomInlineHeaderRegistry::Type::RequestHeaders>
+    access_control_request_private_network_handle(
+        Http::CustomHeaders::get().AccessControlRequestPrviateNetwork);
+Http::RegisterCustomInlineHeader<Http::CustomInlineHeaderRegistry::Type::ResponseHeaders>
+    access_control_response_private_network_handle(
+        Http::CustomHeaders::get().AccessControlAllowPrviateNetwork);
+
 CorsFilterConfig::CorsFilterConfig(const std::string& stats_prefix, Stats::Scope& scope)
     : stats_(generateStats(stats_prefix + "cors.", scope)) {}
 
-CorsFilter::CorsFilter(CorsFilterConfigSharedPtr config)
-    : policies_({{nullptr, nullptr}}), config_(std::move(config)) {}
+CorsFilter::CorsFilter(CorsFilterConfigSharedPtr config) : config_(std::move(config)) {}
+
+void CorsFilter::initializeCorsPolicies() {
+  decoder_callbacks_->traversePerFilterConfig([this](const Router::RouteSpecificFilterConfig& cfg) {
+    const auto* typed_cfg = dynamic_cast<const Router::CorsPolicy*>(&cfg);
+    if (typed_cfg != nullptr) {
+      policies_.push_back(typed_cfg);
+    }
+  });
+
+  // The 'traversePerFilterConfig' will handle cors policy of virtual host first. So, we need
+  // reverse the 'policies_' to make sure the cors policy of route entry to be first item in the
+  // 'policies_'.
+  if (policies_.size() >= 2) {
+    std::reverse(policies_.begin(), policies_.end());
+  }
+
+  // If no cors policy is configured in the per filter config, then the cors policy fields in the
+  // route configuration will be ignored.
+  if (policies_.empty()) {
+    policies_ = {
+        decoder_callbacks_->route()->routeEntry()->corsPolicy(),
+        decoder_callbacks_->route()->routeEntry()->virtualHost().corsPolicy(),
+    };
+  }
+}
 
 // This handles the CORS preflight request as described in
 // https://www.w3.org/TR/cors/#resource-preflight-requests
@@ -27,16 +85,13 @@ Http::FilterHeadersStatus CorsFilter::decodeHeaders(Http::RequestHeaderMap& head
     return Http::FilterHeadersStatus::Continue;
   }
 
-  policies_ = {{
-      decoder_callbacks_->route()->routeEntry()->corsPolicy(),
-      decoder_callbacks_->route()->routeEntry()->virtualHost().corsPolicy(),
-  }};
+  initializeCorsPolicies();
 
   if (!enabled() && !shadowEnabled()) {
     return Http::FilterHeadersStatus::Continue;
   }
 
-  origin_ = headers.Origin();
+  origin_ = headers.getInline(origin_handle.handle());
   if (origin_ == nullptr || origin_->value().empty()) {
     return Http::FilterHeadersStatus::Continue;
   }
@@ -53,40 +108,60 @@ Http::FilterHeadersStatus CorsFilter::decodeHeaders(Http::RequestHeaderMap& head
 
   is_cors_request_ = true;
 
-  const auto method = headers.Method();
-  if (method == nullptr ||
-      method->value().getStringView() != Http::Headers::get().MethodValues.Options) {
+  const absl::string_view method = headers.getMethodValue();
+  if (method != Http::Headers::get().MethodValues.Options) {
     return Http::FilterHeadersStatus::Continue;
   }
 
-  const auto requestMethod = headers.AccessControlRequestMethod();
-  if (requestMethod == nullptr || requestMethod->value().empty()) {
+  if (headers.getInlineValue(access_control_request_method_handle.handle()).empty()) {
     return Http::FilterHeadersStatus::Continue;
   }
 
   auto response_headers{Http::createHeaderMap<Http::ResponseHeaderMapImpl>(
       {{Http::Headers::get().Status, std::to_string(enumToInt(Http::Code::OK))}})};
 
-  response_headers->setAccessControlAllowOrigin(origin_->value().getStringView());
+  response_headers->setInline(access_control_allow_origin_handle.handle(),
+                              origin_->value().getStringView());
 
   if (allowCredentials()) {
-    response_headers->setReferenceAccessControlAllowCredentials(
-        Http::Headers::get().CORSValues.True);
+    response_headers->setReferenceInline(access_control_allow_credentials_handle.handle(),
+                                         Http::CustomHeaders::get().CORSValues.True);
   }
 
-  if (!allowMethods().empty()) {
-    response_headers->setAccessControlAllowMethods(allowMethods());
+  const absl::string_view allow_methods = allowMethods();
+  if (!allow_methods.empty()) {
+    if (allow_methods == "*") {
+      response_headers->setInline(
+          access_control_allow_methods_handle.handle(),
+          headers.getInlineValue(access_control_request_method_handle.handle()));
+    } else {
+      response_headers->setInline(access_control_allow_methods_handle.handle(), allow_methods);
+    }
   }
 
-  if (!allowHeaders().empty()) {
-    response_headers->setAccessControlAllowHeaders(allowHeaders());
+  const absl::string_view allow_headers = allowHeaders();
+  if (!allow_headers.empty()) {
+    if (allow_headers == "*") {
+      response_headers->setInline(
+          access_control_allow_headers_handle.handle(),
+          headers.getInlineValue(access_control_request_headers_handle.handle()));
+    } else {
+      response_headers->setInline(access_control_allow_headers_handle.handle(), allow_headers);
+    }
   }
 
   if (!maxAge().empty()) {
-    response_headers->setAccessControlMaxAge(maxAge());
+    response_headers->setInline(access_control_max_age_handle.handle(), maxAge());
   }
 
-  decoder_callbacks_->encodeHeaders(std::move(response_headers), true);
+  // More details refer to https://developer.chrome.com/blog/private-network-access-preflight.
+  if (allowPrivateNetworkAccess() &&
+      headers.getInlineValue(access_control_request_private_network_handle.handle()) == "true") {
+    response_headers->setInline(access_control_response_private_network_handle.handle(), "true");
+  }
+
+  decoder_callbacks_->encodeHeaders(std::move(response_headers), true,
+                                    HttpResponseCodeDetails::get().CorsResponse);
 
   return Http::FilterHeadersStatus::StopIteration;
 }
@@ -98,13 +173,14 @@ Http::FilterHeadersStatus CorsFilter::encodeHeaders(Http::ResponseHeaderMap& hea
     return Http::FilterHeadersStatus::Continue;
   }
 
-  headers.setAccessControlAllowOrigin(origin_->value().getStringView());
+  headers.setInline(access_control_allow_origin_handle.handle(), origin_->value().getStringView());
   if (allowCredentials()) {
-    headers.setReferenceAccessControlAllowCredentials(Http::Headers::get().CORSValues.True);
+    headers.setReferenceInline(access_control_allow_credentials_handle.handle(),
+                               Http::CustomHeaders::get().CORSValues.True);
   }
 
   if (!exposeHeaders().empty()) {
-    headers.setAccessControlExposeHeaders(exposeHeaders());
+    headers.setInline(access_control_expose_headers_handle.handle(), exposeHeaders());
   }
 
   return Http::FilterHeadersStatus::Continue;
@@ -176,6 +252,15 @@ bool CorsFilter::allowCredentials() {
   for (const auto policy : policies_) {
     if (policy && policy->allowCredentials()) {
       return policy->allowCredentials().value();
+    }
+  }
+  return false;
+}
+
+bool CorsFilter::allowPrivateNetworkAccess() {
+  for (const auto policy : policies_) {
+    if (policy && policy->allowPrivateNetworkAccess()) {
+      return policy->allowPrivateNetworkAccess().value();
     }
   }
   return false;

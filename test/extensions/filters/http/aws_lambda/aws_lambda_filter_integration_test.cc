@@ -16,22 +16,17 @@ namespace {
 class AwsLambdaFilterIntegrationTest : public testing::TestWithParam<Network::Address::IpVersion>,
                                        public HttpIntegrationTest {
 public:
-  AwsLambdaFilterIntegrationTest()
-      : HttpIntegrationTest(Http::CodecClient::Type::HTTP2, GetParam()) {}
+  AwsLambdaFilterIntegrationTest() : HttpIntegrationTest(Http::CodecType::HTTP2, GetParam()) {}
 
   void SetUp() override {
     // Set these environment variables to quickly sign credentials instead of attempting to query
     // instance metadata and timing-out.
     TestEnvironment::setEnvVar("AWS_ACCESS_KEY_ID", "aws-user", 1 /*overwrite*/);
     TestEnvironment::setEnvVar("AWS_SECRET_ACCESS_KEY", "secret", 1 /*overwrite*/);
-    setUpstreamProtocol(FakeHttpConnection::Type::HTTP1);
+    setUpstreamProtocol(Http::CodecType::HTTP1);
   }
 
-  void TearDown() override {
-    test_server_.reset();
-    fake_upstream_connection_.reset();
-    fake_upstreams_.clear();
-  }
+  void TearDown() override { fake_upstream_connection_.reset(); }
 
   void setupLambdaFilter(bool passthrough) {
     const std::string filter =
@@ -42,7 +37,7 @@ public:
               arn: "arn:aws:lambda:us-west-2:123456789:function:test"
               payload_passthrough: {}
             )EOF";
-    config_helper_.addFilter(fmt::format(filter, passthrough));
+    config_helper_.prependFilter(fmt::format(filter, passthrough));
 
     constexpr auto metadata_yaml = R"EOF(
         com.amazonaws.lambda:
@@ -122,35 +117,27 @@ public:
       upstream_request_->encodeData(buffer, true);
     }
 
-    response->waitForEndStream();
+    ASSERT_TRUE(response->waitForEndStream());
     EXPECT_TRUE(response->complete());
 
     // verify headers
-    expected_response_headers.iterate(
-        [](const Http::HeaderEntry& expected_entry, void* ctx) {
-          const auto* actual_headers = static_cast<const Http::ResponseHeaderMap*>(ctx);
-          const auto* actual_entry = actual_headers->get(
-              Http::LowerCaseString(std::string(expected_entry.key().getStringView())));
-          EXPECT_EQ(actual_entry->value().getStringView(), expected_entry.value().getStringView());
-          return Http::HeaderMap::Iterate::Continue;
-        },
-        // Because headers() returns a pointer to const we have to cast it
-        // away to match the callback signature. This is safe because we do
-        // not call any non-const functions on the headers in the callback.
-        const_cast<Http::ResponseHeaderMap*>(&response->headers()));
+    expected_response_headers.iterate([actual_headers = &response->headers()](
+                                          const Http::HeaderEntry& expected_entry) {
+      const auto actual_entry = actual_headers->get(
+          Http::LowerCaseString(std::string(expected_entry.key().getStringView())));
+      EXPECT_EQ(actual_entry[0]->value().getStringView(), expected_entry.value().getStringView());
+      return Http::HeaderMap::Iterate::Continue;
+    });
 
     // verify cookies if we have any
     if (!expected_response_cookies.empty()) {
       std::vector<std::string> actual_cookies;
-      response->headers().iterate(
-          [](const Http::HeaderEntry& entry, void* ctx) {
-            auto* list = static_cast<std::vector<std::string>*>(ctx);
-            if (entry.key().getStringView() == Http::Headers::get().SetCookie.get()) {
-              list->emplace_back(entry.value().getStringView());
-            }
-            return Http::HeaderMap::Iterate::Continue;
-          },
-          &actual_cookies);
+      response->headers().iterate([&actual_cookies](const Http::HeaderEntry& entry) {
+        if (entry.key().getStringView() == Http::Headers::get().SetCookie.get()) {
+          actual_cookies.emplace_back(entry.value().getStringView());
+        }
+        return Http::HeaderMap::Iterate::Continue;
+      });
 
       EXPECT_EQ(expected_response_cookies, actual_cookies);
     }

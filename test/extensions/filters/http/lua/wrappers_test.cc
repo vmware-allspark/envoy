@@ -1,16 +1,18 @@
 #include "envoy/config/core/v3/base.pb.h"
 
-#include "common/http/utility.h"
-#include "common/stream_info/stream_info_impl.h"
-
-#include "extensions/filters/http/lua/wrappers.h"
+#include "source/common/http/utility.h"
+#include "source/common/network/address_impl.h"
+#include "source/common/stream_info/stream_info_impl.h"
+#include "source/extensions/filters/http/lua/wrappers.h"
 
 #include "test/extensions/filters/common/lua/lua_wrappers.h"
 #include "test/mocks/stream_info/mocks.h"
 #include "test/test_common/utility.h"
 
+using testing::Expectation;
 using testing::InSequence;
 using testing::ReturnPointee;
+using testing::ReturnRef;
 
 namespace Envoy {
 namespace Extensions {
@@ -44,20 +46,76 @@ TEST_F(LuaHeaderMapWrapperTest, Methods) {
       for key, value in pairs(object) do
         testPrint(string.format("'%s' '%s'", key, value))
       end
+
+      object:add("header3", "foo")
+      object:add("header3", "bar")
+      testPrint(object:get("header3"))
     end
   )EOF"};
 
   InSequence s;
   setup(SCRIPT);
 
-  Http::TestHeaderMapImpl headers;
+  Http::TestRequestHeaderMapImpl headers;
   HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; });
-  EXPECT_CALL(*this, testPrint("WORLD"));
-  EXPECT_CALL(*this, testPrint("'hello' 'WORLD'"));
-  EXPECT_CALL(*this, testPrint("'header1' ''"));
-  EXPECT_CALL(*this, testPrint("'header2' 'foo'"));
-  EXPECT_CALL(*this, testPrint("'hello' 'WORLD'"));
-  EXPECT_CALL(*this, testPrint("'header2' 'foo'"));
+  EXPECT_CALL(printer_, testPrint("WORLD"));
+  EXPECT_CALL(printer_, testPrint("'hello' 'WORLD'"));
+  EXPECT_CALL(printer_, testPrint("'header1' ''"));
+  EXPECT_CALL(printer_, testPrint("'header2' 'foo'"));
+  EXPECT_CALL(printer_, testPrint("'hello' 'WORLD'"));
+  EXPECT_CALL(printer_, testPrint("'header2' 'foo'"));
+  EXPECT_CALL(printer_, testPrint("foo,bar"));
+  start("callMe");
+}
+
+// Get the total number of values for a certain header with multiple values.
+TEST_F(LuaHeaderMapWrapperTest, GetNumValues) {
+  const std::string SCRIPT{R"EOF(
+      function callMe(object)
+        testPrint(object:getNumValues("X-Test"))
+        testPrint(object:getNumValues(":path"))
+        testPrint(object:getNumValues("foobar"))
+      end
+    )EOF"};
+
+  InSequence s;
+  setup(SCRIPT);
+
+  Http::TestRequestHeaderMapImpl headers{{":path", "/"}, {"x-test", "foo"}, {"x-test", "bar"}};
+  HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; });
+  EXPECT_CALL(printer_, testPrint("2"));
+  EXPECT_CALL(printer_, testPrint("1"));
+  EXPECT_CALL(printer_, testPrint("0"));
+  start("callMe");
+}
+
+// Get the value on a certain index for a header with multiple values.
+TEST_F(LuaHeaderMapWrapperTest, GetAtIndex) {
+  const std::string SCRIPT{R"EOF(
+        function callMe(object)
+          if object:getAtIndex("x-test", -1) == nil then
+            testPrint("invalid_negative_index")
+          end
+          testPrint(object:getAtIndex("X-Test", 0))
+          testPrint(object:getAtIndex("x-test", 1))
+          testPrint(object:getAtIndex("x-test", 2))
+          if object:getAtIndex("x-test", 3) == nil then
+            testPrint("nil_value")
+          end
+        end
+      )EOF"};
+
+  InSequence s;
+  setup(SCRIPT);
+
+  Http::TestRequestHeaderMapImpl headers{
+      {":path", "/"}, {"x-test", "foo"}, {"x-test", "bar"}, {"x-test", ""}};
+  HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; });
+  EXPECT_CALL(printer_, testPrint("invalid_negative_index"));
+  EXPECT_CALL(printer_, testPrint("foo"));
+  EXPECT_CALL(printer_, testPrint("bar"));
+  EXPECT_CALL(printer_, testPrint(""));
+  EXPECT_CALL(printer_, testPrint("nil_value"));
   start("callMe");
 }
 
@@ -86,7 +144,7 @@ TEST_F(LuaHeaderMapWrapperTest, ModifiableMethods) {
   InSequence s;
   setup(SCRIPT);
 
-  Http::TestHeaderMapImpl headers;
+  Http::TestRequestHeaderMapImpl headers;
   HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return false; });
   start("shouldBeOk");
 
@@ -119,13 +177,13 @@ TEST_F(LuaHeaderMapWrapperTest, Replace) {
   InSequence s;
   setup(SCRIPT);
 
-  Http::TestHeaderMapImpl headers{{":path", "/"}, {"other_header", "hello"}};
+  Http::TestRequestHeaderMapImpl headers{{":path", "/"}, {"other_header", "hello"}};
   HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; });
   start("callMe");
 
-  EXPECT_EQ((Http::TestHeaderMapImpl{{":path", "/new_path"},
-                                     {"other_header", "other_header_value"},
-                                     {"new_header", "new_header_value"}}),
+  EXPECT_EQ((Http::TestRequestHeaderMapImpl{{":path", "/new_path"},
+                                            {"other_header", "other_header_value"},
+                                            {"new_header", "new_header_value"}}),
             headers);
 }
 
@@ -142,7 +200,7 @@ TEST_F(LuaHeaderMapWrapperTest, ModifyDuringIteration) {
   InSequence s;
   setup(SCRIPT);
 
-  Http::TestHeaderMapImpl headers{{"foo", "bar"}};
+  Http::TestRequestHeaderMapImpl headers{{"foo", "bar"}};
   HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; });
   EXPECT_THROW_WITH_MESSAGE(start("callMe"), Filters::Common::Lua::LuaException,
                             "[string \"...\"]:4: header map cannot be modified while iterating");
@@ -167,11 +225,11 @@ TEST_F(LuaHeaderMapWrapperTest, ModifyAfterIteration) {
   InSequence s;
   setup(SCRIPT);
 
-  Http::TestHeaderMapImpl headers{{"foo", "bar"}};
+  Http::TestRequestHeaderMapImpl headers{{"foo", "bar"}};
   HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; });
-  EXPECT_CALL(*this, testPrint("'foo' 'bar'"));
-  EXPECT_CALL(*this, testPrint("'foo' 'bar'"));
-  EXPECT_CALL(*this, testPrint("'hello' 'world'"));
+  EXPECT_CALL(printer_, testPrint("'foo' 'bar'"));
+  EXPECT_CALL(printer_, testPrint("'foo' 'bar'"));
+  EXPECT_CALL(printer_, testPrint("'hello' 'world'"));
   start("callMe");
 }
 
@@ -188,7 +246,7 @@ TEST_F(LuaHeaderMapWrapperTest, DontFinishIteration) {
   InSequence s;
   setup(SCRIPT);
 
-  Http::TestHeaderMapImpl headers{{"foo", "bar"}, {"hello", "world"}};
+  Http::TestRequestHeaderMapImpl headers{{"foo", "bar"}, {"hello", "world"}};
   HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; });
   EXPECT_THROW_WITH_MESSAGE(
       start("callMe"), Filters::Common::Lua::LuaException,
@@ -208,7 +266,7 @@ TEST_F(LuaHeaderMapWrapperTest, IteratorAcrossYield) {
   InSequence s;
   setup(SCRIPT);
 
-  Http::TestHeaderMapImpl headers{{"foo", "bar"}, {"hello", "world"}};
+  Http::TestRequestHeaderMapImpl headers{{"foo", "bar"}, {"hello", "world"}};
   Filters::Common::Lua::LuaDeathRef<HeaderMapWrapper> wrapper(
       HeaderMapWrapper::create(coroutine_->luaState(), headers, []() { return true; }), true);
   yield_callback_ = [] {};
@@ -216,6 +274,26 @@ TEST_F(LuaHeaderMapWrapperTest, IteratorAcrossYield) {
   wrapper.reset();
   EXPECT_THROW_WITH_MESSAGE(coroutine_->resume(0, [] {}), Filters::Common::Lua::LuaException,
                             "[string \"...\"]:5: object used outside of proper scope");
+}
+
+// Verify setting the HTTP1 reason phrase
+TEST_F(LuaHeaderMapWrapperTest, SetHttp1ReasonPhrase) {
+  const std::string SCRIPT{R"EOF(
+    function callMe(object)
+      object:setHttp1ReasonPhrase("Slow Down")
+    end
+  )EOF"};
+
+  InSequence s;
+  setup(SCRIPT);
+
+  auto headers = Http::ResponseHeaderMapImpl::create();
+  HeaderMapWrapper::create(coroutine_->luaState(), *headers, []() { return true; });
+  start("callMe");
+
+  Http::StatefulHeaderKeyFormatterOptRef formatter(headers->formatter());
+  EXPECT_EQ(true, formatter.has_value());
+  EXPECT_EQ("Slow Down", formatter->getReasonPhrase());
 }
 
 class LuaStreamInfoWrapperTest
@@ -242,7 +320,7 @@ protected:
     ON_CALL(stream_info, protocol()).WillByDefault(ReturnPointee(&protocol));
     Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
         StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
-    EXPECT_CALL(*this,
+    EXPECT_CALL(printer_,
                 testPrint(fmt::format("'{}'", Http::Utility::getProtocolString(protocol.value()))));
     start("callMe");
     wrapper.reset();
@@ -262,6 +340,54 @@ TEST_F(LuaStreamInfoWrapperTest, ReturnCurrentProtocol) {
   expectToPrintCurrentProtocol(Http::Protocol::Http10);
   expectToPrintCurrentProtocol(Http::Protocol::Http11);
   expectToPrintCurrentProtocol(Http::Protocol::Http2);
+}
+
+// Verify downstream local addresses and downstream direct remote addresses are available from
+// stream info wrapper.
+TEST_F(LuaStreamInfoWrapperTest, ReturnCurrentDownstreamAddresses) {
+  const std::string SCRIPT{R"EOF(
+      function callMe(object)
+        testPrint(object:downstreamLocalAddress())
+        testPrint(object:downstreamDirectRemoteAddress())
+      end
+    )EOF"};
+
+  InSequence s;
+  setup(SCRIPT);
+
+  NiceMock<Envoy::StreamInfo::MockStreamInfo> stream_info;
+  auto address = Network::Address::InstanceConstSharedPtr{
+      new Network::Address::Ipv4Instance("127.0.0.1", 8000)};
+  auto downstream_direct_remote =
+      Network::Address::InstanceConstSharedPtr{new Network::Address::Ipv4Instance("8.8.8.8", 3000)};
+  stream_info.downstream_connection_info_provider_->setLocalAddress(address);
+  stream_info.downstream_connection_info_provider_->setDirectRemoteAddressForTest(
+      downstream_direct_remote);
+  Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
+      StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
+  EXPECT_CALL(printer_, testPrint(address->asString()));
+  EXPECT_CALL(printer_, testPrint(downstream_direct_remote->asString()));
+  start("callMe");
+  wrapper.reset();
+}
+
+TEST_F(LuaStreamInfoWrapperTest, ReturnRequestedServerName) {
+  const std::string SCRIPT{R"EOF(
+      function callMe(object)
+        testPrint(object:requestedServerName())
+      end
+    )EOF"};
+
+  InSequence s;
+  setup(SCRIPT);
+
+  NiceMock<Envoy::StreamInfo::MockStreamInfo> stream_info;
+  stream_info.downstream_connection_info_provider_->setRequestedServerName("some.sni.io");
+  Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
+      StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
+  EXPECT_CALL(printer_, testPrint("some.sni.io"));
+  start("callMe");
+  wrapper.reset();
 }
 
 // Set, get and iterate stream info dynamic metadata.
@@ -288,19 +414,18 @@ TEST_F(LuaStreamInfoWrapperTest, SetGetAndIterateDynamicMetadata) {
       end
     )EOF"};
 
-  InSequence s;
   setup(SCRIPT);
 
-  StreamInfo::StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem());
+  StreamInfo::StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
   EXPECT_EQ(0, stream_info.dynamicMetadata().filter_metadata_size());
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
-  EXPECT_CALL(*this, testPrint("userdata"));
-  EXPECT_CALL(*this, testPrint("bar"));
-  EXPECT_CALL(*this, testPrint("cool"));
-  EXPECT_CALL(*this, testPrint("'foo' 'bar'"));
-  EXPECT_CALL(*this, testPrint("'so' 'cool'"));
-  EXPECT_CALL(*this, testPrint("0"));
+  EXPECT_CALL(printer_, testPrint("userdata"));
+  EXPECT_CALL(printer_, testPrint("bar"));
+  EXPECT_CALL(printer_, testPrint("cool"));
+  EXPECT_CALL(printer_, testPrint("'foo' 'bar'"));
+  EXPECT_CALL(printer_, testPrint("'so' 'cool'"));
+  EXPECT_CALL(printer_, testPrint("0"));
   start("callMe");
 
   EXPECT_EQ(1, stream_info.dynamicMetadata().filter_metadata_size());
@@ -311,6 +436,41 @@ TEST_F(LuaStreamInfoWrapperTest, SetGetAndIterateDynamicMetadata) {
                        .at("foo")
                        .string_value());
   wrapper.reset();
+}
+
+// Verify that binary values could also be extracted from dynamicMetadata().
+TEST_F(LuaStreamInfoWrapperTest, GetDynamicMetadataBinaryData) {
+  const std::string SCRIPT{R"EOF(
+    function callMe(object)
+      local metadata = object:dynamicMetadata():get("envoy.pp")
+      local bin_data = metadata["bin_data"]
+      local data_length = string.len(metadata["bin_data"])
+      for idx = 1, data_length do
+        testPrint('Hex Data: ' .. string.format('%x', string.byte(bin_data, idx)))
+      end
+    end
+  )EOF"};
+
+  ProtobufWkt::Value metadata_value;
+  constexpr uint8_t buffer[] = {'h', 'e', 0x00, 'l', 'l', 'o'};
+  metadata_value.set_string_value(reinterpret_cast<char const*>(buffer), sizeof(buffer));
+  ProtobufWkt::Struct metadata;
+  metadata.mutable_fields()->insert({"bin_data", metadata_value});
+
+  setup(SCRIPT);
+
+  StreamInfo::StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
+  (*stream_info.metadata_.mutable_filter_metadata())["envoy.pp"] = metadata;
+  Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
+      StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
+
+  EXPECT_CALL(printer_, testPrint("Hex Data: 68"));          // h (Hex: 68)
+  EXPECT_CALL(printer_, testPrint("Hex Data: 65"));          // e (Hex: 65)
+  EXPECT_CALL(printer_, testPrint("Hex Data: 0"));           // \0 (Hex: 0)
+  EXPECT_CALL(printer_, testPrint("Hex Data: 6c")).Times(2); // l (Hex: 6c)
+  EXPECT_CALL(printer_, testPrint("Hex Data: 6f"));          // 0 (Hex: 6f)
+
+  start("callMe");
 }
 
 // Set, get complex key/values in stream info dynamic metadata.
@@ -333,17 +493,17 @@ TEST_F(LuaStreamInfoWrapperTest, SetGetComplexDynamicMetadata) {
   InSequence s;
   setup(SCRIPT);
 
-  StreamInfo::StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem());
+  StreamInfo::StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
   EXPECT_EQ(0, stream_info.dynamicMetadata().filter_metadata_size());
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
-  EXPECT_CALL(*this, testPrint("1234"));
-  EXPECT_CALL(*this, testPrint("baz"));
-  EXPECT_CALL(*this, testPrint("true"));
-  EXPECT_CALL(*this, testPrint("cool"));
-  EXPECT_CALL(*this, testPrint("and"));
-  EXPECT_CALL(*this, testPrint("dynamic"));
-  EXPECT_CALL(*this, testPrint("true"));
+  EXPECT_CALL(printer_, testPrint("1234"));
+  EXPECT_CALL(printer_, testPrint("baz"));
+  EXPECT_CALL(printer_, testPrint("true"));
+  EXPECT_CALL(printer_, testPrint("cool"));
+  EXPECT_CALL(printer_, testPrint("and"));
+  EXPECT_CALL(printer_, testPrint("dynamic"));
+  EXPECT_CALL(printer_, testPrint("true"));
   start("callMe");
 
   EXPECT_EQ(1, stream_info.dynamicMetadata().filter_metadata_size());
@@ -381,7 +541,7 @@ TEST_F(LuaStreamInfoWrapperTest, BadTypesInTableForDynamicMetadata) {
   InSequence s;
   setup(SCRIPT);
 
-  StreamInfo::StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem());
+  StreamInfo::StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_THROW_WITH_MESSAGE(start("callMe"), Filters::Common::Lua::LuaException,
@@ -402,7 +562,7 @@ TEST_F(LuaStreamInfoWrapperTest, ModifyDuringIterationForDynamicMetadata) {
   InSequence s;
   setup(SCRIPT);
 
-  StreamInfo::StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem());
+  StreamInfo::StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_THROW_WITH_MESSAGE(
@@ -416,36 +576,34 @@ TEST_F(LuaStreamInfoWrapperTest, ModifyAfterIterationForDynamicMetadata) {
     function callMe(object)
       object:dynamicMetadata():set("envoy.lb", "hello", "world")
       for filter, entry in pairs(object:dynamicMetadata()) do
-        testPrint(filter)
         for key, value in pairs(entry) do
-          testPrint(string.format("'%s' '%s'", key, value))
+          testPrint(string.format("'%s' '%s' '%s'", filter, key, value))
         end
       end
 
       object:dynamicMetadata():set("envoy.lb", "hello", "envoy")
       object:dynamicMetadata():set("envoy.proxy", "proto", "grpc")
+
+      testPrint("modified")
+
       for filter, entry in pairs(object:dynamicMetadata()) do
-        testPrint(filter)
         for key, value in pairs(entry) do
-          testPrint(string.format("'%s' '%s'", key, value))
+          testPrint(string.format("'%s' '%s' '%s'", filter, key, value))
         end
       end
     end
   )EOF"};
 
-  InSequence s;
   setup(SCRIPT);
 
-  StreamInfo::StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem());
+  StreamInfo::StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
   EXPECT_EQ(0, stream_info.dynamicMetadata().filter_metadata_size());
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
-  EXPECT_CALL(*this, testPrint("envoy.lb"));
-  EXPECT_CALL(*this, testPrint("'hello' 'world'"));
-  EXPECT_CALL(*this, testPrint("envoy.proxy"));
-  EXPECT_CALL(*this, testPrint("'proto' 'grpc'"));
-  EXPECT_CALL(*this, testPrint("envoy.lb"));
-  EXPECT_CALL(*this, testPrint("'hello' 'envoy'"));
+  Expectation expect_1 = EXPECT_CALL(printer_, testPrint("'envoy.lb' 'hello' 'world'"));
+  Expectation expect_2 = EXPECT_CALL(printer_, testPrint("modified")).After(expect_1);
+  EXPECT_CALL(printer_, testPrint("'envoy.proxy' 'proto' 'grpc'")).After(expect_2);
+  EXPECT_CALL(printer_, testPrint("'envoy.lb' 'hello' 'envoy'")).After(expect_2);
   start("callMe");
 }
 
@@ -463,7 +621,7 @@ TEST_F(LuaStreamInfoWrapperTest, DontFinishIterationForDynamicMetadata) {
   InSequence s;
   setup(SCRIPT);
 
-  StreamInfo::StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem());
+  StreamInfo::StreamInfoImpl stream_info(Http::Protocol::Http2, test_time_.timeSystem(), nullptr);
   Filters::Common::Lua::LuaDeathRef<StreamInfoWrapper> wrapper(
       StreamInfoWrapper::create(coroutine_->luaState(), stream_info), true);
   EXPECT_THROW_WITH_MESSAGE(

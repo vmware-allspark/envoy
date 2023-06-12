@@ -12,9 +12,9 @@
 #include "envoy/runtime/runtime.h"
 #include "envoy/stats/scope.h"
 
-#include "common/network/cidr_range.h"
-#include "common/network/lc_trie.h"
-#include "common/stats/symbol_table_impl.h"
+#include "source/common/network/cidr_range.h"
+#include "source/common/network/lc_trie.h"
+#include "source/common/stats/symbol_table.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -36,11 +36,12 @@ public:
                         Runtime::Loader& runtime);
 
   Runtime::Loader& runtime() { return runtime_; }
-  Stats::Scope& scope() { return scope_; }
   FilterRequestType requestType() const { return request_type_; }
   const Network::LcTrie::LcTrie<std::string>& trie() const { return *trie_; }
 
-  void incHit(absl::string_view tag) { incCounter(hit_, tag); }
+  void incHit(absl::string_view tag) {
+    incCounter(stat_name_set_->getBuiltin(absl::StrCat(tag, ".hit"), unknown_tag_));
+  }
   void incNoHit() { incCounter(no_hit_); }
   void incTotal() { incCounter(total_); }
 
@@ -48,27 +49,27 @@ private:
   static FilterRequestType requestTypeEnum(
       envoy::extensions::filters::http::ip_tagging::v3::IPTagging::RequestType request_type) {
     switch (request_type) {
+      PANIC_ON_PROTO_ENUM_SENTINEL_VALUES;
     case envoy::extensions::filters::http::ip_tagging::v3::IPTagging::BOTH:
       return FilterRequestType::BOTH;
     case envoy::extensions::filters::http::ip_tagging::v3::IPTagging::INTERNAL:
       return FilterRequestType::INTERNAL;
     case envoy::extensions::filters::http::ip_tagging::v3::IPTagging::EXTERNAL:
       return FilterRequestType::EXTERNAL;
-    default:
-      NOT_REACHED_GCOVR_EXCL_LINE;
     }
+    PANIC_DUE_TO_CORRUPT_ENUM;
   }
 
-  void incCounter(Stats::StatName name1, absl::string_view tag = "");
+  void incCounter(Stats::StatName name);
 
   const FilterRequestType request_type_;
   Stats::Scope& scope_;
   Runtime::Loader& runtime_;
   Stats::StatNameSetPtr stat_name_set_;
   const Stats::StatName stats_prefix_;
-  const Stats::StatName hit_;
   const Stats::StatName no_hit_;
   const Stats::StatName total_;
+  const Stats::StatName unknown_tag_;
   std::unique_ptr<Network::LcTrie::LcTrie<std::string>> trie_;
 };
 

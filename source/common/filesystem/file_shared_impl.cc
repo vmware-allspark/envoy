@@ -1,39 +1,42 @@
-#include "common/filesystem/file_shared_impl.h"
+#include "source/common/filesystem/file_shared_impl.h"
 
-#include <cstring>
+#include <random>
+
+#include "source/common/common/utility.h"
 
 namespace Envoy {
 namespace Filesystem {
 
-Api::IoError::IoErrorCode IoFileError::getErrorCode() const { return IoErrorCode::UnknownError; }
-
-std::string IoFileError::getErrorDetails() const { return ::strerror(errno_); }
-
-Api::IoCallBoolResult FileSharedImpl::open(FlagSet in) {
-  if (isOpen()) {
-    return resultSuccess<bool>(true);
+Api::IoError::IoErrorCode IoFileError::getErrorCode() const {
+  switch (errno_) {
+  case HANDLE_ERROR_PERM:
+    return IoErrorCode::Permission;
+  case HANDLE_ERROR_INVALID:
+    return IoErrorCode::BadFd;
+  default:
+    ENVOY_LOG_MISC(debug, "Unknown error code {} details {}", errno_, getErrorDetails());
+    return IoErrorCode::UnknownError;
   }
-
-  openFile(in);
-  return fd_ != -1 ? resultSuccess<bool>(true) : resultFailure<bool>(false, errno);
 }
 
-Api::IoCallSizeResult FileSharedImpl::write(absl::string_view buffer) {
-  const ssize_t rc = writeFile(buffer);
-  return rc != -1 ? resultSuccess<ssize_t>(rc) : resultFailure<ssize_t>(rc, errno);
-};
+std::string IoFileError::getErrorDetails() const { return errorDetails(errno_); }
 
-Api::IoCallBoolResult FileSharedImpl::close() {
-  ASSERT(isOpen());
+bool FileSharedImpl::isOpen() const { return fd_ != INVALID_HANDLE; };
 
-  bool success = closeFile();
-  fd_ = -1;
-  return success ? resultSuccess<bool>(true) : resultFailure<bool>(false, errno);
+std::string FileSharedImpl::path() const { return filepath_and_type_.path_; };
+
+DestinationType FileSharedImpl::destinationType() const { return filepath_and_type_.file_type_; };
+
+std::string FileSharedImpl::generateTmpFilePath(absl::string_view path) {
+  static std::random_device rd;
+  static std::mt19937 gen(rd());
+  static std::uniform_int_distribution<> distribution('A', 'Z');
+  std::array<char, 8> out;
+  for (int i = 0; i < 8; i++) {
+    out[i] = distribution(gen);
+  }
+  return absl::StrCat(path, "/envoy_", absl::string_view{&out[0], out.size()}, ".tmp");
 }
-
-bool FileSharedImpl::isOpen() const { return fd_ != -1; };
-
-std::string FileSharedImpl::path() const { return path_; };
 
 } // namespace Filesystem
 } // namespace Envoy

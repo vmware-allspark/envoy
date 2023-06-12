@@ -19,14 +19,53 @@
 #include "envoy/tracing/http_tracer.h"
 #include "envoy/upstream/cluster_manager.h"
 
-#include "common/http/async_client_impl.h"
-#include "common/singleton/const_singleton.h"
+#include "source/common/common/logger.h"
+#include "source/common/http/async_client_impl.h"
+#include "source/common/singleton/const_singleton.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace Filters {
 namespace Common {
 namespace ExtAuthz {
+
+class Matcher;
+using MatcherSharedPtr = std::shared_ptr<Matcher>;
+
+/**
+ *  Matchers describe the rules for matching authorization request and response headers.
+ */
+class Matcher {
+public:
+  virtual ~Matcher() = default;
+
+  /**
+   * Returns whether or not the header key matches the rules of the matcher.
+   *
+   * @param key supplies the header key to be evaluated.
+   */
+  virtual bool matches(absl::string_view key) const PURE;
+};
+
+class HeaderKeyMatcher : public Matcher {
+public:
+  HeaderKeyMatcher(std::vector<Matchers::StringMatcherPtr>&& list);
+
+  bool matches(absl::string_view key) const override;
+
+private:
+  const std::vector<Matchers::StringMatcherPtr> matchers_;
+};
+
+class NotHeaderKeyMatcher : public Matcher {
+public:
+  NotHeaderKeyMatcher(std::vector<Matchers::StringMatcherPtr>&& list);
+
+  bool matches(absl::string_view key) const override;
+
+private:
+  const HeaderKeyMatcher matcher_;
+};
 
 /**
  * For creating ext_authz.proto (authorization) request.
@@ -46,6 +85,7 @@ public:
    *        check request.
    * @param request is the reference to the check request that will be filled up.
    * @param with_request_body when true, will add the request body to the check request.
+   * @param pack_as_bytes when true, will set the check request body as bytes.
    * @param include_peer_certificate whether to include the peer certificate in the check request.
    */
   static void createHttpCheck(const Envoy::Http::StreamDecoderFilterCallbacks* callbacks,
@@ -53,7 +93,10 @@ public:
                               Protobuf::Map<std::string, std::string>&& context_extensions,
                               envoy::config::core::v3::Metadata&& metadata_context,
                               envoy::service::auth::v3::CheckRequest& request,
-                              uint64_t max_request_bytes, bool include_peer_certificate);
+                              uint64_t max_request_bytes, bool pack_as_bytes,
+                              bool include_peer_certificate,
+                              const Protobuf::Map<std::string, std::string>& destination_labels,
+                              const MatcherSharedPtr& request_header_matchers);
 
   /**
    * createTcpCheck is used to extract the attributes from the network layer and fill them up
@@ -64,7 +107,13 @@ public:
    */
   static void createTcpCheck(const Network::ReadFilterCallbacks* callbacks,
                              envoy::service::auth::v3::CheckRequest& request,
-                             bool include_peer_certificate);
+                             bool include_peer_certificate,
+                             const Protobuf::Map<std::string, std::string>& destination_labels);
+
+  static MatcherSharedPtr toRequestMatchers(const envoy::type::matcher::v3::ListStringMatcher& list,
+                                            bool add_http_headers);
+  static std::vector<Matchers::StringMatcherPtr>
+  createStringMatchers(const envoy::type::matcher::v3::ListStringMatcher& list);
 
 private:
   static void setAttrContextPeer(envoy::service::auth::v3::AttributeContext::Peer& peer,
@@ -76,13 +125,15 @@ private:
                              const uint64_t stream_id, const StreamInfo::StreamInfo& stream_info,
                              const Buffer::Instance* decoding_buffer,
                              const Envoy::Http::RequestHeaderMap& headers,
-                             uint64_t max_request_bytes);
+                             uint64_t max_request_bytes, bool pack_as_byte,
+                             const MatcherSharedPtr& request_header_matchers);
   static void setAttrContextRequest(envoy::service::auth::v3::AttributeContext::Request& req,
                                     const uint64_t stream_id,
                                     const StreamInfo::StreamInfo& stream_info,
                                     const Buffer::Instance* decoding_buffer,
                                     const Envoy::Http::RequestHeaderMap& headers,
-                                    uint64_t max_request_bytes);
+                                    uint64_t max_request_bytes, bool pack_as_bytes,
+                                    const MatcherSharedPtr& request_header_matchers);
   static std::string getHeaderStr(const Envoy::Http::HeaderEntry* entry);
   static Envoy::Http::HeaderMap::Iterate fillHttpHeaders(const Envoy::Http::HeaderEntry&, void*);
 };

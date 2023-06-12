@@ -3,13 +3,14 @@
 #include <cstdint>
 #include <list>
 #include <string>
-#include <unordered_map>
 
 #include "envoy/api/api.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/filesystem/watcher.h"
 
-#include "common/common/logger.h"
+#include "source/common/common/logger.h"
+
+#include "absl/container/node_hash_map.h"
 
 namespace Envoy {
 namespace Filesystem {
@@ -21,7 +22,7 @@ namespace Filesystem {
  */
 class WatcherImpl : public Watcher, Logger::Loggable<Logger::Id::file> {
 public:
-  WatcherImpl(Event::Dispatcher& dispatcher, Api::Api& api);
+  WatcherImpl(Event::Dispatcher& dispatcher, Filesystem::Instance& file_system);
   ~WatcherImpl() override;
 
   // Filesystem::Watcher
@@ -40,10 +41,10 @@ private:
 
   void onInotifyEvent();
 
-  Api::Api& api_;
+  Filesystem::Instance& file_system_;
   int inotify_fd_;
   Event::FileEventPtr inotify_event_;
-  std::unordered_map<int, DirectoryWatch> callback_map_;
+  absl::node_hash_map<int, DirectoryWatch> callback_map_;
 };
 
 } // namespace Filesystem

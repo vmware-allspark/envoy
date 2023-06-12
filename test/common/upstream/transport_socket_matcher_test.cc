@@ -1,3 +1,4 @@
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -8,14 +9,13 @@
 #include "envoy/network/transport_socket.h"
 #include "envoy/stats/scope.h"
 
-#include "common/config/metadata.h"
-#include "common/network/transport_socket_options_impl.h"
-#include "common/upstream/transport_socket_match_impl.h"
-
-#include "server/transport_socket_config_impl.h"
+#include "source/common/config/metadata.h"
+#include "source/common/network/transport_socket_options_impl.h"
+#include "source/common/upstream/transport_socket_match_impl.h"
+#include "source/server/transport_socket_config_impl.h"
 
 #include "test/mocks/network/mocks.h"
-#include "test/mocks/server/mocks.h"
+#include "test/mocks/server/transport_socket_factory_context.h"
 #include "test/test_common/registry.h"
 #include "test/test_common/utility.h"
 
@@ -28,28 +28,43 @@ namespace Envoy {
 namespace Upstream {
 namespace {
 
-class FakeTransportSocketFactory : public Network::TransportSocketFactory {
+class FakeTransportSocketFactory : public Network::UpstreamTransportSocketFactory {
 public:
   MOCK_METHOD(bool, implementsSecureTransport, (), (const));
+  MOCK_METHOD(bool, supportsAlpn, (), (const));
+  MOCK_METHOD(absl::string_view, defaultServerNameIndication, (), (const));
   MOCK_METHOD(Network::TransportSocketPtr, createTransportSocket,
-              (Network::TransportSocketOptionsSharedPtr), (const));
-  FakeTransportSocketFactory(std::string id) : id_(std::move(id)) {}
+              (Network::TransportSocketOptionsConstSharedPtr,
+               Upstream::HostDescriptionConstSharedPtr),
+              (const));
+  MOCK_METHOD(void, hashKey, (std::vector<uint8_t>&, Network::TransportSocketOptionsConstSharedPtr),
+              (const));
+  FakeTransportSocketFactory(std::string id, bool alpn) : supports_alpn_(alpn), id_(std::move(id)) {
+    ON_CALL(*this, supportsAlpn).WillByDefault(Invoke([this]() { return supports_alpn_; }));
+  }
   std::string id() const { return id_; }
+
+  bool supports_alpn_;
 
 private:
   const std::string id_;
 };
 
 class FooTransportSocketFactory
-    : public Network::TransportSocketFactory,
+    : public Network::UpstreamTransportSocketFactory,
       public Server::Configuration::UpstreamTransportSocketConfigFactory,
       Logger::Loggable<Logger::Id::upstream> {
 public:
   MOCK_METHOD(bool, implementsSecureTransport, (), (const));
   MOCK_METHOD(Network::TransportSocketPtr, createTransportSocket,
-              (Network::TransportSocketOptionsSharedPtr), (const));
+              (Network::TransportSocketOptionsConstSharedPtr,
+               Upstream::HostDescriptionConstSharedPtr),
+              (const));
+  MOCK_METHOD(void, hashKey, (std::vector<uint8_t>&, Network::TransportSocketOptionsConstSharedPtr),
+              (const));
+  MOCK_METHOD(absl::string_view, defaultServerNameIndication, (), (const));
 
-  Network::TransportSocketFactoryPtr
+  Network::UpstreamTransportSocketFactoryPtr
   createTransportSocketFactory(const Protobuf::Message& proto,
                                Server::Configuration::TransportSocketFactoryContext&) override {
     const auto& node = dynamic_cast<const envoy::config::core::v3::Node&>(proto);
@@ -57,7 +72,7 @@ public:
     if (!node.id().empty()) {
       id = node.id();
     }
-    return std::make_unique<FakeTransportSocketFactory>(id);
+    return std::make_unique<NiceMock<FakeTransportSocketFactory>>(id, supports_alpn_);
   }
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
@@ -65,12 +80,14 @@ public:
   }
 
   std::string name() const override { return "foo"; }
+  bool supports_alpn_{};
 };
 
 class TransportSocketMatcherTest : public testing::Test {
 public:
   TransportSocketMatcherTest()
-      : mock_default_factory_(new FakeTransportSocketFactory("default")),
+      : registration_(factory_),
+        mock_default_factory_(new NiceMock<FakeTransportSocketFactory>("default", false)),
         stats_scope_(stats_store_.createScope("transport_socket_match.test")) {}
 
   void init(const std::vector<std::string>& match_yaml) {
@@ -90,11 +107,15 @@ public:
   }
 
 protected:
+  FooTransportSocketFactory factory_;
+  Registry::InjectFactory<Server::Configuration::UpstreamTransportSocketConfigFactory>
+      registration_;
+
   TransportSocketMatcherPtr matcher_;
   NiceMock<Server::Configuration::MockTransportSocketFactoryContext> mock_factory_context_;
-  Network::TransportSocketFactoryPtr mock_default_factory_;
+  Network::UpstreamTransportSocketFactoryPtr mock_default_factory_;
   Stats::IsolatedStoreImpl stats_store_;
-  Stats::ScopePtr stats_scope_;
+  Stats::ScopeSharedPtr stats_scope_;
 };
 
 TEST_F(TransportSocketMatcherTest, ReturnDefaultSocketFactoryWhenNoMatch) {
@@ -104,12 +125,68 @@ match:
   hasSidecar: "true"
 transport_socket:
   name: "foo"
-  config:
+  typed_config:
+    "@type": type.googleapis.com/envoy.config.core.v3.Node
     id: "abc"
  )EOF"});
 
   envoy::config::core::v3::Metadata metadata;
   validate(metadata, "default");
+
+  // Neither the defaults nor matcher support ALPN.
+  EXPECT_FALSE(matcher_->allMatchesSupportAlpn());
+}
+
+TEST_F(TransportSocketMatcherTest, AlpnSupport) {
+  mock_default_factory_ = std::make_unique<NiceMock<FakeTransportSocketFactory>>("default", true);
+  factory_.supports_alpn_ = true;
+  init({R"EOF(
+name: "enableFooSocket"
+match:
+  hasSidecar: "true"
+transport_socket:
+  name: "foo"
+  typed_config:
+    "@type": type.googleapis.com/envoy.config.core.v3.Node
+    id: "abc"
+ )EOF"});
+
+  // Both default and matcher support ALPN
+  EXPECT_TRUE(matcher_->allMatchesSupportAlpn());
+}
+
+TEST_F(TransportSocketMatcherTest, NoDefaultAlpnSupport) {
+  factory_.supports_alpn_ = true;
+  init({R"EOF(
+name: "enableFooSocket"
+match:
+  hasSidecar: "true"
+transport_socket:
+  name: "foo"
+  typed_config:
+    "@type": type.googleapis.com/envoy.config.core.v3.Node
+    id: "abc"
+ )EOF"});
+
+  // The default doesn't support ALPN, matchers do.
+  EXPECT_FALSE(matcher_->allMatchesSupportAlpn());
+}
+
+TEST_F(TransportSocketMatcherTest, NoMatcherAlpnSupport) {
+  mock_default_factory_ = std::make_unique<NiceMock<FakeTransportSocketFactory>>("default", true);
+  init({R"EOF(
+name: "enableFooSocket"
+match:
+  hasSidecar: "true"
+transport_socket:
+  name: "foo"
+  typed_config:
+    "@type": type.googleapis.com/envoy.config.core.v3.Node
+    id: "abc"
+ )EOF"});
+
+  // The default doesn't support ALPN, matchers do.
+  EXPECT_FALSE(matcher_->allMatchesSupportAlpn());
 }
 
 TEST_F(TransportSocketMatcherTest, BasicMatch) {
@@ -119,7 +196,8 @@ match:
   sidecar: "true"
 transport_socket:
   name: "foo"
-  config:
+  typed_config:
+    "@type": type.googleapis.com/envoy.config.core.v3.Node
     id: "sidecar")EOF",
         R"EOF(
 name: "http_socket"
@@ -127,7 +205,8 @@ match:
   protocol: "http"
 transport_socket:
   name: "foo"
-  config:
+  typed_config:
+    "@type": type.googleapis.com/envoy.config.core.v3.Node
     id: "http"
  )EOF"});
 
@@ -155,7 +234,8 @@ match:
   protocol: "http"
 transport_socket:
   name: "foo"
-  config:
+  typed_config:
+    "@type": type.googleapis.com/envoy.config.core.v3.Node
     id: "sidecar_http"
  )EOF",
         R"EOF(
@@ -164,7 +244,8 @@ match:
   sidecar: "true"
 transport_socket:
   name: "foo"
-  config:
+  typed_config:
+    "@type": type.googleapis.com/envoy.config.core.v3.Node
     id: "sidecar"
  )EOF"});
   envoy::config::core::v3::Metadata metadata;
@@ -182,7 +263,8 @@ name: "match_all"
 match: {}
 transport_socket:
   name: "foo"
-  config:
+  typed_config:
+    "@type": type.googleapis.com/envoy.config.core.v3.Node
     id: "match_all"
  )EOF"});
   envoy::config::core::v3::Metadata metadata;
@@ -194,9 +276,6 @@ filter_metadata:
                             metadata);
   validate(metadata, "match_all");
 }
-
-REGISTER_FACTORY(FooTransportSocketFactory,
-                 Server::Configuration::UpstreamTransportSocketConfigFactory);
 
 } // namespace
 } // namespace Upstream

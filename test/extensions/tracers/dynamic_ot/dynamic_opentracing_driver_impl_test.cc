@@ -1,8 +1,7 @@
 #include <memory>
 
-#include "common/http/header_map_impl.h"
-
-#include "extensions/tracers/dynamic_ot/dynamic_opentracing_driver_impl.h"
+#include "source/common/http/header_map_impl.h"
+#include "source/extensions/tracers/dynamic_ot/dynamic_opentracing_driver_impl.h"
 
 #include "test/mocks/http/mocks.h"
 #include "test/mocks/stats/mocks.h"
@@ -22,7 +21,8 @@ namespace {
 class DynamicOpenTracingDriverTest : public testing::Test {
 public:
   void setup(const std::string& library, const std::string& tracer_config) {
-    driver_ = std::make_unique<DynamicOpenTracingDriver>(stats_, library, tracer_config);
+    driver_ =
+        std::make_unique<DynamicOpenTracingDriver>(*stats_.rootScope(), library, tracer_config);
   }
 
   void setupValidDriver() { setup(library_path_, tracer_config_); }
@@ -70,19 +70,27 @@ TEST_F(DynamicOpenTracingDriverTest, InitializeDriver) {
   }
 }
 
+// This test fails under gcc, please see https://github.com/envoyproxy/envoy/issues/7647
+// for more details.
+#ifndef GCC_COMPILER
 TEST_F(DynamicOpenTracingDriverTest, FlushSpans) {
   setupValidDriver();
 
-  Tracing::SpanPtr first_span = driver_->startSpan(config_, request_headers_, operation_name_,
-                                                   start_time_, {Tracing::Reason::Sampling, true});
-  first_span->finishSpan();
-  driver_->tracer().Close();
+  {
+    Tracing::SpanPtr first_span = driver_->startSpan(
+        config_, request_headers_, operation_name_, start_time_, {Tracing::Reason::Sampling, true});
+    first_span->finishSpan();
+    driver_->tracer().Close();
+  }
+
+  driver_ = nullptr;
 
   const Json::ObjectSharedPtr spans_json =
       TestEnvironment::jsonLoadFromString(TestEnvironment::readFileToStringForTest(spans_file_));
   EXPECT_NE(spans_json, nullptr);
   EXPECT_EQ(spans_json->asObjectArray().size(), 1);
 }
+#endif
 
 } // namespace
 } // namespace DynamicOt

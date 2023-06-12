@@ -7,13 +7,11 @@ using testing::ReturnRef;
 using testing::_;
 using testing::Invoke;
 using testing::ReturnRef;
+using testing::SaveArg;
 
 namespace Envoy {
 namespace Tcp {
 namespace ConnectionPool {
-
-MockCancellable::MockCancellable() = default;
-MockCancellable::~MockCancellable() = default;
 
 MockUpstreamCallbacks::MockUpstreamCallbacks() = default;
 MockUpstreamCallbacks::~MockUpstreamCallbacks() = default;
@@ -30,21 +28,25 @@ MockInstance::MockInstance() {
     return newConnectionImpl(cb);
   }));
   ON_CALL(*this, host()).WillByDefault(Return(host_));
+  ON_CALL(*this, addIdleCallback(_)).WillByDefault(SaveArg<0>(&idle_cb_));
 }
 MockInstance::~MockInstance() = default;
 
-MockCancellable* MockInstance::newConnectionImpl(Callbacks& cb) {
+Envoy::ConnectionPool::MockCancellable* MockInstance::newConnectionImpl(Callbacks& cb) {
   handles_.emplace_back();
   callbacks_.push_back(&cb);
   return &handles_.back();
 }
 
-void MockInstance::poolFailure(PoolFailureReason reason) {
+void MockInstance::poolFailure(PoolFailureReason reason, bool host_null) {
   Callbacks* cb = callbacks_.front();
   callbacks_.pop_front();
   handles_.pop_front();
-
-  cb->onPoolFailure(reason, host_);
+  if (host_null) {
+    cb->onPoolFailure(reason, "", nullptr);
+  } else {
+    cb->onPoolFailure(reason, "", host_);
+  }
 }
 
 void MockInstance::poolReady(Network::MockClientConnection& conn) {
@@ -57,6 +59,8 @@ void MockInstance::poolReady(Network::MockClientConnection& conn) {
   connection_data_->release_callback_ = [&]() -> void { released(conn); };
 
   cb->onPoolReady(std::move(connection_data_), host_);
+
+  connection_data_ = std::make_unique<NiceMock<MockConnectionData>>();
 }
 
 } // namespace ConnectionPool
