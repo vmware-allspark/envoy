@@ -1,18 +1,17 @@
-#include "extensions/filters/network/zookeeper_proxy/filter.h"
+#include "source/extensions/filters/network/zookeeper_proxy/filter.h"
 
 #include <string>
 #include <vector>
 
 #include "envoy/config/core/v3/base.pb.h"
 
-#include "common/buffer/buffer_impl.h"
-#include "common/common/assert.h"
-#include "common/common/enum_to_int.h"
-#include "common/common/fmt.h"
-#include "common/common/logger.h"
-#include "common/stats/utility.h"
-
-#include "extensions/filters/network/well_known_names.h"
+#include "source/common/buffer/buffer_impl.h"
+#include "source/common/common/assert.h"
+#include "source/common/common/enum_to_int.h"
+#include "source/common/common/fmt.h"
+#include "source/common/common/logger.h"
+#include "source/common/stats/utility.h"
+#include "source/extensions/filters/network/well_known_names.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -52,6 +51,7 @@ ZooKeeperFilterConfig::ZooKeeperFilterConfig(const std::string& stat_prefix,
   initOpCode(OpCodes::Multi, stats_.multi_resp_, "multi_resp");
   initOpCode(OpCodes::Reconfig, stats_.reconfig_resp_, "reconfig_resp");
   initOpCode(OpCodes::SetWatches, stats_.setwatches_resp_, "setwatches_resp");
+  initOpCode(OpCodes::SetWatches2, stats_.setwatches2_resp_, "setwatches2_resp");
   initOpCode(OpCodes::CheckWatches, stats_.checkwatches_resp_, "checkwatches_resp");
   initOpCode(OpCodes::RemoveWatches, stats_.removewatches_resp_, "removewatches_resp");
   initOpCode(OpCodes::GetEphemerals, stats_.getephemerals_resp_, "getephemerals_resp");
@@ -77,14 +77,12 @@ void ZooKeeperFilter::initializeReadFilterCallbacks(Network::ReadFilterCallbacks
 
 Network::FilterStatus ZooKeeperFilter::onData(Buffer::Instance& data, bool) {
   clearDynamicMetadata();
-  decoder_->onData(data);
-  return Network::FilterStatus::Continue;
+  return decoder_->onData(data);
 }
 
 Network::FilterStatus ZooKeeperFilter::onWrite(Buffer::Instance& data, bool) {
   clearDynamicMetadata();
-  decoder_->onWrite(data);
-  return Network::FilterStatus::Continue;
+  return decoder_->onWrite(data);
 }
 
 Network::FilterStatus ZooKeeperFilter::onNewConnection() { return Network::FilterStatus::Continue; }
@@ -154,11 +152,11 @@ void ZooKeeperFilter::onPing() {
 }
 
 void ZooKeeperFilter::onAuthRequest(const std::string& scheme) {
-  Stats::SymbolTable::StoragePtr storage = config_->scope_.symbolTable().join(
-      {config_->stat_prefix_, config_->auth_,
-       config_->stat_name_set_->getBuiltin(absl::StrCat(scheme, "_rq"),
-                                           config_->unknown_scheme_rq_)});
-  config_->scope_.counterFromStatName(Stats::StatName(storage.get())).inc();
+  Stats::Counter& counter = Stats::Utility::counterFromStatNames(
+      config_->scope_, {config_->stat_prefix_, config_->auth_,
+                        config_->stat_name_set_->getBuiltin(absl::StrCat(scheme, "_rq"),
+                                                            config_->unknown_scheme_rq_)});
+  counter.inc();
   setDynamicMetadata("opname", "auth");
 }
 
@@ -270,6 +268,11 @@ void ZooKeeperFilter::onSetWatchesRequest() {
   setDynamicMetadata("opname", "setwatches");
 }
 
+void ZooKeeperFilter::onSetWatches2Request() {
+  config_->stats_.setwatches2_rq_.inc();
+  setDynamicMetadata("opname", "setwatches2");
+}
+
 void ZooKeeperFilter::onGetEphemeralsRequest(const std::string& path) {
   config_->stats_.getephemerals_rq_.inc();
   setDynamicMetadata({{"opname", "getephemerals"}, {"path", path}});
@@ -290,11 +293,10 @@ void ZooKeeperFilter::onConnectResponse(const int32_t proto_version, const int32
                                         const std::chrono::milliseconds& latency) {
   config_->stats_.connect_resp_.inc();
 
-  Stats::SymbolTable::StoragePtr storage =
-      config_->scope_.symbolTable().join({config_->stat_prefix_, config_->connect_latency_});
-  config_->scope_
-      .histogramFromStatName(Stats::StatName(storage.get()), Stats::Histogram::Unit::Milliseconds)
-      .recordValue(latency.count());
+  Stats::Histogram& histogram = Stats::Utility::histogramFromElements(
+      config_->scope_, {config_->stat_prefix_, config_->connect_latency_},
+      Stats::Histogram::Unit::Milliseconds);
+  histogram.recordValue(latency.count());
 
   setDynamicMetadata({{"opname", "connect_response"},
                       {"protocol_version", std::to_string(proto_version)},
@@ -313,11 +315,11 @@ void ZooKeeperFilter::onResponse(const OpCodes opcode, const int32_t xid, const 
     opname = opcode_info.opname_;
     opcode_latency = opcode_info.latency_name_;
   }
-  Stats::SymbolTable::StoragePtr storage =
-      config_->scope_.symbolTable().join({config_->stat_prefix_, opcode_latency});
-  config_->scope_
-      .histogramFromStatName(Stats::StatName(storage.get()), Stats::Histogram::Unit::Milliseconds)
-      .recordValue(latency.count());
+
+  Stats::Histogram& histogram = Stats::Utility::histogramFromStatNames(
+      config_->scope_, {config_->stat_prefix_, opcode_latency},
+      Stats::Histogram::Unit::Milliseconds);
+  histogram.recordValue(latency.count());
 
   setDynamicMetadata({{"opname", opname},
                       {"xid", std::to_string(xid)},

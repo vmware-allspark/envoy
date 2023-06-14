@@ -2,10 +2,10 @@
 #include "envoy/extensions/filters/network/thrift_proxy/filters/ratelimit/v3/rate_limit.pb.h"
 #include "envoy/extensions/filters/network/thrift_proxy/filters/ratelimit/v3/rate_limit.pb.validate.h"
 
-#include "extensions/filters/network/thrift_proxy/filters/ratelimit/config.h"
+#include "source/extensions/filters/network/thrift_proxy/filters/ratelimit/config.h"
 
 #include "test/extensions/filters/network/thrift_proxy/mocks.h"
-#include "test/mocks/server/mocks.h"
+#include "test/mocks/server/factory_context.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -19,7 +19,7 @@ namespace RateLimitFilter {
 namespace {
 
 envoy::extensions::filters::network::thrift_proxy::filters::ratelimit::v3::RateLimit
-parseRateLimitFromV2Yaml(const std::string& yaml) {
+parseRateLimitFromV3Yaml(const std::string& yaml) {
   envoy::extensions::filters::network::thrift_proxy::filters::ratelimit::v3::RateLimit rate_limit;
   TestUtility::loadFromYaml(yaml, rate_limit);
   return rate_limit;
@@ -41,18 +41,19 @@ TEST(RateLimitFilterConfigTest, RateLimitFilterCorrectProto) {
 domain: "test"
 timeout: "1.337s"
 rate_limit_service:
+  transport_api_version: V3
   grpc_service:
     envoy_grpc:
       cluster_name: ratelimit_cluster
   )EOF";
 
-  auto proto_config = parseRateLimitFromV2Yaml(yaml_string);
+  auto proto_config = parseRateLimitFromV3Yaml(yaml_string);
 
   NiceMock<Server::Configuration::MockFactoryContext> context;
 
-  EXPECT_CALL(context.cluster_manager_.async_client_manager_, factoryForGrpcService(_, _, _))
+  EXPECT_CALL(context.cluster_manager_.async_client_manager_, getOrCreateRawAsyncClient(_, _, _))
       .WillOnce(Invoke([](const envoy::config::core::v3::GrpcService&, Stats::Scope&, bool) {
-        return std::make_unique<NiceMock<Grpc::MockAsyncClientFactory>>();
+        return std::make_unique<NiceMock<Grpc::MockAsyncClient>>();
       }));
 
   RateLimitFilterConfig factory;

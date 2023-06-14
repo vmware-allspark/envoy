@@ -7,19 +7,15 @@
 #include "envoy/upstream/load_balancer.h"
 #include "envoy/upstream/upstream.h"
 
-#include "common/network/address_impl.h"
-#include "common/upstream/load_balancer_impl.h"
-#include "common/upstream/upstream_impl.h"
-
+#include "source/common/network/address_impl.h"
+#include "source/common/upstream/load_balancer_impl.h"
+#include "source/common/upstream/upstream_impl.h"
 #include "source/extensions/clusters/redis/crc16.h"
+#include "source/extensions/filters/network/common/redis/client.h"
+#include "source/extensions/filters/network/common/redis/codec.h"
+#include "source/extensions/filters/network/common/redis/supported_commands.h"
 
-#include "extensions/clusters/well_known_names.h"
-#include "extensions/filters/network/common/redis/client.h"
-#include "extensions/filters/network/common/redis/codec.h"
-#include "extensions/filters/network/common/redis/supported_commands.h"
-
-#include "absl/container/flat_hash_map.h"
-#include "absl/container/flat_hash_set.h"
+#include "absl/container/btree_map.h"
 #include "absl/synchronization/mutex.h"
 
 namespace Envoy {
@@ -29,28 +25,42 @@ namespace Redis {
 
 static const uint64_t MaxSlot = 16384;
 
+using ReplicaToResolve = std::pair<std::string, uint16_t>;
+
 class ClusterSlot {
 public:
-  ClusterSlot(int64_t start, int64_t end, Network::Address::InstanceConstSharedPtr master)
-      : start_(start), end_(end), master_(std::move(master)) {}
+  ClusterSlot(int64_t start, int64_t end, Network::Address::InstanceConstSharedPtr primary)
+      : start_(start), end_(end), primary_(std::move(primary)) {}
 
   int64_t start() const { return start_; }
   int64_t end() const { return end_; }
-  Network::Address::InstanceConstSharedPtr master() const { return master_; }
-  const absl::flat_hash_set<Network::Address::InstanceConstSharedPtr>& replicas() const {
+  Network::Address::InstanceConstSharedPtr primary() const { return primary_; }
+  const absl::btree_map<std::string, Network::Address::InstanceConstSharedPtr>& replicas() const {
     return replicas_;
   }
+
+  void setPrimary(Network::Address::InstanceConstSharedPtr address) {
+    primary_ = std::move(address);
+  }
   void addReplica(Network::Address::InstanceConstSharedPtr replica_address) {
-    replicas_.insert(std::move(replica_address));
+    replicas_.emplace(replica_address->asString(), std::move(replica_address));
+  }
+  void addReplicaToResolve(const std::string& host, uint16_t port) {
+    replicas_to_resolve_.emplace_back(host, port);
   }
 
   bool operator==(const ClusterSlot& rhs) const;
 
+  // In case of primary slot address is hostname and needs to be resolved
+  std::string primary_hostname_;
+  uint16_t primary_port_;
+  std::vector<ReplicaToResolve> replicas_to_resolve_;
+
 private:
   int64_t start_;
   int64_t end_;
-  Network::Address::InstanceConstSharedPtr master_;
-  absl::flat_hash_set<Network::Address::InstanceConstSharedPtr> replicas_;
+  Network::Address::InstanceConstSharedPtr primary_;
+  absl::btree_map<std::string, Network::Address::InstanceConstSharedPtr> replicas_;
 };
 
 using ClusterSlotsPtr = std::unique_ptr<std::vector<ClusterSlot>>;
@@ -82,7 +92,7 @@ public:
                                bool is_redis_cluster,
                                const NetworkFilters::Common::Redis::RespValue& request,
                                NetworkFilters::Common::Redis::Client::ReadPolicy read_policy =
-                                   NetworkFilters::Common::Redis::Client::ReadPolicy::Master);
+                                   NetworkFilters::Common::Redis::Client::ReadPolicy::Primary);
 
   // Upstream::LoadBalancerContextBase
   absl::optional<uint64_t> computeHashKey() override { return hash_key_; }
@@ -113,7 +123,8 @@ public:
    * @param all_hosts provides the updated hosts.
    * @return indicate if the cluster slot is updated or not.
    */
-  virtual bool onClusterSlotUpdate(ClusterSlotsPtr&& slots, Upstream::HostMap all_hosts) PURE;
+  virtual bool onClusterSlotUpdate(ClusterSlotsSharedPtr&& slots,
+                                   Upstream::HostMap& all_hosts) PURE;
 
   /**
    * Callback when a host's health status is updated
@@ -130,22 +141,23 @@ using ClusterSlotUpdateCallBackSharedPtr = std::shared_ptr<ClusterSlotUpdateCall
 class RedisClusterLoadBalancerFactory : public ClusterSlotUpdateCallBack,
                                         public Upstream::LoadBalancerFactory {
 public:
-  RedisClusterLoadBalancerFactory(Runtime::RandomGenerator& random) : random_(random) {}
+  RedisClusterLoadBalancerFactory(Random::RandomGenerator& random) : random_(random) {}
 
   // ClusterSlotUpdateCallBack
-  bool onClusterSlotUpdate(ClusterSlotsPtr&& slots, Upstream::HostMap all_hosts) override;
+  bool onClusterSlotUpdate(ClusterSlotsSharedPtr&& slots, Upstream::HostMap& all_hosts) override;
 
   void onHostHealthUpdate() override;
 
   // Upstream::LoadBalancerFactory
   Upstream::LoadBalancerPtr create() override;
+  Upstream::LoadBalancerPtr create(Upstream::LoadBalancerParams) override { return create(); }
 
 private:
   class RedisShard {
   public:
-    RedisShard(Upstream::HostConstSharedPtr master, Upstream::HostVectorConstSharedPtr replicas,
+    RedisShard(Upstream::HostConstSharedPtr primary, Upstream::HostVectorConstSharedPtr replicas,
                Upstream::HostVectorConstSharedPtr all_hosts)
-        : master_(std::move(master)) {
+        : primary_(std::move(primary)) {
       replicas_.updateHosts(Upstream::HostSetImpl::partitionHosts(
                                 std::move(replicas), Upstream::HostsPerLocalityImpl::empty()),
                             nullptr, {}, {});
@@ -153,12 +165,12 @@ private:
                                  std::move(all_hosts), Upstream::HostsPerLocalityImpl::empty()),
                              nullptr, {}, {});
     }
-    const Upstream::HostConstSharedPtr master() const { return master_; }
+    const Upstream::HostConstSharedPtr primary() const { return primary_; }
     const Upstream::HostSetImpl& replicas() const { return replicas_; }
     const Upstream::HostSetImpl& allHosts() const { return all_hosts_; }
 
   private:
-    const Upstream::HostConstSharedPtr master_;
+    const Upstream::HostConstSharedPtr primary_;
     Upstream::HostSetImpl replicas_{0, absl::nullopt};
     Upstream::HostSetImpl all_hosts_{0, absl::nullopt};
   };
@@ -183,24 +195,38 @@ private:
   class RedisClusterLoadBalancer : public Upstream::LoadBalancer {
   public:
     RedisClusterLoadBalancer(SlotArraySharedPtr slot_array, ShardVectorSharedPtr shard_vector,
-                             Runtime::RandomGenerator& random)
+                             Random::RandomGenerator& random)
         : slot_array_(std::move(slot_array)), shard_vector_(std::move(shard_vector)),
           random_(random) {}
 
     // Upstream::LoadBalancerBase
     Upstream::HostConstSharedPtr chooseHost(Upstream::LoadBalancerContext*) override;
+    Upstream::HostConstSharedPtr peekAnotherHost(Upstream::LoadBalancerContext*) override {
+      return nullptr;
+    }
+    // Pool selection not implemented.
+    absl::optional<Upstream::SelectedPoolAndConnection>
+    selectExistingConnection(Upstream::LoadBalancerContext* /*context*/,
+                             const Upstream::Host& /*host*/,
+                             std::vector<uint8_t>& /*hash_key*/) override {
+      return absl::nullopt;
+    }
+    // Lifetime tracking not implemented.
+    OptRef<Envoy::Http::ConnectionPool::ConnectionLifetimeCallbacks> lifetimeCallbacks() override {
+      return {};
+    }
 
   private:
     const SlotArraySharedPtr slot_array_;
     const ShardVectorSharedPtr shard_vector_;
-    Runtime::RandomGenerator& random_;
+    Random::RandomGenerator& random_;
   };
 
   absl::Mutex mutex_;
-  SlotArraySharedPtr slot_array_ GUARDED_BY(mutex_);
+  SlotArraySharedPtr slot_array_ ABSL_GUARDED_BY(mutex_);
   ClusterSlotsSharedPtr current_cluster_slot_;
   ShardVectorSharedPtr shard_vector_;
-  Runtime::RandomGenerator& random_;
+  Random::RandomGenerator& random_;
 };
 
 class RedisClusterThreadAwareLoadBalancer : public Upstream::ThreadAwareLoadBalancer {

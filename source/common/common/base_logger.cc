@@ -1,9 +1,9 @@
-#include "common/common/base_logger.h"
+#include "source/common/common/base_logger.h"
 
 namespace Envoy {
 namespace Logger {
 
-const char* Logger::DEFAULT_LOG_FORMAT = "[%Y-%m-%d %T.%e][%t][%l][%n] %v";
+const char* Logger::DEFAULT_LOG_FORMAT = "[%Y-%m-%d %T.%e][%t][%l][%n] [%g:%#] %v";
 
 Logger::Logger(std::shared_ptr<spdlog::logger> logger) : logger_(logger) {
   logger_->set_pattern(DEFAULT_LOG_FORMAT);

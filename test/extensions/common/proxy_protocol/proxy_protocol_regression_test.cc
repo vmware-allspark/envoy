@@ -1,18 +1,16 @@
 #include "envoy/network/address.h"
 
-#include "common/buffer/buffer_impl.h"
-#include "common/event/dispatcher_impl.h"
-#include "common/network/connection_balancer_impl.h"
-#include "common/network/listen_socket_impl.h"
-
-#include "server/connection_handler_impl.h"
-
-#include "extensions/common/proxy_protocol/proxy_protocol_header.h"
-#include "extensions/filters/listener/proxy_protocol/proxy_protocol.h"
+#include "source/common/buffer/buffer_impl.h"
+#include "source/common/common/basic_resource_impl.h"
+#include "source/common/event/dispatcher_impl.h"
+#include "source/common/network/connection_balancer_impl.h"
+#include "source/common/network/listen_socket_impl.h"
+#include "source/extensions/common/proxy_protocol/proxy_protocol_header.h"
+#include "source/extensions/filters/listener/proxy_protocol/proxy_protocol.h"
+#include "source/extensions/listener_managers/listener_manager/connection_handler_impl.h"
 
 #include "test/mocks/buffer/mocks.h"
 #include "test/mocks/network/mocks.h"
-#include "test/mocks/server/mocks.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/network_utility.h"
 #include "test/test_common/utility.h"
@@ -41,45 +39,68 @@ class ProxyProtocolRegressionTest : public testing::TestWithParam<Network::Addre
                                     protected Logger::Loggable<Logger::Id::main> {
 public:
   ProxyProtocolRegressionTest()
-      : api_(Api::createApiForTest(stats_store_)), dispatcher_(api_->allocateDispatcher()),
-        socket_(std::make_shared<Network::TcpListenSocket>(
-            Network::Test::getCanonicalLoopbackAddress(GetParam()), nullptr, true)),
-        connection_handler_(new Server::ConnectionHandlerImpl(*dispatcher_, "test_thread")),
-        name_("proxy"), filter_chain_(Network::Test::createEmptyFilterChainWithRawBufferSockets()) {
-    EXPECT_CALL(socket_factory_, socketType())
-        .WillOnce(Return(Network::Address::SocketType::Stream));
-    EXPECT_CALL(socket_factory_, localAddress()).WillOnce(ReturnRef(socket_->localAddress()));
-    EXPECT_CALL(socket_factory_, getListenSocket()).WillOnce(Return(socket_));
-    connection_handler_->addListener(*this);
-    conn_ = dispatcher_->createClientConnection(socket_->localAddress(),
+      : api_(Api::createApiForTest(stats_store_)),
+        dispatcher_(api_->allocateDispatcher("test_thread")),
+        socket_(std::make_shared<Network::Test::TcpListenSocketImmediateListen>(
+            Network::Test::getCanonicalLoopbackAddress(GetParam()))),
+        connection_handler_(new Server::ConnectionHandlerImpl(*dispatcher_, absl::nullopt)),
+        name_("proxy"), filter_chain_(Network::Test::createEmptyFilterChainWithRawBufferSockets()),
+        init_manager_(nullptr) {
+    socket_factories_.emplace_back(std::make_unique<Network::MockListenSocketFactory>());
+    EXPECT_CALL(*static_cast<Network::MockListenSocketFactory*>(socket_factories_[0].get()),
+                socketType())
+        .WillOnce(Return(Network::Socket::Type::Stream));
+    EXPECT_CALL(*static_cast<Network::MockListenSocketFactory*>(socket_factories_[0].get()),
+                localAddress())
+        .WillRepeatedly(ReturnRef(socket_->connectionInfoProvider().localAddress()));
+    EXPECT_CALL(*static_cast<Network::MockListenSocketFactory*>(socket_factories_[0].get()),
+                getListenSocket(_))
+        .WillOnce(Return(socket_));
+    connection_handler_->addListener(absl::nullopt, *this, runtime_);
+    conn_ = dispatcher_->createClientConnection(socket_->connectionInfoProvider().localAddress(),
                                                 Network::Address::InstanceConstSharedPtr(),
-                                                Network::Test::createRawBufferSocket(), nullptr);
+                                                Network::Test::createRawBufferSocket(), nullptr,
+                                                nullptr);
     conn_->addConnectionCallbacks(connection_callbacks_);
   }
 
   // Network::ListenerConfig
   Network::FilterChainManager& filterChainManager() override { return *this; }
   Network::FilterChainFactory& filterChainFactory() override { return factory_; }
-  Network::ListenSocketFactory& listenSocketFactory() override { return socket_factory_; }
-  bool bindToPort() override { return true; }
+  std::vector<Network::ListenSocketFactoryPtr>& listenSocketFactories() override {
+    return socket_factories_;
+  }
+  bool bindToPort() const override { return true; }
   bool handOffRestoredDestinationConnections() const override { return false; }
   uint32_t perConnectionBufferLimitBytes() const override { return 0; }
   std::chrono::milliseconds listenerFiltersTimeout() const override { return {}; }
   bool continueOnListenerFiltersTimeout() const override { return false; }
-  Stats::Scope& listenerScope() override { return stats_store_; }
+  Stats::Scope& listenerScope() override { return *stats_store_.rootScope(); }
   uint64_t listenerTag() const override { return 1; }
   const std::string& name() const override { return name_; }
-  Network::ActiveUdpListenerFactory* udpListenerFactory() override { return nullptr; }
+  Network::UdpListenerConfigOptRef udpListenerConfig() override {
+    return Network::UdpListenerConfigOptRef();
+  }
+  Network::InternalListenerConfigOptRef internalListenerConfig() override {
+    return Network::InternalListenerConfigOptRef();
+  }
+  ResourceLimit& openConnections() override { return open_connections_; }
   envoy::config::core::v3::TrafficDirection direction() const override {
     return envoy::config::core::v3::UNSPECIFIED;
   }
-  Network::ConnectionBalancer& connectionBalancer() override { return connection_balancer_; }
+  Network::ConnectionBalancer& connectionBalancer(const Network::Address::Instance&) override {
+    return connection_balancer_;
+  }
   const std::vector<AccessLog::InstanceSharedPtr>& accessLogs() const override {
     return empty_access_logs_;
   }
+  uint32_t tcpBacklogSize() const override { return ENVOY_TCP_BACKLOG_SIZE; }
+  Init::Manager& initManager() override { return *init_manager_; }
+  bool ignoreGlobalConnLimit() const override { return false; }
 
   // Network::FilterChainManager
-  const Network::FilterChain* findFilterChain(const Network::ConnectionSocket&) const override {
+  const Network::FilterChain* findFilterChain(const Network::ConnectionSocket&,
+                                              const StreamInfo::StreamInfo&) const override {
     return filter_chain_.get();
   }
 
@@ -97,7 +118,9 @@ public:
           filter_manager.addAcceptFilter(
               nullptr,
               std::make_unique<ListenerFilters::ProxyProtocol::Filter>(
-                  std::make_shared<ListenerFilters::ProxyProtocol::Config>(listenerScope())));
+                  std::make_shared<ListenerFilters::ProxyProtocol::Config>(
+                      listenerScope(),
+                      envoy::extensions::filters::listener::proxy_protocol::v3::ProxyProtocol())));
           maybeExitDispatcher();
           return true;
         }));
@@ -155,18 +178,21 @@ public:
   Api::ApiPtr api_;
   Event::DispatcherPtr dispatcher_;
   std::shared_ptr<Network::TcpListenSocket> socket_;
-  Network::MockListenSocketFactory socket_factory_;
+  std::vector<Network::ListenSocketFactoryPtr> socket_factories_;
   Network::NopConnectionBalancerImpl connection_balancer_;
   Network::ConnectionHandlerPtr connection_handler_;
   Network::MockFilterChainFactory factory_;
   Network::ClientConnectionPtr conn_;
   NiceMock<Network::MockConnectionCallbacks> connection_callbacks_;
+  BasicResourceLimitImpl open_connections_;
   Network::Connection* server_connection_;
   Network::MockConnectionCallbacks server_callbacks_;
   std::shared_ptr<Network::MockReadFilter> read_filter_;
   std::string name_;
   const Network::FilterChainSharedPtr filter_chain_;
   const std::vector<AccessLog::InstanceSharedPtr> empty_access_logs_;
+  std::unique_ptr<Init::Manager> init_manager_;
+  NiceMock<Runtime::MockLoader> runtime_;
 };
 
 // Parameterize the listener socket address version.
@@ -190,8 +216,9 @@ TEST_P(ProxyProtocolRegressionTest, V1Basic) {
 
   expectData("more data");
 
-  EXPECT_EQ(server_connection_->remoteAddress()->ip()->addressAsString(), source_addr);
-  EXPECT_TRUE(server_connection_->localAddressRestored());
+  EXPECT_EQ(server_connection_->connectionInfoProvider().remoteAddress()->ip()->addressAsString(),
+            source_addr);
+  EXPECT_TRUE(server_connection_->connectionInfoProvider().localAddressRestored());
 
   disconnect();
 }
@@ -212,8 +239,9 @@ TEST_P(ProxyProtocolRegressionTest, V2Basic) {
 
   expectData("more data");
 
-  EXPECT_EQ(server_connection_->remoteAddress()->ip()->addressAsString(), source_addr);
-  EXPECT_TRUE(server_connection_->localAddressRestored());
+  EXPECT_EQ(server_connection_->connectionInfoProvider().remoteAddress()->ip()->addressAsString(),
+            source_addr);
+  EXPECT_TRUE(server_connection_->connectionInfoProvider().localAddressRestored());
 
   disconnect();
 }
@@ -228,11 +256,13 @@ TEST_P(ProxyProtocolRegressionTest, V2LocalConnection) {
   expectData("more data");
 
   if (GetParam() == Envoy::Network::Address::IpVersion::v4) {
-    EXPECT_EQ(server_connection_->remoteAddress()->ip()->addressAsString(), "127.0.0.1");
+    EXPECT_EQ(server_connection_->connectionInfoProvider().remoteAddress()->ip()->addressAsString(),
+              "127.0.0.1");
   } else {
-    EXPECT_EQ(server_connection_->remoteAddress()->ip()->addressAsString(), "::1");
+    EXPECT_EQ(server_connection_->connectionInfoProvider().remoteAddress()->ip()->addressAsString(),
+              "::1");
   }
-  EXPECT_FALSE(server_connection_->localAddressRestored());
+  EXPECT_FALSE(server_connection_->connectionInfoProvider().localAddressRestored());
 
   disconnect();
 }

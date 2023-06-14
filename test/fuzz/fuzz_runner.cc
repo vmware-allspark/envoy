@@ -1,11 +1,10 @@
 #include "test/fuzz/fuzz_runner.h"
 
-#include "common/common/thread.h"
-#include "common/common/utility.h"
-#include "common/event/libevent.h"
-#include "common/http/http2/codec_impl.h"
-
-#include "exe/process_wide.h"
+#include "source/common/common/thread.h"
+#include "source/common/common/utility.h"
+#include "source/common/event/libevent.h"
+#include "source/common/http/http2/codec_impl.h"
+#include "source/exe/process_wide.h"
 
 #include "test/test_common/environment.h"
 
@@ -47,6 +46,14 @@ void Runner::setupEnvironment(int argc, char** argv, spdlog::level::level_enum d
   static auto* logging_context =
       new Logger::Context(log_level_, TestEnvironment::getOptions().logFormat(), *lock, false);
   UNREFERENCED_PARAMETER(logging_context);
+
+  // Suppress all libprotobuf non-fatal logging as long as this object exists.
+  // For fuzzing, this prevents logging when parsing text-format protos fails,
+  // deprecated fields are used, etc.
+  // https://github.com/protocolbuffers/protobuf/blob/204f99488ce1ef74565239cf3963111ae4c774b7/src/google/protobuf/stubs/logging.h#L223
+  if (log_level_ > spdlog::level::debug) {
+    ABSL_ATTRIBUTE_UNUSED static auto* log_silencer = new Protobuf::LogSilencer();
+  }
 }
 
 } // namespace Fuzz

@@ -1,126 +1,87 @@
 #!/usr/bin/env bash
 
-. tools/shell_utils.sh
+# set SPHINX_SKIP_CONFIG_VALIDATION environment variable to true to skip
+# validation of configuration examples
 
 set -e
 
-# We need to set ENVOY_DOCS_VERSION_STRING and ENVOY_DOCS_RELEASE_LEVEL for Sphinx.
-# We also validate that the tag and version match at this point if needed.
-if [ -n "$CIRCLE_TAG" ]
-then
-  # Check the git tag matches the version number in the VERSION file.
-  VERSION_NUMBER=$(cat VERSION)
-  if [ "v${VERSION_NUMBER}" != "${CIRCLE_TAG}" ]; then
-    echo "Given git tag does not match the VERSION file content:"
-    echo "${CIRCLE_TAG} vs $(cat VERSION)"
-    exit 1
-  fi
-  # Check the version_history.rst contains current release version.
-  grep --fixed-strings "$VERSION_NUMBER" docs/root/intro/version_history.rst \
-    || (echo "Git tag not found in version_history.rst" && exit 1)
 
-  # Now that we now there is a match, we can use the tag.
-  export ENVOY_DOCS_VERSION_STRING="tag-$CIRCLE_TAG"
-  export ENVOY_DOCS_RELEASE_LEVEL=tagged
-  export ENVOY_BLOB_SHA="$CIRCLE_TAG"
-else
-  BUILD_SHA=$(git rev-parse HEAD)
-  VERSION_NUM=$(cat VERSION)
-  export ENVOY_DOCS_VERSION_STRING="${VERSION_NUM}"-"${BUILD_SHA:0:6}"
-  export ENVOY_DOCS_RELEASE_LEVEL=pre-release
-  export ENVOY_BLOB_SHA="$BUILD_SHA"
+if [[ ! $(command -v bazel) ]]; then
+    # shellcheck disable=SC2016
+    echo 'ERROR: bazel must be installed and available in "$PATH" to build docs' >&2
+    exit 1
 fi
 
-SCRIPT_DIR=$(dirname "$0")
-API_DIR=$(dirname "$dir")/api
-BUILD_DIR=build_docs
-[[ -z "${DOCS_OUTPUT_DIR}" ]] && DOCS_OUTPUT_DIR=generated/docs
-[[ -z "${GENERATED_RST_DIR}" ]] && GENERATED_RST_DIR=generated/rst
+VERSION="$(cat VERSION.txt)"
+MAIN_BRANCH="refs/heads/main"
+DEV_VERSION_REGEX="-dev$"
 
+# default is to build html only
+BUILD_TYPE=html
+
+if [[ "$VERSION" =~ $DEV_VERSION_REGEX ]]; then
+   if [[ "$AZP_BRANCH" == "$MAIN_BRANCH" ]]; then
+       # no need to build html, just rst
+       BUILD_TYPE=rst
+   fi
+else
+    export BUILD_DOCS_TAG="v${VERSION}"
+    echo "BUILD AZP RELEASE BRANCH ${BUILD_DOCS_TAG}"
+    BAZEL_BUILD_OPTIONS+=("--action_env=BUILD_DOCS_TAG")
+fi
+
+# This is for local RBE setup, should be no-op for builds without RBE setting in bazelrc files.
+IFS=" " read -ra BAZEL_BUILD_OPTIONS <<< "${BAZEL_BUILD_OPTION_LIST:-}"
+IFS=" " read -ra BAZEL_STARTUP_OPTIONS <<< "${BAZEL_STARTUP_OPTION_LIST:-}"
+
+# We want the binary at the end
+BAZEL_BUILD_OPTIONS+=(--remote_download_toplevel)
+
+if [[ "${AZP_BRANCH}" =~ ^refs/pull ]]; then
+    # For PRs use the unmerged PR commit in the version string.
+    #
+    # Staged/built docs still use the merged sha in the URL to distinguish builds
+    #
+    export BUILD_DOCS_SHA="${AZP_COMMIT_SHA}"
+    BAZEL_BUILD_OPTIONS+=("--action_env=BUILD_DOCS_SHA")
+fi
+
+if [[ -n "${AZP_TARGET_BRANCH}" ]] || [[ -n "${SPHINX_QUIET}" ]]; then
+    export SPHINX_RUNNER_ARGS="-v warn"
+    BAZEL_BUILD_OPTIONS+=("--action_env=SPHINX_RUNNER_ARGS")
+fi
+
+# Building html/rst is determined by then needs of CI but can be overridden in dev.
+if [[ "${BUILD_TYPE}" == "html" ]] || [[ -n "${DOCS_BUILD_HTML}" ]]; then
+    BUILD_HTML=1
+    BUILD_HTML_TARGET="//docs:html"
+    BUILD_HTML_TARBALL="bazel-bin/docs/html.tar.gz"
+    if [[ -n "${AZP_BRANCH}" ]] || [[ -n "${DOCS_BUILD_RELEASE}" ]]; then
+        # CI build - use git sha
+        BUILD_HTML_TARGET="//docs:html_release"
+        BUILD_HTML_TARBALL="bazel-bin/docs/html_release.tar.gz"
+    fi
+fi
+if [[ "${BUILD_TYPE}" == "rst" ]] || [[ -n "${DOCS_BUILD_RST}" ]]; then
+    BUILD_RST=1
+fi
+
+# Build html/rst
+if [[ -n "${BUILD_RST}" ]]; then
+    bazel "${BAZEL_STARTUP_OPTIONS[@]}" build "${BAZEL_BUILD_OPTIONS[@]}" //docs:rst
+fi
+if [[ -n "${BUILD_HTML}" ]]; then
+    bazel "${BAZEL_STARTUP_OPTIONS[@]}" build "${BAZEL_BUILD_OPTIONS[@]}" "$BUILD_HTML_TARGET"
+fi
+
+[[ -z "${DOCS_OUTPUT_DIR}" ]] && DOCS_OUTPUT_DIR=generated/docs
 rm -rf "${DOCS_OUTPUT_DIR}"
 mkdir -p "${DOCS_OUTPUT_DIR}"
 
-rm -rf "${GENERATED_RST_DIR}"
-mkdir -p "${GENERATED_RST_DIR}"
-
-source_venv "$BUILD_DIR"
-pip3 install -r "${SCRIPT_DIR}"/requirements.txt
-
-# Clean up any stale files in the API tree output. Bazel remembers valid cached
-# files still.
-rm -rf bazel-bin/external/envoy_api_canonical
-
-export EXTENSION_DB_PATH="$(realpath "${BUILD_DIR}/extension_db.json")"
-
-# This is for local RBE setup, should be no-op for builds without RBE setting in bazelrc files.
-BAZEL_BUILD_OPTIONS+=" --remote_download_outputs=all --strategy=protodoc=sandboxed,local
-    --action_env=ENVOY_BLOB_SHA --action_env=EXTENSION_DB_PATH"
-
-# Generate extension database. This maps from extension name to extension
-# metadata, based on the envoy_cc_extension() Bazel target attributes.
-./docs/generate_extension_db.py "${EXTENSION_DB_PATH}"
-
-# Generate RST for the lists of trusted/untrusted extensions in
-# intro/arch_overview/security docs.
-mkdir -p "${GENERATED_RST_DIR}"/intro/arch_overview/security
-./docs/generate_extension_rst.py "${EXTENSION_DB_PATH}" "${GENERATED_RST_DIR}"/intro/arch_overview/security
-
-function generate_api_rst() {
-  declare -r API_VERSION=$1
-  echo "Generating ${API_VERSION} API RST..."
-
-  # Generate the extensions docs
-  bazel build ${BAZEL_BUILD_OPTIONS} @envoy_api_canonical//:"${API_VERSION}"_protos --aspects \
-    tools/protodoc/protodoc.bzl%protodoc_aspect --output_groups=rst
-
-  # Fill in boiler plate for extensions that have google.protobuf.Empty as their
-  # config.
-  bazel run ${BAZEL_BUILD_OPTIONS} //tools/protodoc:generate_empty \
-    "${PWD}"/docs/empty_extensions.json "${PWD}/${GENERATED_RST_DIR}"/api-"${API_VERSION}"/config
-
-  # We do ** matching below to deal with Bazel cache blah (source proto artifacts
-  # are nested inside source package targets).
-  shopt -s globstar
-
-  # Find all source protos.
-  declare -r PROTO_TARGET=$(bazel query "labels(srcs, labels(deps, @envoy_api_canonical//:${API_VERSION}_protos))")
-
-  # Only copy in the protos we care about and know how to deal with in protodoc.
-  for p in ${PROTO_TARGET}
-  do
-    declare PROTO_FILE_WITHOUT_PREFIX="${p#@envoy_api_canonical//}"
-    declare PROTO_FILE_CANONICAL="${PROTO_FILE_WITHOUT_PREFIX/://}"
-    # We use ** glob matching here to deal with the fact that we have something
-    # like
-    # bazel-bin/external/envoy_api_canonical/envoy/admin/v2alpha/pkg/envoy/admin/v2alpha/certs.proto.proto
-    # and we don't want to have to do a nested loop and slow bazel query to
-    # recover the canonical package part of the path.
-    declare SRCS=(bazel-bin/external/envoy_api_canonical/**/"${PROTO_FILE_CANONICAL}.rst")
-    # While we may have reformatted the file multiple times due to the transitive
-    # dependencies in the aspect above, they all look the same. So, just pick an
-    # arbitrary match and we're done.
-    declare SRC="${SRCS[0]}"
-    declare DST="${GENERATED_RST_DIR}/api-${API_VERSION}/${PROTO_FILE_CANONICAL#envoy/}".rst
-
-    mkdir -p "$(dirname "${DST}")"
-    cp -f "${SRC}" "$(dirname "${DST}")"
-  done
-}
-
-generate_api_rst v2
-generate_api_rst v3
-
-# Fixup anchors and references in v3 so they form a distinct namespace.
-# TODO(htuch): Do this in protodoc generation in the future.
-find "${GENERATED_RST_DIR}"/api-v3 -name "*.rst" -print0 | xargs -0 sed -i -e "s#envoy_api_#envoy_v3_api_#g"
-find "${GENERATED_RST_DIR}"/api-v3 -name "*.rst" -print0 | xargs -0 sed -i -e "s#config_resource_monitors#v3_config_resource_monitors#g"
-
-mkdir -p ${GENERATED_RST_DIR}/api-docs
-
-cp -f $API_DIR/xds_protocol.rst "${GENERATED_RST_DIR}/api-docs/xds_protocol.rst"
-
-rsync -rav  $API_DIR/diagrams "${GENERATED_RST_DIR}/api-docs"
-
-rsync -av "${SCRIPT_DIR}"/root/ "${SCRIPT_DIR}"/conf.py "${GENERATED_RST_DIR}"
-
-sphinx-build -W --keep-going -b html "${GENERATED_RST_DIR}" "${DOCS_OUTPUT_DIR}"
+# Save html/rst to output directory
+if [[ -n "${BUILD_HTML}" ]]; then
+    tar -xzf "$BUILD_HTML_TARBALL" -C "$DOCS_OUTPUT_DIR"
+fi
+if [[ -n "${BUILD_RST}" ]]; then
+    cp bazel-bin/docs/rst.tar.gz "$DOCS_OUTPUT_DIR"/envoy-docs-rst.tar.gz
+fi

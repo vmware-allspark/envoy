@@ -3,13 +3,8 @@
 Adaptive Concurrency
 ====================
 
-.. attention::
-
-  The adaptive concurrency filter is experimental and is currently under active development.
-
-This filter should be configured with the name `envoy.filters.http.adaptive_concurrency`.
-
-See the :ref:`v2 API reference <envoy_api_msg_config.filter.http.adaptive_concurrency.v2alpha.AdaptiveConcurrency>` for details on each configuration parameter.
+* This filter should be configured with the type URL ``type.googleapis.com/envoy.extensions.filters.http.adaptive_concurrency.v3.AdaptiveConcurrency``.
+* :ref:`v3 API reference <envoy_v3_api_msg_extensions.filters.http.adaptive_concurrency.v3.AdaptiveConcurrency>` for details on each configuration parameter.
 
 Overview
 --------
@@ -28,7 +23,7 @@ Gradient Controller
 The gradient controller makes forwarding decisions based on a periodically measured ideal round-trip
 time (minRTT) for an upstream.
 
-:ref:`v2 API reference <envoy_api_msg_config.filter.http.adaptive_concurrency.v2alpha.GradientControllerConfig>`
+:ref:`v3 API reference <envoy_v3_api_msg_extensions.filters.http.adaptive_concurrency.v3.GradientControllerConfig>`
 
 Calculating the minRTT
 ^^^^^^^^^^^^^^^^^^^^^^
@@ -73,7 +68,7 @@ Notice that *B*, the buffer value added to the minRTT, allows for normal varianc
 latencies by requiring the sampled latencies the exceed the minRTT by some configurable threshold
 before decreasing the gradient value.
 
-The buffer will be a percentage of the measured minRTT value whose value is modified via the buffer field in the :ref:`minRTT calculation parameters <envoy_api_msg_config.filter.http.adaptive_concurrency.v2alpha.GradientControllerConfig.MinimumRTTCalculationParams>`. The buffer is calculated as follows:
+The buffer will be a percentage of the measured minRTT value whose value is modified via the buffer field in the :ref:`minRTT calculation parameters <envoy_v3_api_msg_extensions.filters.http.adaptive_concurrency.v3.GradientControllerConfig.MinimumRTTCalculationParams>`. The buffer is calculated as follows:
 
 .. math::
 
@@ -118,7 +113,7 @@ fields can be overridden via runtime settings.
 
   name: envoy.filters.http.adaptive_concurrency
   typed_config:
-    "@type": type.googleapis.com/envoy.config.filter.http.adaptive_concurrency.v2alpha.AdaptiveConcurrency
+    "@type": type.googleapis.com/envoy.extensions.filters.http.adaptive_concurrency.v3.AdaptiveConcurrency
     gradient_controller_config:
       sample_aggregate_percentile:
         value: 90
@@ -156,8 +151,8 @@ The adaptive concurrency filter supports the following runtime settings:
 
 adaptive_concurrency.enabled
     Overrides whether the adaptive concurrency filter will use the concurrency controller for
-    forwarding decisions. If set to `false`, the filter will be a no-op. Defaults to what is
-    specified for `enabled` in the filter configuration.
+    forwarding decisions. If set to ``false``, the filter will be a no-op. Defaults to what is
+    specified for ``enabled`` in the filter configuration.
 
 adaptive_concurrency.gradient_controller.min_rtt_calc_interval_ms
     Overrides the interval in which the ideal round-trip time (minRTT) will be recalculated.
@@ -166,7 +161,7 @@ adaptive_concurrency.gradient_controller.min_rtt_aggregate_request_count
     Overrides the number of requests sampled for calculation of the minRTT.
 
 adaptive_concurrency.gradient_controller.jitter
-    Overrides the random delay introduced to the minRTT calculation start time. A value of `10`
+    Overrides the random delay introduced to the minRTT calculation start time. A value of ``10``
     indicates a random delay of 10% of the configured interval. The runtime value specified is
     clamped to the range [0,100].
 
@@ -181,7 +176,7 @@ adaptive_concurrency.gradient_controller.min_rtt_buffer
 
 adaptive_concurrency.gradient_controller.sample_aggregate_percentile
     Overrides the percentile value used to represent the collection of latency samples in
-    calculations. A value of `95` indicates the 95th percentile. The runtime value specified is
+    calculations. A value of ``95`` indicates the 95th percentile. The runtime value specified is
     clamped to the range [0,100].
 
 adaptive_concurrency.gradient_controller.min_concurrency
@@ -191,7 +186,7 @@ Statistics
 ----------
 The adaptive concurrency filter outputs statistics in the
 *http.<stat_prefix>.adaptive_concurrency.* namespace. The :ref:`stat prefix
-<envoy_api_field_config.filter.network.http_connection_manager.v2.HttpConnectionManager.stat_prefix>`
+<envoy_v3_api_field_extensions.filters.network.http_connection_manager.v3.HttpConnectionManager.stat_prefix>`
 comes from the owning HTTP connection manager. Statistics are specific to the concurrency
 controllers.
 

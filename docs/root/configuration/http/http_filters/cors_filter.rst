@@ -8,20 +8,30 @@ For the meaning of the headers please refer to the pages below.
 
 * https://developer.mozilla.org/en-US/docs/Web/HTTP/Access_control_CORS
 * https://www.w3.org/TR/cors/
-* :ref:`v2 API reference <envoy_api_msg_route.CorsPolicy>`
-* This filter should be configured with the name *envoy.filters.http.cors*.
+* This filter should be configured with the type URL ``type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors``.
+* :ref:`v3 API reference <envoy_v3_api_msg_extensions.filters.http.cors.v3.CorsPolicy>`
+
+
+.. note::
+  This filter will be used to respond to preflight ``OPTIONS`` requests. Any legal ``OPTIONS`` requests will be
+  responded directly by the filter and will not be passed to the next filter in the filter chain. Other requests
+  will not be responded directly but if they are accepted cors requests, the filter will add the related headers
+  to the response.
+
+  In addition, this filter will be bypassed if a direct response or route redirect is configured for the route.
+
 
 .. _cors-runtime:
 
 Runtime
 -------
 The fraction of requests for which the filter is enabled can be configured via the :ref:`runtime_key
-<envoy_api_field_core.RuntimeFractionalPercent.runtime_key>` value of the :ref:`filter_enabled
-<envoy_api_field_route.CorsPolicy.filter_enabled>` field.
+<envoy_v3_api_field_config.core.v3.RuntimeFractionalPercent.runtime_key>` value of the :ref:`filter_enabled
+<envoy_v3_api_field_config.route.v3.CorsPolicy.filter_enabled>` field.
 
 The fraction of requests for which the filter is enabled in shadow-only mode can be configured via
-the :ref:`runtime_key <envoy_api_field_core.RuntimeFractionalPercent.runtime_key>` value of the
-:ref:`shadow_enabled <envoy_api_field_route.CorsPolicy.shadow_enabled>` field. When enabled in
+the :ref:`runtime_key <envoy_v3_api_field_config.core.v3.RuntimeFractionalPercent.runtime_key>` value of the
+:ref:`shadow_enabled <envoy_v3_api_field_config.route.v3.CorsPolicy.shadow_enabled>` field. When enabled in
 shadow-only mode, the filter will evaluate the request's *Origin* to determine if it's valid but
 will not enforce any policies.
 

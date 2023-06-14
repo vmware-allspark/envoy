@@ -1,8 +1,8 @@
 #pragma once
 
-#include "common/event/dispatcher_impl.h"
-#include "common/network/address_impl.h"
-#include "common/network/utility.h"
+#include "source/common/event/dispatcher_impl.h"
+#include "source/common/network/address_impl.h"
+#include "source/common/network/utility.h"
 
 #include "test/test_common/network_utility.h"
 #include "test/test_common/simulated_time_system.h"
@@ -20,8 +20,8 @@ protected:
   ListenerImplTestBase()
       : version_(GetParam()),
         alt_address_(Network::Test::findOrCheckFreePort(
-            Network::Test::getCanonicalLoopbackAddress(version_), Address::SocketType::Stream)),
-        api_(Api::createApiForTest()), dispatcher_(api_->allocateDispatcher()) {}
+            Network::Test::getCanonicalLoopbackAddress(version_), Socket::Type::Stream)),
+        api_(Api::createApiForTest()), dispatcher_(api_->allocateDispatcher("test_thread")) {}
 
   Event::DispatcherImpl& dispatcherImpl() {
     // We need access to the concrete impl type in order to instantiate a

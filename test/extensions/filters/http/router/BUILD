@@ -1,5 +1,3 @@
-licenses(["notice"])  # Apache 2
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_package",
@@ -9,15 +7,17 @@ load(
     "envoy_extension_cc_test",
 )
 
+licenses(["notice"])  # Apache 2
+
 envoy_package()
 
 envoy_extension_cc_test(
     name = "config_test",
     srcs = ["config_test.cc"],
-    extension_name = "envoy.filters.http.router",
+    extension_names = ["envoy.filters.http.router"],
     deps = [
         "//source/extensions/filters/http/router:config",
-        "//test/mocks/server:server_mocks",
+        "//test/mocks/server:factory_context_mocks",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/extensions/filters/http/router/v3:pkg_cc_proto",
     ],
@@ -25,11 +25,12 @@ envoy_extension_cc_test(
 
 envoy_extension_cc_test(
     name = "auto_sni_integration_test",
+    size = "large",
     srcs = ["auto_sni_integration_test.cc"],
     data = [
         "//test/config/integration/certs",
     ],
-    extension_name = "envoy.filters.http.router",
+    extension_names = ["envoy.filters.http.router"],
     deps = [
         "//source/extensions/filters/http/router:config",
         "//test/integration:http_integration_lib",

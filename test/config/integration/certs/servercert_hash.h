@@ -1,3 +1,3 @@
 // NOLINT(namespace-envoy)
-constexpr char TEST_SERVER_CERT_HASH[] = "D3:F5:97:8F:8F:7E:CA:63:C3:FF:61:89:95:D7:47:31:E3:BA:9B:"
-                                         "3C:44:10:A1:57:61:B7:9F:4D:65:90:F8:7F";
+constexpr char TEST_SERVER_CERT_HASH[] = "DC:E2:2B:65:90:43:9A:36:1C:8E:6D:CA:42:8A:8C:37:C7:A1:77:"
+                                         "00:5B:C1:3E:33:8A:B9:2D:04:2C:B1:3F:0A";

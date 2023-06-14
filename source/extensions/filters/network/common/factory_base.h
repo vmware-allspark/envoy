@@ -1,7 +1,10 @@
 #pragma once
 
 #include "envoy/server/filter_config.h"
+#include "envoy/server/transport_socket_config.h"
 #include "envoy/upstream/upstream.h"
+
+#include "source/common/common/utility.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -31,29 +34,41 @@ public:
     return std::make_unique<ProtocolOptionsProto>();
   }
 
-  Upstream::ProtocolOptionsConfigConstSharedPtr
-  createProtocolOptionsConfig(const Protobuf::Message& proto_config,
-                              ProtobufMessage::ValidationVisitor& validation_visitor) override {
+  Upstream::ProtocolOptionsConfigConstSharedPtr createProtocolOptionsConfig(
+      const Protobuf::Message& proto_config,
+      Server::Configuration::ProtocolOptionsFactoryContext& factory_context) override {
     return createProtocolOptionsTyped(MessageUtil::downcastAndValidate<const ProtocolOptionsProto&>(
-        proto_config, validation_visitor));
+                                          proto_config, factory_context.messageValidationVisitor()),
+                                      factory_context);
   }
 
   std::string name() const override { return name_; }
 
-  bool isTerminalFilter() override { return is_terminal_filter_; }
+  bool isTerminalFilterByProto(const Protobuf::Message& proto_config,
+                               Server::Configuration::ServerFactoryContext& context) override {
+    return isTerminalFilterByProtoTyped(MessageUtil::downcastAndValidate<const ConfigProto&>(
+                                            proto_config, context.messageValidationVisitor()),
+                                        context);
+  }
 
 protected:
   FactoryBase(const std::string& name, bool is_terminal = false)
       : name_(name), is_terminal_filter_(is_terminal) {}
 
 private:
+  virtual bool isTerminalFilterByProtoTyped(const ConfigProto&,
+                                            Server::Configuration::ServerFactoryContext&) {
+    return is_terminal_filter_;
+  }
   virtual Network::FilterFactoryCb
   createFilterFactoryFromProtoTyped(const ConfigProto& proto_config,
                                     Server::Configuration::FactoryContext& context) PURE;
 
   virtual Upstream::ProtocolOptionsConfigConstSharedPtr
-  createProtocolOptionsTyped(const ProtocolOptionsProto&) {
-    throw EnvoyException(fmt::format("filter {} does not support protocol options", name_));
+  createProtocolOptionsTyped(const ProtocolOptionsProto&,
+                             Server::Configuration::ProtocolOptionsFactoryContext&) {
+    ExceptionUtil::throwEnvoyException(
+        fmt::format("filter {} does not support protocol options", name_));
   }
 
   const std::string name_;
