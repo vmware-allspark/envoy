@@ -1,9 +1,9 @@
-#include "extensions/filters/network/sni_cluster/sni_cluster.h"
+#include "source/extensions/filters/network/sni_cluster/sni_cluster.h"
 
 #include "envoy/network/connection.h"
 
-#include "common/common/assert.h"
-#include "common/tcp_proxy/tcp_proxy.h"
+#include "source/common/common/assert.h"
+#include "source/common/tcp_proxy/tcp_proxy.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -21,8 +21,7 @@ Network::FilterStatus SniClusterFilter::onNewConnection() {
     read_callbacks_->connection().streamInfo().filterState()->setData(
         TcpProxy::PerConnectionCluster::key(),
         std::make_unique<TcpProxy::PerConnectionCluster>(sni),
-        StreamInfo::FilterState::StateType::Mutable,
-        StreamInfo::FilterState::LifeSpan::DownstreamConnection);
+        StreamInfo::FilterState::StateType::Mutable, StreamInfo::FilterState::LifeSpan::Connection);
   }
 
   return Network::FilterStatus::Continue;

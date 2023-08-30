@@ -1,45 +1,97 @@
-#include "common/config/new_grpc_mux_impl.h"
+#include "source/common/config/new_grpc_mux_impl.h"
 
 #include "envoy/service/discovery/v3/discovery.pb.h"
 
-#include "common/common/assert.h"
-#include "common/common/backoff_strategy.h"
-#include "common/common/token_bucket_impl.h"
-#include "common/config/utility.h"
-#include "common/config/version_converter.h"
-#include "common/memory/utils.h"
-#include "common/protobuf/protobuf.h"
-#include "common/protobuf/utility.h"
+#include "source/common/common/assert.h"
+#include "source/common/common/backoff_strategy.h"
+#include "source/common/common/token_bucket_impl.h"
+#include "source/common/config/utility.h"
+#include "source/common/config/xds_context_params.h"
+#include "source/common/config/xds_resource.h"
+#include "source/common/memory/utils.h"
+#include "source/common/protobuf/protobuf.h"
+#include "source/common/protobuf/utility.h"
 
 namespace Envoy {
 namespace Config {
 
+namespace {
+class AllMuxesState {
+public:
+  void insert(NewGrpcMuxImpl* mux) { muxes_.insert(mux); }
+
+  void erase(NewGrpcMuxImpl* mux) { muxes_.erase(mux); }
+
+  void shutdownAll() {
+    for (auto& mux : muxes_) {
+      mux->shutdown();
+    }
+  }
+
+private:
+  absl::flat_hash_set<NewGrpcMuxImpl*> muxes_;
+};
+using AllMuxes = ThreadSafeSingleton<AllMuxesState>;
+} // namespace
+
 NewGrpcMuxImpl::NewGrpcMuxImpl(Grpc::RawAsyncClientPtr&& async_client,
                                Event::Dispatcher& dispatcher,
                                const Protobuf::MethodDescriptor& service_method,
-                               envoy::config::core::v3::ApiVersion transport_api_version,
-                               Runtime::RandomGenerator& random, Stats::Scope& scope,
+                               Random::RandomGenerator& random, Stats::Scope& scope,
                                const RateLimitSettings& rate_limit_settings,
-                               const LocalInfo::LocalInfo& local_info)
+                               const LocalInfo::LocalInfo& local_info,
+                               CustomConfigValidatorsPtr&& config_validators,
+                               JitteredExponentialBackOffStrategyPtr backoff_strategy,
+                               XdsConfigTrackerOptRef xds_config_tracker)
     : grpc_stream_(this, std::move(async_client), service_method, random, dispatcher, scope,
-                   rate_limit_settings),
-      local_info_(local_info), transport_api_version_(transport_api_version) {}
+                   std::move(backoff_strategy), rate_limit_settings),
+      local_info_(local_info), config_validators_(std::move(config_validators)),
+      dynamic_update_callback_handle_(local_info.contextProvider().addDynamicContextUpdateCallback(
+          [this](absl::string_view resource_type_url) {
+            onDynamicContextUpdate(resource_type_url);
+          })),
+      dispatcher_(dispatcher), xds_config_tracker_(xds_config_tracker) {
+  AllMuxes::get().insert(this);
+}
 
-void NewGrpcMuxImpl::pause(const std::string& type_url) { pausable_ack_queue_.pause(type_url); }
+NewGrpcMuxImpl::~NewGrpcMuxImpl() { AllMuxes::get().erase(this); }
 
-void NewGrpcMuxImpl::resume(const std::string& type_url) {
-  pausable_ack_queue_.resume(type_url);
+void NewGrpcMuxImpl::shutdownAll() { AllMuxes::get().shutdownAll(); }
+
+void NewGrpcMuxImpl::onDynamicContextUpdate(absl::string_view resource_type_url) {
+  auto sub = subscriptions_.find(resource_type_url);
+  if (sub == subscriptions_.end()) {
+    return;
+  }
+  sub->second->sub_state_.setMustSendDiscoveryRequest();
   trySendDiscoveryRequests();
 }
 
-bool NewGrpcMuxImpl::paused(const std::string& type_url) const {
-  return pausable_ack_queue_.paused(type_url);
+ScopedResume NewGrpcMuxImpl::pause(const std::string& type_url) {
+  return pause(std::vector<std::string>{type_url});
+}
+
+ScopedResume NewGrpcMuxImpl::pause(const std::vector<std::string> type_urls) {
+  for (const auto& type_url : type_urls) {
+    pausable_ack_queue_.pause(type_url);
+  }
+
+  return std::make_unique<Cleanup>([this, type_urls]() {
+    for (const auto& type_url : type_urls) {
+      pausable_ack_queue_.resume(type_url);
+      if (!pausable_ack_queue_.paused(type_url)) {
+        trySendDiscoveryRequests();
+      }
+    }
+  });
 }
 
 void NewGrpcMuxImpl::onDiscoveryResponse(
-    std::unique_ptr<envoy::service::discovery::v3::DeltaDiscoveryResponse>&& message) {
+    std::unique_ptr<envoy::service::discovery::v3::DeltaDiscoveryResponse>&& message,
+    ControlPlaneStats& control_plane_stats) {
   ENVOY_LOG(debug, "Received DeltaDiscoveryResponse for {} at version {}", message->type_url(),
             message->system_version_info());
+
   auto sub = subscriptions_.find(message->type_url());
   if (sub == subscriptions_.end()) {
     ENVOY_LOG(warn,
@@ -49,24 +101,33 @@ void NewGrpcMuxImpl::onDiscoveryResponse(
     return;
   }
 
-  // When an on-demand request is made a Watch is created using an alias, as the resource name isn't
-  // known at that point. When an update containing aliases comes back, we update Watches with
-  // resource names.
-  for (const auto& r : message->resources()) {
-    if (r.aliases_size() > 0) {
-      AddedRemoved converted = sub->second->watch_map_.convertAliasWatchesToNameWatches(r);
-      sub->second->sub_state_.updateSubscriptionInterest(converted.added_, converted.removed_);
+  if (message->has_control_plane()) {
+    control_plane_stats.identifier_.set(message->control_plane().identifier());
+
+    if (message->control_plane().identifier() != sub->second->control_plane_identifier_) {
+      sub->second->control_plane_identifier_ = message->control_plane().identifier();
+      ENVOY_LOG(debug, "Receiving gRPC updates for {} from {}", message->type_url(),
+                sub->second->control_plane_identifier_);
     }
   }
 
-  kickOffAck(sub->second->sub_state_.handleResponse(*message));
+  auto ack = sub->second->sub_state_.handleResponse(*message);
+
+  // Processing point to record error if there is any failure after the response is processed.
+  if (xds_config_tracker_.has_value() &&
+      ack.error_detail_.code() != Grpc::Status::WellKnownGrpcStatus::Ok) {
+    xds_config_tracker_->onConfigRejected(*message, ack.error_detail_.message());
+  }
+  kickOffAck(ack);
   Memory::Utils::tryShrinkHeap();
 }
 
 void NewGrpcMuxImpl::onStreamEstablished() {
-  for (auto& sub : subscriptions_) {
-    sub.second->sub_state_.markStreamFresh();
+  for (auto& [type_url, subscription] : subscriptions_) {
+    UNREFERENCED_PARAMETER(type_url);
+    subscription->sub_state_.markStreamFresh();
   }
+  pausable_ack_queue_.clear();
   trySendDiscoveryRequests();
 }
 
@@ -79,8 +140,8 @@ void NewGrpcMuxImpl::onEstablishmentFailure() {
   absl::flat_hash_map<std::string, DeltaSubscriptionState*> all_subscribed;
   absl::flat_hash_map<std::string, DeltaSubscriptionState*> already_called;
   do {
-    for (auto& sub : subscriptions_) {
-      all_subscribed[sub.first] = &sub.second->sub_state_;
+    for (auto& [type_url, subscription] : subscriptions_) {
+      all_subscribed[type_url] = &subscription->sub_state_;
     }
     for (auto& sub : all_subscribed) {
       if (already_called.insert(sub).second) { // insert succeeded ==> not already called
@@ -101,32 +162,71 @@ void NewGrpcMuxImpl::kickOffAck(UpdateAck ack) {
 void NewGrpcMuxImpl::start() { grpc_stream_.establishNewStream(); }
 
 GrpcMuxWatchPtr NewGrpcMuxImpl::addWatch(const std::string& type_url,
-                                         const std::set<std::string>& resources,
-                                         SubscriptionCallbacks& callbacks) {
+                                         const absl::flat_hash_set<std::string>& resources,
+                                         SubscriptionCallbacks& callbacks,
+                                         OpaqueResourceDecoderSharedPtr resource_decoder,
+                                         const SubscriptionOptions& options) {
   auto entry = subscriptions_.find(type_url);
   if (entry == subscriptions_.end()) {
     // We don't yet have a subscription for type_url! Make one!
-    addSubscription(type_url);
-    return addWatch(type_url, resources, callbacks);
+    addSubscription(type_url, options.use_namespace_matching_);
+    return addWatch(type_url, resources, callbacks, resource_decoder, options);
   }
 
-  Watch* watch = entry->second->watch_map_.addWatch(callbacks);
+  Watch* watch = entry->second->watch_map_.addWatch(callbacks, *resource_decoder);
   // updateWatch() queues a discovery request if any of 'resources' are not yet subscribed.
-  updateWatch(type_url, watch, resources);
-  return std::make_unique<WatchImpl>(type_url, watch, *this);
+  updateWatch(type_url, watch, resources, options);
+  return std::make_unique<WatchImpl>(type_url, watch, *this, options);
 }
 
 // Updates the list of resource names watched by the given watch. If an added name is new across
 // the whole subscription, or if a removed name has no other watch interested in it, then the
 // subscription will enqueue and attempt to send an appropriate discovery request.
 void NewGrpcMuxImpl::updateWatch(const std::string& type_url, Watch* watch,
-                                 const std::set<std::string>& resources) {
+                                 const absl::flat_hash_set<std::string>& resources,
+                                 const SubscriptionOptions& options) {
   ASSERT(watch != nullptr);
   auto sub = subscriptions_.find(type_url);
   RELEASE_ASSERT(sub != subscriptions_.end(),
                  fmt::format("Watch of {} has no subscription to update.", type_url));
-  auto added_removed = sub->second->watch_map_.updateWatchInterest(watch, resources);
-  sub->second->sub_state_.updateSubscriptionInterest(added_removed.added_, added_removed.removed_);
+  // We need to prepare xdstp:// resources for the transport, by normalizing and adding any extra
+  // context parameters.
+  absl::flat_hash_set<std::string> effective_resources;
+  for (const auto& resource : resources) {
+    if (XdsResourceIdentifier::hasXdsTpScheme(resource)) {
+      auto xdstp_resource = XdsResourceIdentifier::decodeUrn(resource);
+      if (options.add_xdstp_node_context_params_) {
+        const auto context = XdsContextParams::encodeResource(
+            local_info_.contextProvider().nodeContext(), xdstp_resource.context(), {}, {});
+        xdstp_resource.mutable_context()->CopyFrom(context);
+      }
+      XdsResourceIdentifier::EncodeOptions encode_options;
+      encode_options.sort_context_params_ = true;
+      effective_resources.insert(XdsResourceIdentifier::encodeUrn(xdstp_resource, encode_options));
+    } else {
+      effective_resources.insert(resource);
+    }
+  }
+  auto added_removed = sub->second->watch_map_.updateWatchInterest(watch, effective_resources);
+  if (options.use_namespace_matching_) {
+    // This is to prevent sending out of requests that contain prefixes instead of resource names
+    sub->second->sub_state_.updateSubscriptionInterest({}, {});
+  } else {
+    sub->second->sub_state_.updateSubscriptionInterest(added_removed.added_,
+                                                       added_removed.removed_);
+  }
+  // Tell the server about our change in interest, if any.
+  if (sub->second->sub_state_.subscriptionUpdatePending()) {
+    trySendDiscoveryRequests();
+  }
+}
+
+void NewGrpcMuxImpl::requestOnDemandUpdate(const std::string& type_url,
+                                           const absl::flat_hash_set<std::string>& for_update) {
+  auto sub = subscriptions_.find(type_url);
+  RELEASE_ASSERT(sub != subscriptions_.end(),
+                 fmt::format("Watch of {} has no subscription to update.", type_url));
+  sub->second->sub_state_.updateSubscriptionInterest(for_update, {});
   // Tell the server about our change in interest, if any.
   if (sub->second->sub_state_.subscriptionUpdatePending()) {
     trySendDiscoveryRequests();
@@ -134,19 +234,26 @@ void NewGrpcMuxImpl::updateWatch(const std::string& type_url, Watch* watch,
 }
 
 void NewGrpcMuxImpl::removeWatch(const std::string& type_url, Watch* watch) {
-  updateWatch(type_url, watch, {});
+  updateWatch(type_url, watch, {}, {});
   auto entry = subscriptions_.find(type_url);
   ASSERT(entry != subscriptions_.end(),
          fmt::format("removeWatch() called for non-existent subscription {}.", type_url));
   entry->second->watch_map_.removeWatch(watch);
 }
 
-void NewGrpcMuxImpl::addSubscription(const std::string& type_url) {
-  subscriptions_.emplace(type_url, std::make_unique<SubscriptionStuff>(type_url, local_info_));
+void NewGrpcMuxImpl::addSubscription(const std::string& type_url,
+                                     const bool use_namespace_matching) {
+  subscriptions_.emplace(type_url, std::make_unique<SubscriptionStuff>(
+                                       type_url, local_info_, use_namespace_matching, dispatcher_,
+                                       *config_validators_.get(), xds_config_tracker_));
   subscription_ordering_.emplace_back(type_url);
 }
 
 void NewGrpcMuxImpl::trySendDiscoveryRequests() {
+  if (shutdown_) {
+    return;
+  }
+
   while (true) {
     // Do any of our subscriptions even want to send a request?
     absl::optional<std::string> maybe_request_type = whoWantsToSendDiscoveryRequest();
@@ -174,7 +281,6 @@ void NewGrpcMuxImpl::trySendDiscoveryRequests() {
     } else {
       request = sub->second->sub_state_.getNextRequestAckless();
     }
-    VersionConverter::prepareMessageForGrpcWire(request, transport_api_version_);
     grpc_stream_.sendMessage(request);
   }
   grpc_stream_.maybeUpdateQueueSizeStat(pausable_ack_queue_.size());

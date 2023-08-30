@@ -1,8 +1,8 @@
-#include "common/config/pausable_ack_queue.h"
+#include "source/common/config/pausable_ack_queue.h"
 
 #include <list>
 
-#include "common/common/assert.h"
+#include "source/common/common/assert.h"
 
 namespace Envoy {
 namespace Config {
@@ -13,54 +13,54 @@ size_t PausableAckQueue::size() const { return storage_.size(); }
 
 bool PausableAckQueue::empty() {
   for (const auto& entry : storage_) {
-    if (!paused_[entry.type_url_]) {
+    if (pauses_[entry.type_url_] == 0) {
       return false;
     }
   }
   return true;
 }
 
+// In the event of a reconnection, clear all the cached nonces.
+void PausableAckQueue::clear() { storage_.clear(); }
+
 const UpdateAck& PausableAckQueue::front() {
   for (const auto& entry : storage_) {
-    if (!paused_[entry.type_url_]) {
+    if (pauses_[entry.type_url_] == 0) {
       return entry;
     }
   }
-  RELEASE_ASSERT(false, "front() on an empty queue is undefined behavior!");
-  NOT_REACHED_GCOVR_EXCL_LINE;
+  PANIC("front() on an empty queue is undefined behavior!");
 }
 
 UpdateAck PausableAckQueue::popFront() {
   for (auto it = storage_.begin(); it != storage_.end(); ++it) {
-    if (!paused_[it->type_url_]) {
+    if (pauses_[it->type_url_] == 0) {
       UpdateAck ret = *it;
       storage_.erase(it);
       return ret;
     }
   }
-  RELEASE_ASSERT(false, "popFront() on an empty queue is undefined behavior!");
-  NOT_REACHED_GCOVR_EXCL_LINE;
+  PANIC("popFront() on an empty queue is undefined behavior!");
 }
 
 void PausableAckQueue::pause(const std::string& type_url) {
   // It's ok to pause a subscription that doesn't exist yet.
-  auto& pause_entry = paused_[type_url];
-  ASSERT(!pause_entry);
-  pause_entry = true;
+  auto& pause_entry = pauses_[type_url];
+  ++pause_entry;
 }
 
 void PausableAckQueue::resume(const std::string& type_url) {
-  auto& pause_entry = paused_[type_url];
-  ASSERT(pause_entry);
-  pause_entry = false;
+  auto& pause_entry = pauses_[type_url];
+  ASSERT(pause_entry > 0);
+  --pause_entry;
 }
 
 bool PausableAckQueue::paused(const std::string& type_url) const {
-  auto entry = paused_.find(type_url);
-  if (entry == paused_.end()) {
+  auto entry = pauses_.find(type_url);
+  if (entry == pauses_.end()) {
     return false;
   }
-  return entry->second;
+  return entry->second > 0;
 }
 
 } // namespace Config

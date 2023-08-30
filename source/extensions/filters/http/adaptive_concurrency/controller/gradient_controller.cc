@@ -1,18 +1,18 @@
-#include "extensions/filters/http/adaptive_concurrency/controller/gradient_controller.h"
+#include "source/extensions/filters/http/adaptive_concurrency/controller/gradient_controller.h"
 
 #include <atomic>
 #include <chrono>
 
+#include "envoy/common/random_generator.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/extensions/filters/http/adaptive_concurrency/v3/adaptive_concurrency.pb.h"
 #include "envoy/runtime/runtime.h"
 #include "envoy/stats/stats.h"
 
-#include "common/common/cleanup.h"
-#include "common/protobuf/protobuf.h"
-#include "common/protobuf/utility.h"
-
-#include "extensions/filters/http/adaptive_concurrency/controller/controller.h"
+#include "source/common/common/cleanup.h"
+#include "source/common/protobuf/protobuf.h"
+#include "source/common/protobuf/utility.h"
+#include "source/extensions/filters/http/adaptive_concurrency/controller/controller.h"
 
 #include "absl/synchronization/mutex.h"
 
@@ -46,10 +46,11 @@ GradientControllerConfig::GradientControllerConfig(
 GradientController::GradientController(GradientControllerConfig config,
                                        Event::Dispatcher& dispatcher, Runtime::Loader&,
                                        const std::string& stats_prefix, Stats::Scope& scope,
-                                       Runtime::RandomGenerator& random)
+                                       Random::RandomGenerator& random, TimeSource& time_source)
     : config_(std::move(config)), dispatcher_(dispatcher), scope_(scope),
-      stats_(generateStats(scope_, stats_prefix)), random_(random), deferred_limit_value_(0),
-      num_rq_outstanding_(0), concurrency_limit_(config_.minConcurrency()),
+      stats_(generateStats(scope_, stats_prefix)), random_(random), time_source_(time_source),
+      deferred_limit_value_(0), num_rq_outstanding_(0),
+      concurrency_limit_(config_.minConcurrency()),
       latency_sample_hist_(hist_fast_alloc(), hist_free) {
   min_rtt_calc_timer_ = dispatcher_.createTimer([this]() -> void { enterMinRTTSamplingWindow(); });
 
@@ -102,20 +103,24 @@ void GradientController::enterMinRTTSamplingWindow() {
   // Throw away any latency samples from before the recalculation window as it may not represent
   // the minRTT.
   hist_clear(latency_sample_hist_.get());
+
+  min_rtt_epoch_ = time_source_.monotonicTime();
 }
 
 void GradientController::updateMinRTT() {
-  ASSERT(inMinRTTSamplingWindow());
-
-  {
-    absl::MutexLock ml(&sample_mutation_mtx_);
-    min_rtt_ = processLatencySamplesAndClear();
-    stats_.min_rtt_msecs_.set(
-        std::chrono::duration_cast<std::chrono::milliseconds>(min_rtt_).count());
-    updateConcurrencyLimit(deferred_limit_value_.load());
-    deferred_limit_value_.store(0);
-    stats_.min_rtt_calculation_active_.set(0);
+  // Only update minRTT when it is in minRTT sampling window and
+  // number of samples is greater than or equal to the minRTTAggregateRequestCount.
+  if (!inMinRTTSamplingWindow() ||
+      hist_sample_count(latency_sample_hist_.get()) < config_.minRTTAggregateRequestCount()) {
+    return;
   }
+
+  min_rtt_ = processLatencySamplesAndClear();
+  stats_.min_rtt_msecs_.set(
+      std::chrono::duration_cast<std::chrono::milliseconds>(min_rtt_).count());
+  updateConcurrencyLimit(deferred_limit_value_.load());
+  deferred_limit_value_.store(0);
+  stats_.min_rtt_calculation_active_.set(0);
 
   min_rtt_calc_timer_->enableTimer(
       applyJitter(config_.minRTTCalcInterval(), config_.jitterPercent()));
@@ -128,7 +133,7 @@ std::chrono::milliseconds GradientController::applyJitter(std::chrono::milliseco
     return interval;
   }
 
-  const uint32_t jitter_range_ms = interval.count() * jitter_pct;
+  const uint32_t jitter_range_ms = std::ceil(interval.count() * jitter_pct);
   return std::chrono::milliseconds(interval.count() + (random_.random() % jitter_range_ms));
 }
 
@@ -192,22 +197,22 @@ RequestForwardingAction GradientController::forwardingDecision() {
   return RequestForwardingAction::Block;
 }
 
-void GradientController::recordLatencySample(std::chrono::nanoseconds rq_latency) {
-  const uint32_t latency_usec =
-      std::chrono::duration_cast<std::chrono::microseconds>(rq_latency).count();
+void GradientController::recordLatencySample(MonotonicTime rq_send_time) {
   ASSERT(num_rq_outstanding_.load() > 0);
   --num_rq_outstanding_;
 
-  uint32_t sample_count;
-  {
-    absl::MutexLock ml(&sample_mutation_mtx_);
-    hist_insert(latency_sample_hist_.get(), latency_usec, 1);
-    sample_count = hist_sample_count(latency_sample_hist_.get());
+  if (rq_send_time < min_rtt_epoch_) {
+    // Disregard samples from requests started in the previous minRTT window.
+    return;
   }
 
-  if (inMinRTTSamplingWindow() && sample_count >= config_.minRTTAggregateRequestCount()) {
-    // This sample has pushed the request count over the request count requirement for the minRTT
-    // recalculation. It must now be finished.
+  const std::chrono::microseconds rq_latency =
+      std::chrono::duration_cast<std::chrono::microseconds>(time_source_.monotonicTime() -
+                                                            rq_send_time);
+  synchronizer_.syncPoint("pre_hist_insert");
+  {
+    absl::MutexLock ml(&sample_mutation_mtx_);
+    hist_insert(latency_sample_hist_.get(), rq_latency.count(), 1);
     updateMinRTT();
   }
 }

@@ -3,9 +3,9 @@ module github.com/envoyproxy/envoy/examples/load-reporting-service
 go 1.13
 
 require (
-	github.com/envoyproxy/go-control-plane v0.9.0
-	github.com/golang/protobuf v1.3.2
-	golang.org/x/net v0.0.0-20200226121028-0de0cce0169b // indirect
-	golang.org/x/sys v0.0.0-20190412213103-97732733099d // indirect
-	google.golang.org/grpc v1.25.1
+	github.com/cncf/xds/go v0.0.0-20230112175826-46e39c7b9b43 // indirect
+	github.com/envoyproxy/go-control-plane v0.11.0
+	github.com/golang/protobuf v1.5.3
+	google.golang.org/genproto v0.0.0-20230306155012-7f2fa6fef1f4 // indirect
+	google.golang.org/grpc v1.54.0
 )

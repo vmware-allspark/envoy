@@ -4,10 +4,12 @@
 #include "envoy/extensions/filters/network/local_ratelimit/v3/local_rate_limit.pb.h"
 #include "envoy/network/filter.h"
 #include "envoy/runtime/runtime.h"
+#include "envoy/singleton/manager.h"
 #include "envoy/stats/stats_macros.h"
 
-#include "common/common/thread_synchronizer.h"
-#include "common/runtime/runtime_protos.h"
+#include "source/common/common/thread_synchronizer.h"
+#include "source/common/runtime/runtime_protos.h"
+#include "source/extensions/filters/common/local_ratelimit/local_ratelimit_impl.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -26,6 +28,41 @@ struct LocalRateLimitStats {
   ALL_LOCAL_RATE_LIMIT_STATS(GENERATE_COUNTER_STRUCT)
 };
 
+using LocalRateLimiterImplSharedPtr =
+    std::shared_ptr<Filters::Common::LocalRateLimit::LocalRateLimiterImpl>;
+
+class SharedRateLimitSingleton : public Singleton::Instance, Logger::Loggable<Logger::Id::filter> {
+public:
+  ~SharedRateLimitSingleton() override;
+
+  class Key : public std::pair<std::string, envoy::type::v3::TokenBucket> {
+  public:
+    using std::pair<std::string, envoy::type::v3::TokenBucket>::pair;
+
+    // Add absl::Hash support.
+    template <typename H>
+    friend H AbslHashValue(H h, const Key& key) { // NOLINT(readability-identifier-naming)
+      return H::combine(std::move(h), key.first, MessageUtil::hash(key.second));
+    }
+
+    bool operator==(const Key& that) const {
+      return (this->first == that.first) &&
+             Protobuf::util::MessageDifferencer::Equivalent(this->second, that.second);
+    }
+  };
+
+  std::pair<LocalRateLimiterImplSharedPtr, const Key*>
+  get(const envoy::extensions::filters::network::local_ratelimit::v3::LocalRateLimit& proto_config,
+      std::function<LocalRateLimiterImplSharedPtr()> create_fn);
+
+  void removeIfUnused(const Key* key);
+
+private:
+  // Use node_hash_map so that a stable pointer to Key can be returned.
+  absl::node_hash_map<Key, std::weak_ptr<Filters::Common::LocalRateLimit::LocalRateLimiterImpl>>
+      limiters_;
+};
+
 /**
  * Configuration shared across all connections. Must be thread safe.
  */
@@ -33,7 +70,10 @@ class Config : Logger::Loggable<Logger::Id::filter> {
 public:
   Config(
       const envoy::extensions::filters::network::local_ratelimit::v3::LocalRateLimit& proto_config,
-      Event::Dispatcher& dispatcher, Stats::Scope& scope, Runtime::Loader& runtime);
+      Event::Dispatcher& dispatcher, Stats::Scope& scope, Runtime::Loader& runtime,
+      Singleton::Manager& singleton_manager);
+
+  ~Config();
 
   bool canCreateConnection();
   bool enabled() { return enabled_.enabled(); }
@@ -41,19 +81,12 @@ public:
 
 private:
   static LocalRateLimitStats generateStats(const std::string& prefix, Stats::Scope& scope);
-  void onFillTimer();
 
-  // TODO(mattklein123): Determine if/how to merge this with token_bucket_impl.h/cc. This
-  // implementation is geared towards multi-threading as well assumes a high call rate (which is
-  // why a fixed periodic refresh timer is used).
-  const Event::TimerPtr fill_timer_;
-  const uint32_t max_tokens_;
-  const uint32_t tokens_per_fill_;
-  const std::chrono::milliseconds fill_interval_;
+  LocalRateLimiterImplSharedPtr rate_limiter_;
   Runtime::FeatureFlag enabled_;
   LocalRateLimitStats stats_;
-  std::atomic<uint32_t> tokens_;
-  Thread::ThreadSynchronizer synchronizer_; // Used for testing only.
+  const SharedRateLimitSingleton::Key* shared_bucket_key_{};
+  std::shared_ptr<SharedRateLimitSingleton> shared_bucket_registry_;
 
   friend class LocalRateLimitTestBase;
 };

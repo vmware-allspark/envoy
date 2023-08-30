@@ -5,19 +5,18 @@
 #include "envoy/extensions/transport_sockets/tls/v3/cert.pb.h"
 #include "envoy/stats/scope.h"
 
-#include "common/event/dispatcher_impl.h"
-#include "common/network/connection_impl.h"
-#include "common/network/utility.h"
-
-#include "extensions/transport_sockets/tls/context_config_impl.h"
-#include "extensions/transport_sockets/tls/context_manager_impl.h"
+#include "source/common/common/thread.h"
+#include "source/common/event/dispatcher_impl.h"
+#include "source/common/network/connection_impl.h"
+#include "source/common/network/utility.h"
+#include "source/extensions/transport_sockets/tls/context_config_impl.h"
+#include "source/extensions/transport_sockets/tls/context_manager_impl.h"
 
 #include "test/config/integration/certs/clientcert_hash.h"
 #include "test/integration/http_integration.h"
 #include "test/integration/server.h"
 #include "test/integration/ssl_utility.h"
 #include "test/mocks/secret/mocks.h"
-#include "test/mocks/server/mocks.h"
 #include "test/test_common/network_utility.h"
 #include "test/test_common/test_time_system.h"
 #include "test/test_common/utility.h"
@@ -35,8 +34,7 @@ class SdsStaticDownstreamIntegrationTest
     : public testing::TestWithParam<Network::Address::IpVersion>,
       public HttpIntegrationTest {
 public:
-  SdsStaticDownstreamIntegrationTest()
-      : HttpIntegrationTest(Http::CodecClient::Type::HTTP1, GetParam()) {}
+  SdsStaticDownstreamIntegrationTest() : HttpIntegrationTest(Http::CodecType::HTTP1, GetParam()) {}
 
   void initialize() override {
     config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
@@ -46,7 +44,7 @@ public:
                                    ->mutable_transport_socket();
       envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext tls_context;
       auto* common_tls_context = tls_context.mutable_common_tls_context();
-      common_tls_context->add_alpn_protocols("http/1.1");
+      common_tls_context->add_alpn_protocols(Http::Utility::AlpnNames::get().Http11);
 
       common_tls_context->mutable_validation_context_sds_secret_config()->set_name(
           "validation_context");
@@ -69,7 +67,7 @@ public:
       tls_certificate->mutable_private_key()->set_filename(
           TestEnvironment::runfilesPath("test/config/integration/certs/serverkey.pem"));
     });
-
+    ASSERT_IS_MAIN_OR_TEST_THREAD();
     HttpIntegrationTest::initialize();
 
     registerTestServerPorts({"http"});
@@ -85,15 +83,15 @@ public:
 
   Network::ClientConnectionPtr makeSslClientConnection() {
     Network::Address::InstanceConstSharedPtr address = getSslAddress(version_, lookupPort("http"));
-    return dispatcher_->createClientConnection(address, Network::Address::InstanceConstSharedPtr(),
-                                               client_ssl_ctx_->createTransportSocket(nullptr),
-                                               nullptr);
+    return dispatcher_->createClientConnection(
+        address, Network::Address::InstanceConstSharedPtr(),
+        client_ssl_ctx_->createTransportSocket(nullptr, nullptr), nullptr, nullptr);
   }
 
 private:
   Extensions::TransportSockets::Tls::ContextManagerImpl context_manager_{timeSystem()};
 
-  Network::TransportSocketFactoryPtr client_ssl_ctx_;
+  Network::UpstreamTransportSocketFactoryPtr client_ssl_ctx_;
 };
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, SdsStaticDownstreamIntegrationTest,
@@ -110,8 +108,7 @@ TEST_P(SdsStaticDownstreamIntegrationTest, RouterRequestAndResponseWithGiantBody
 class SdsStaticUpstreamIntegrationTest : public testing::TestWithParam<Network::Address::IpVersion>,
                                          public HttpIntegrationTest {
 public:
-  SdsStaticUpstreamIntegrationTest()
-      : HttpIntegrationTest(Http::CodecClient::Type::HTTP1, GetParam()) {}
+  SdsStaticUpstreamIntegrationTest() : HttpIntegrationTest(Http::CodecType::HTTP1, GetParam()) {}
 
   void initialize() override {
     config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
@@ -146,9 +143,8 @@ public:
   }
 
   void createUpstreams() override {
-    fake_upstreams_.emplace_back(new FakeUpstream(createUpstreamSslContext(context_manager_, *api_),
-                                                  0, FakeHttpConnection::Type::HTTP1, version_,
-                                                  timeSystem()));
+    addFakeUpstream(createUpstreamSslContext(context_manager_, *api_), Http::CodecType::HTTP1,
+                    /*autonomous_upstream=*/false);
   }
 
 private:

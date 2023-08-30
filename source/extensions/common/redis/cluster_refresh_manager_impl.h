@@ -8,10 +8,9 @@
 #include "envoy/singleton/instance.h"
 #include "envoy/upstream/cluster_manager.h"
 
-#include "common/common/lock_guard.h"
-#include "common/common/thread.h"
-
-#include "extensions/common/redis/cluster_refresh_manager.h"
+#include "source/common/common/lock_guard.h"
+#include "source/common/common/thread.h"
+#include "source/extensions/common/redis/cluster_refresh_manager.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -93,7 +92,7 @@ private:
   Event::Dispatcher& main_thread_dispatcher_;
   Upstream::ClusterManager& cm_;
   TimeSource& time_source_;
-  std::map<std::string, ClusterInfoSharedPtr> info_map_ GUARDED_BY(map_mutex_);
+  std::map<std::string, ClusterInfoSharedPtr> info_map_ ABSL_GUARDED_BY(map_mutex_);
   Thread::MutexBasicLockable map_mutex_;
 };
 

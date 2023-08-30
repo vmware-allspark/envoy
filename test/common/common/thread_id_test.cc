@@ -1,4 +1,4 @@
-#include "common/common/thread.h"
+#include "source/common/common/thread.h"
 
 #include "test/test_common/thread_factory_for_test.h"
 
@@ -44,6 +44,11 @@ TEST(ThreadId, Hashability) {
       main_thread,
       background_thread,
   }));
+}
+
+TEST(ThreadId, CanGetId) {
+  Thread::ThreadId tid(10);
+  EXPECT_EQ(tid.getId(), 10);
 }
 
 } // namespace

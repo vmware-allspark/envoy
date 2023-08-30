@@ -6,16 +6,13 @@
 
 #include "envoy/access_log/access_log.h"
 
-#include "common/common/logger.h"
-#include "common/common/macros.h"
+#include "source/common/common/logger.h"
+#include "source/common/common/macros.h"
 
 #include "absl/strings/string_view.h"
 
 namespace Envoy {
 namespace Logger {
-
-class DelegatingLogSink;
-using DelegatingLogSinkSharedPtr = std::shared_ptr<DelegatingLogSink>;
 
 /**
  * SinkDelegate that writes log messages to a file.
@@ -24,9 +21,10 @@ class FileSinkDelegate : public SinkDelegate {
 public:
   FileSinkDelegate(const std::string& log_path, AccessLog::AccessLogManager& log_manager,
                    DelegatingLogSinkSharedPtr log_sink);
+  ~FileSinkDelegate() override;
 
   // SinkDelegate
-  void log(absl::string_view msg) override;
+  void log(absl::string_view msg, const spdlog::details::log_msg& log_msg) override;
   void flush() override;
 
 private:

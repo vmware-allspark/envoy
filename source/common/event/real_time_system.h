@@ -2,7 +2,7 @@
 
 #include "envoy/event/timer.h"
 
-#include "common/common/utility.h"
+#include "source/common/common/utility.h"
 
 namespace Envoy {
 namespace Event {
@@ -13,7 +13,7 @@ namespace Event {
 class RealTimeSystem : public TimeSystem {
 public:
   // TimeSystem
-  SchedulerPtr createScheduler(Scheduler&) override;
+  SchedulerPtr createScheduler(Scheduler&, CallbackScheduler&) override;
 
   // TimeSource
   SystemTime systemTime() override { return time_source_.systemTime(); }

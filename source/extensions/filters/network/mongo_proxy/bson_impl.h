@@ -7,9 +7,9 @@
 #include "envoy/buffer/buffer.h"
 #include "envoy/common/exception.h"
 
-#include "common/common/logger.h"
-
-#include "extensions/filters/network/mongo_proxy/bson.h"
+#include "source/common/common/logger.h"
+#include "source/common/common/utility.h"
+#include "source/extensions/filters/network/mongo_proxy/bson.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -153,7 +153,7 @@ public:
 private:
   void checkType(Type type) const {
     if (type_ != type) {
-      throw EnvoyException("invalid BSON field type cast");
+      ExceptionUtil::throwEnvoyException("invalid BSON field type cast");
     }
   }
 

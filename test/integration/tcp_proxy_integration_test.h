@@ -10,19 +10,21 @@
 
 namespace Envoy {
 
+struct TcpProxyIntegrationTestParams {
+  Network::Address::IpVersion version;
+  bool test_original_version;
+};
+
 class TcpProxyIntegrationTest : public testing::TestWithParam<Network::Address::IpVersion>,
                                 public BaseIntegrationTest {
 public:
   TcpProxyIntegrationTest() : BaseIntegrationTest(GetParam(), ConfigHelper::tcpProxyConfig()) {
-    enable_half_close_ = true;
-  }
-
-  ~TcpProxyIntegrationTest() override {
-    test_server_.reset();
-    fake_upstreams_.clear();
+    enableHalfClose(true);
   }
 
   void initialize() override;
+  // Setup common byte metering parameters.
+  void setupByteMeterAccessLog();
 };
 
 class TcpProxySslIntegrationTest : public TcpProxyIntegrationTest {
@@ -33,7 +35,7 @@ public:
                              const std::string& data_to_send_downstream);
 
   std::unique_ptr<Ssl::ContextManager> context_manager_;
-  Network::TransportSocketFactoryPtr context_;
+  Network::UpstreamTransportSocketFactoryPtr context_;
   ConnectionStatusCallbacks connect_callbacks_;
   MockWatermarkBuffer* client_write_buffer_;
   std::shared_ptr<WaitForPayloadReader> payload_reader_;

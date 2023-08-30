@@ -1,5 +1,3 @@
-licenses(["notice"])  # Apache 2
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_package",
@@ -8,6 +6,8 @@ load(
     "//test/extensions:extensions_build_system.bzl",
     "envoy_extension_cc_test",
 )
+
+licenses(["notice"])  # Apache 2
 
 envoy_package()
 
@@ -20,11 +20,11 @@ envoy_extension_cc_test(
         "zipkin_core_types_test.cc",
         "zipkin_tracer_impl_test.cc",
     ],
-    extension_name = "envoy.tracers.zipkin",
+    extension_names = ["envoy.tracers.zipkin"],
     external_deps = ["abseil_optional"],
     deps = [
-        "//include/envoy/common:time_interface",
-        "//include/envoy/runtime:runtime_interface",
+        "//envoy/common:time_interface",
+        "//envoy/runtime:runtime_interface",
         "//source/common/common:hex_lib",
         "//source/common/common:utility_lib",
         "//source/common/network:address_lib",
@@ -39,7 +39,8 @@ envoy_extension_cc_test(
         "//test/mocks/stats:stats_mocks",
         "//test/mocks/thread_local:thread_local_mocks",
         "//test/mocks/tracing:tracing_mocks",
-        "//test/mocks/upstream:upstream_mocks",
+        "//test/mocks/upstream:cluster_manager_mocks",
+        "//test/mocks/upstream:thread_local_cluster_mocks",
         "//test/test_common:simulated_time_system_lib",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/config/trace/v3:pkg_cc_proto",
@@ -49,10 +50,11 @@ envoy_extension_cc_test(
 envoy_extension_cc_test(
     name = "config_test",
     srcs = ["config_test.cc"],
-    extension_name = "envoy.tracers.zipkin",
+    extension_names = ["envoy.tracers.zipkin"],
     deps = [
         "//source/extensions/tracers/zipkin:config",
-        "//test/mocks/server:server_mocks",
+        "//test/mocks/server:tracer_factory_context_mocks",
+        "//test/mocks/server:tracer_factory_mocks",
         "//test/test_common:utility_lib",
         "@envoy_api//envoy/config/trace/v3:pkg_cc_proto",
     ],

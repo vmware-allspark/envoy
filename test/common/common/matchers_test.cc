@@ -4,9 +4,10 @@
 #include "envoy/type/matcher/v3/string.pb.h"
 #include "envoy/type/matcher/v3/value.pb.h"
 
-#include "common/common/matchers.h"
-#include "common/config/metadata.h"
-#include "common/protobuf/protobuf.h"
+#include "source/common/common/matchers.h"
+#include "source/common/config/metadata.h"
+#include "source/common/protobuf/protobuf.h"
+#include "source/common/stream_info/filter_state_impl.h"
 
 #include "test/test_common/utility.h"
 
@@ -119,6 +120,25 @@ TEST(MetadataTest, MatchStringSuffixValue) {
   matcher.mutable_value()->mutable_string_match()->set_suffix("prodx");
   EXPECT_FALSE(Envoy::Matchers::MetadataMatcher(matcher).match(metadata));
   matcher.mutable_value()->mutable_string_match()->set_suffix("prod");
+  EXPECT_TRUE(Envoy::Matchers::MetadataMatcher(matcher).match(metadata));
+}
+
+TEST(MetadataTest, MatchStringContainsValue) {
+  envoy::config::core::v3::Metadata metadata;
+  Envoy::Config::Metadata::mutableMetadataValue(metadata, "envoy.filter.a", "label")
+      .set_string_value("test");
+  Envoy::Config::Metadata::mutableMetadataValue(metadata, "envoy.filter.b", "label")
+      .set_string_value("abcprodef");
+
+  envoy::type::matcher::v3::MetadataMatcher matcher;
+  matcher.set_filter("envoy.filter.b");
+  matcher.add_path()->set_key("label");
+
+  matcher.mutable_value()->mutable_string_match()->set_exact("test");
+  EXPECT_FALSE(Envoy::Matchers::MetadataMatcher(matcher).match(metadata));
+  matcher.mutable_value()->mutable_string_match()->set_contains("pride");
+  EXPECT_FALSE(Envoy::Matchers::MetadataMatcher(matcher).match(metadata));
+  matcher.mutable_value()->mutable_string_match()->set_contains("prod");
   EXPECT_TRUE(Envoy::Matchers::MetadataMatcher(matcher).match(metadata));
 }
 
@@ -261,6 +281,22 @@ TEST(MetadataTest, MatchDoubleListValue) {
   metadataValue.Clear();
 }
 
+TEST(MetadataTest, InvertMatch) {
+  envoy::config::core::v3::Metadata metadata;
+  Envoy::Config::Metadata::mutableMetadataValue(metadata, "envoy.filter.x", "label")
+      .set_string_value("prod");
+
+  envoy::type::matcher::v3::MetadataMatcher matcher;
+  matcher.set_filter("envoy.filter.x");
+  matcher.add_path()->set_key("label");
+  matcher.set_invert(true);
+
+  matcher.mutable_value()->mutable_string_match()->set_exact("test");
+  EXPECT_TRUE(Envoy::Matchers::MetadataMatcher(matcher).match(metadata));
+  matcher.mutable_value()->mutable_string_match()->set_exact("prod");
+  EXPECT_FALSE(Envoy::Matchers::MetadataMatcher(matcher).match(metadata));
+}
+
 TEST(StringMatcher, ExactMatchIgnoreCase) {
   envoy::type::matcher::v3::StringMatcher matcher;
   matcher.set_exact("exact");
@@ -306,6 +342,22 @@ TEST(StringMatcher, SuffixMatchIgnoreCase) {
   EXPECT_FALSE(Matchers::StringMatcherImpl(matcher).match("other"));
 }
 
+TEST(StringMatcher, ContainsMatchIgnoreCase) {
+  envoy::type::matcher::v3::StringMatcher matcher;
+  matcher.set_contains("contained-str");
+  EXPECT_TRUE(Matchers::StringMatcherImpl(matcher).match("abc-contained-str-def"));
+  EXPECT_TRUE(Matchers::StringMatcherImpl(matcher).match("contained-str"));
+  EXPECT_FALSE(Matchers::StringMatcherImpl(matcher).match("ABC-Contained-Str-DEF"));
+  EXPECT_FALSE(Matchers::StringMatcherImpl(matcher).match("abc-container-int-def"));
+  EXPECT_FALSE(Matchers::StringMatcherImpl(matcher).match("other"));
+
+  matcher.set_ignore_case(true);
+  EXPECT_TRUE(Matchers::StringMatcherImpl(matcher).match("abc-contained-str-def"));
+  EXPECT_TRUE(Matchers::StringMatcherImpl(matcher).match("abc-cOnTaInEd-str-def"));
+  EXPECT_FALSE(Matchers::StringMatcherImpl(matcher).match("abc-ContAineR-str-def"));
+  EXPECT_FALSE(Matchers::StringMatcherImpl(matcher).match("other"));
+}
+
 TEST(StringMatcher, SafeRegexValue) {
   envoy::type::matcher::v3::StringMatcher matcher;
   matcher.mutable_safe_regex()->mutable_google_re2();
@@ -313,14 +365,6 @@ TEST(StringMatcher, SafeRegexValue) {
   EXPECT_TRUE(Matchers::StringMatcherImpl(matcher).match("foo"));
   EXPECT_TRUE(Matchers::StringMatcherImpl(matcher).match("foobar"));
   EXPECT_FALSE(Matchers::StringMatcherImpl(matcher).match("bar"));
-}
-
-TEST(StringMatcher, RegexValueIgnoreCase) {
-  envoy::type::matcher::v3::StringMatcher matcher;
-  matcher.set_ignore_case(true);
-  matcher.set_hidden_envoy_deprecated_regex("foo");
-  EXPECT_THROW_WITH_MESSAGE(Matchers::StringMatcherImpl(matcher).match("foo"), EnvoyException,
-                            "ignore_case has no effect for regex.");
 }
 
 TEST(StringMatcher, SafeRegexValueIgnoreCase) {
@@ -388,6 +432,34 @@ TEST(PathMatcher, MatchPrefixPathIgnoreCase) {
   EXPECT_FALSE(matcher->match("/prefiz#/prefix"));
 }
 
+TEST(PathMatcher, SlashPrefixMatcherShared) {
+  // Create 3 matchers and verify that the same instance is being reused for them.
+  const auto matcher1 = Envoy::Matchers::PathMatcher::createPrefix("/", false);
+  const auto matcher2 = Envoy::Matchers::PathMatcher::createPrefix("/", false);
+  const auto matcher3 = Envoy::Matchers::PathMatcher::createPrefix("/", true);
+
+  EXPECT_EQ(matcher1, matcher2);
+  EXPECT_EQ(matcher1, matcher3);
+
+  // Sanity check that the matcher works as expected.
+  EXPECT_TRUE(matcher1->match("/bla"));
+  EXPECT_FALSE(matcher1->match("bla"));
+}
+
+TEST(PathMatcher, EmptyPrefixMatcherShared) {
+  // Create 3 matchers and verify that the same instance is being reused for them.
+  const auto matcher1 = Envoy::Matchers::PathMatcher::createPrefix("", false);
+  const auto matcher2 = Envoy::Matchers::PathMatcher::createPrefix("", false);
+  const auto matcher3 = Envoy::Matchers::PathMatcher::createPrefix("", true);
+
+  EXPECT_EQ(matcher1, matcher2);
+  EXPECT_EQ(matcher1, matcher3);
+
+  // Sanity check that the matcher works as expected.
+  EXPECT_TRUE(matcher1->match("/bla"));
+  EXPECT_TRUE(matcher1->match("bla"));
+}
+
 TEST(PathMatcher, MatchSuffixPath) {
   envoy::type::matcher::v3::PathMatcher matcher;
   matcher.mutable_path()->set_suffix("suffix");
@@ -400,6 +472,20 @@ TEST(PathMatcher, MatchSuffixPath) {
   EXPECT_FALSE(Matchers::PathMatcher(matcher).match("/suffiz"));
   EXPECT_FALSE(Matchers::PathMatcher(matcher).match("/suffiz?param=suffix"));
   EXPECT_FALSE(Matchers::PathMatcher(matcher).match("/suffiz#suffix"));
+}
+
+TEST(PathMatcher, MatchContainsPath) {
+  envoy::type::matcher::v3::PathMatcher matcher;
+  matcher.mutable_path()->set_contains("contains");
+
+  EXPECT_TRUE(Matchers::PathMatcher(matcher).match("/contains"));
+  EXPECT_TRUE(Matchers::PathMatcher(matcher).match("/abc-contains"));
+  EXPECT_TRUE(Matchers::PathMatcher(matcher).match("/contains-abc"));
+  EXPECT_TRUE(Matchers::PathMatcher(matcher).match("/abc-contains-def"));
+  EXPECT_TRUE(Matchers::PathMatcher(matcher).match("/abc-contains-def?param=val"));
+  EXPECT_TRUE(Matchers::PathMatcher(matcher).match("/abc-contains-def#fragment"));
+  EXPECT_FALSE(Matchers::PathMatcher(matcher).match("/abc-def#containsfragment?param=contains"));
+  EXPECT_FALSE(Matchers::PathMatcher(matcher).match("/abc-curtains-def"));
 }
 
 TEST(PathMatcher, MatchRegexPath) {
@@ -416,6 +502,59 @@ TEST(PathMatcher, MatchRegexPath) {
   EXPECT_FALSE(Matchers::PathMatcher(matcher).match("/regez"));
   EXPECT_FALSE(Matchers::PathMatcher(matcher).match("/regez?param=regex"));
   EXPECT_FALSE(Matchers::PathMatcher(matcher).match("/regez#regex"));
+}
+
+TEST(FilterStateMatcher, MatchAbsentFilterState) {
+  envoy::type::matcher::v3::FilterStateMatcher matcher;
+  matcher.set_key("test.key");
+  matcher.mutable_string_match()->set_exact("exact");
+  StreamInfo::FilterStateImpl filter_state(StreamInfo::FilterState::LifeSpan::Connection);
+  EXPECT_FALSE(Matchers::FilterStateMatcher(matcher).match(filter_state));
+}
+
+class TestObject : public StreamInfo::FilterState::Object {
+public:
+  TestObject(absl::optional<std::string> value) : value_(value) {}
+  absl::optional<std::string> serializeAsString() const override { return value_; }
+
+private:
+  absl::optional<std::string> value_;
+};
+
+TEST(FilterStateMatcher, MatchFilterStateWithoutString) {
+  const std::string key = "test.key";
+  envoy::type::matcher::v3::FilterStateMatcher matcher;
+  matcher.set_key(key);
+  matcher.mutable_string_match()->set_exact("exact");
+  StreamInfo::FilterStateImpl filter_state(StreamInfo::FilterState::LifeSpan::Connection);
+  filter_state.setData(key, std::make_shared<TestObject>(absl::nullopt),
+                       StreamInfo::FilterState::StateType::ReadOnly);
+  EXPECT_FALSE(Matchers::FilterStateMatcher(matcher).match(filter_state));
+}
+
+TEST(FilterStateMatcher, MatchFilterStateDifferentString) {
+  const std::string key = "test.key";
+  const std::string value = "exact_value";
+  envoy::type::matcher::v3::FilterStateMatcher matcher;
+  matcher.set_key(key);
+  matcher.mutable_string_match()->set_exact(value);
+  StreamInfo::FilterStateImpl filter_state(StreamInfo::FilterState::LifeSpan::Connection);
+  filter_state.setData(key,
+                       std::make_shared<TestObject>(absl::make_optional<std::string>("different")),
+                       StreamInfo::FilterState::StateType::ReadOnly);
+  EXPECT_FALSE(Matchers::FilterStateMatcher(matcher).match(filter_state));
+}
+
+TEST(FilterStateMatcher, MatchFilterState) {
+  const std::string key = "test.key";
+  const std::string value = "exact_value";
+  envoy::type::matcher::v3::FilterStateMatcher matcher;
+  matcher.set_key(key);
+  matcher.mutable_string_match()->set_exact(value);
+  StreamInfo::FilterStateImpl filter_state(StreamInfo::FilterState::LifeSpan::Connection);
+  filter_state.setData(key, std::make_shared<TestObject>(absl::make_optional<std::string>(value)),
+                       StreamInfo::FilterState::StateType::ReadOnly);
+  EXPECT_TRUE(Matchers::FilterStateMatcher(matcher).match(filter_state));
 }
 
 } // namespace

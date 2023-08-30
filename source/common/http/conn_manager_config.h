@@ -2,16 +2,21 @@
 
 #include "envoy/config/config_provider.h"
 #include "envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.pb.h"
+#include "envoy/http/early_header_mutation.h"
 #include "envoy/http/filter.h"
+#include "envoy/http/header_validator.h"
+#include "envoy/http/original_ip_detection.h"
 #include "envoy/http/request_id_extension.h"
 #include "envoy/router/rds.h"
 #include "envoy/stats/scope.h"
 #include "envoy/tracing/http_tracer.h"
 #include "envoy/type/v3/percent.pb.h"
 
-#include "common/http/date_provider.h"
-#include "common/network/utility.h"
-#include "common/stats/symbol_table_impl.h"
+#include "source/common/http/date_provider.h"
+#include "source/common/local_reply/local_reply.h"
+#include "source/common/network/utility.h"
+#include "source/common/stats/symbol_table.h"
+#include "source/common/tracing/tracer_config_impl.h"
 
 namespace Envoy {
 namespace Http {
@@ -33,6 +38,7 @@ namespace Http {
   COUNTER(downstream_cx_http3_total)                                                               \
   COUNTER(downstream_cx_idle_timeout)                                                              \
   COUNTER(downstream_cx_max_duration_reached)                                                      \
+  COUNTER(downstream_cx_max_requests_reached)                                                      \
   COUNTER(downstream_cx_overload_disable_keepalive)                                                \
   COUNTER(downstream_cx_protocol_error)                                                            \
   COUNTER(downstream_cx_rx_bytes_total)                                                            \
@@ -48,15 +54,19 @@ namespace Http {
   COUNTER(downstream_rq_4xx)                                                                       \
   COUNTER(downstream_rq_5xx)                                                                       \
   COUNTER(downstream_rq_completed)                                                                 \
+  COUNTER(downstream_rq_failed_path_normalization)                                                 \
   COUNTER(downstream_rq_http1_total)                                                               \
   COUNTER(downstream_rq_http2_total)                                                               \
   COUNTER(downstream_rq_http3_total)                                                               \
   COUNTER(downstream_rq_idle_timeout)                                                              \
   COUNTER(downstream_rq_non_relative_path)                                                         \
   COUNTER(downstream_rq_overload_close)                                                            \
+  COUNTER(downstream_rq_redirected_with_normalized_path)                                           \
+  COUNTER(downstream_rq_rejected_via_ip_detection)                                                 \
   COUNTER(downstream_rq_response_before_rq_complete)                                               \
   COUNTER(downstream_rq_rx_reset)                                                                  \
   COUNTER(downstream_rq_timeout)                                                                   \
+  COUNTER(downstream_rq_header_timeout)                                                            \
   COUNTER(downstream_rq_too_large)                                                                 \
   COUNTER(downstream_rq_total)                                                                     \
   COUNTER(downstream_rq_tx_reset)                                                                  \
@@ -113,21 +123,7 @@ struct ConnectionManagerTracingStats {
   CONN_MAN_TRACING_STATS(GENERATE_COUNTER_STRUCT)
 };
 
-/**
- * Configuration for tracing which is set on the connection manager level.
- * Http Tracing can be enabled/disabled on a per connection manager basis.
- * Here we specify some specific for connection manager settings.
- */
-struct TracingConnectionManagerConfig {
-  Tracing::OperationName operation_name_;
-  Tracing::CustomTagMap custom_tags_;
-  envoy::type::v3::FractionalPercent client_sampling_;
-  envoy::type::v3::FractionalPercent random_sampling_;
-  envoy::type::v3::FractionalPercent overall_sampling_;
-  bool verbose_;
-  uint32_t max_path_tag_length_;
-};
-
+using TracingConnectionManagerConfig = Tracing::ConnectionManagerTracingConfigImpl;
 using TracingConnectionManagerConfigPtr = std::unique_ptr<TracingConnectionManagerConfig>;
 
 /**
@@ -166,6 +162,18 @@ enum class ForwardClientCertType {
 enum class ClientCertDetailsType { Cert, Chain, Subject, URI, DNS };
 
 /**
+ * Type that indicates how port should be stripped from Host header.
+ */
+enum class StripPortType {
+  // Removes the port from host/authority header only if the port matches with the listener port.
+  MatchingHost,
+  // Removes any port from host/authority header.
+  Any,
+  // Keeps the port in host/authority header as is.
+  None
+};
+
+/**
  * Configuration for what addresses should be considered internal beyond the defaults.
  */
 class InternalAddressConfig {
@@ -195,14 +203,23 @@ public:
   virtual ~ConnectionManagerConfig() = default;
 
   /**
-   * @return RequestIDExtensionSharedPtr The request id utilities instance to use
+   * @return RequestIDExtensionSharedPtr The request id utilities instance to use.
    */
-  virtual RequestIDExtensionSharedPtr requestIDExtension() PURE;
+  virtual const RequestIDExtensionSharedPtr& requestIDExtension() PURE;
 
   /**
    *  @return const std::list<AccessLog::InstanceSharedPtr>& the access logs to write to.
    */
   virtual const std::list<AccessLog::InstanceSharedPtr>& accessLogs() PURE;
+
+  /**
+   * @return const absl::optional<std::chrono::milliseconds>& the interval to flush the access logs.
+   */
+  virtual const absl::optional<std::chrono::milliseconds>& accessLogFlushInterval() PURE;
+
+  // If set to true, access log will be flushed when a new HTTP request is received, after request
+  // headers have been evaluated, and before attempting to establish a connection with the upstream.
+  virtual bool flushAccessLogOnNewRequest() PURE;
 
   /**
    * Called to create a codec for the connection manager. This function will be called when the
@@ -246,6 +263,11 @@ public:
   virtual bool preserveExternalRequestId() const PURE;
 
   /**
+   * @return whether the x-request-id should always be set in the response.
+   */
+  virtual bool alwaysSetRequestIdInResponse() const PURE;
+
+  /**
    * @return optional idle timeout for incoming connection manager connections.
    */
   virtual absl::optional<std::chrono::milliseconds> idleTimeout() const PURE;
@@ -284,6 +306,12 @@ public:
   virtual std::chrono::milliseconds requestTimeout() const PURE;
 
   /**
+   * @return request header timeout for incoming connection manager connections. Zero indicates a
+   *         disabled request header timeout.
+   */
+  virtual std::chrono::milliseconds requestHeadersTimeout() const PURE;
+
+  /**
    * @return delayed close timeout for downstream HTTP connections. Zero indicates a disabled
    *         timeout. See http_connection_manager.proto for a detailed description of this timeout.
    */
@@ -318,6 +346,11 @@ public:
    */
   virtual HttpConnectionManagerProto::ServerHeaderTransformation
   serverHeaderTransformation() const PURE;
+
+  /**
+   * @return const absl::optional<std::string> the scheme name to write into requests.
+   */
+  virtual const absl::optional<std::string>& schemeToSet() const PURE;
 
   /**
    * @return ConnectionManagerStats& the stats to write to.
@@ -404,6 +437,12 @@ public:
   virtual bool proxy100Continue() const PURE;
 
   /**
+   * @return bool supplies if the HttpConnectionManager should handle invalid HTTP with a stream
+   * error or connection error.
+   */
+  virtual bool streamErrorOnInvalidHttpMessaging() const PURE;
+
+  /**
    * @return supplies the http1 settings.
    */
   virtual const Http::Http1Settings& http1Settings() const PURE;
@@ -420,11 +459,72 @@ public:
   virtual bool shouldMergeSlashes() const PURE;
 
   /**
+   * @return port strip type from host/authority header.
+   */
+  virtual StripPortType stripPortType() const PURE;
+
+  /**
    * @return the action HttpConnectionManager should take when receiving client request
    * headers containing underscore characters.
    */
   virtual envoy::config::core::v3::HttpProtocolOptions::HeadersWithUnderscoresAction
   headersWithUnderscoresAction() const PURE;
+
+  /**
+   * @return LocalReply configuration which supplies mapping for local reply generated by Envoy.
+   */
+  virtual const LocalReply::LocalReply& localReply() const PURE;
+
+  /**
+   * @return the action HttpConnectionManager should take when receiving client request
+   * with URI path containing %2F, %2f, %5c or %5C sequences.
+   */
+  virtual envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager::
+      PathWithEscapedSlashesAction
+      pathWithEscapedSlashesAction() const PURE;
+
+  /**
+   * @return vector of OriginalIPDetectionSharedPtr original IP detection extensions.
+   */
+  virtual const std::vector<OriginalIPDetectionSharedPtr>&
+  originalIpDetectionExtensions() const PURE;
+
+  virtual const std::vector<EarlyHeaderMutationPtr>& earlyHeaderMutationExtensions() const PURE;
+
+  /**
+   * @return if the HttpConnectionManager should remove trailing host dot from host/authority
+   * header.
+   */
+  virtual bool shouldStripTrailingHostDot() const PURE;
+  /**
+   * @return maximum requests for downstream.
+   */
+  virtual uint64_t maxRequestsPerConnection() const PURE;
+  /**
+   * @return the config describing if/how to write the Proxy-Status HTTP response header.
+   * If nullptr, don't write the Proxy-Status HTTP response header.
+   */
+  virtual const HttpConnectionManagerProto::ProxyStatusConfig* proxyStatusConfig() const PURE;
+
+  /**
+   * Creates new header validator. This method always returns nullptr unless the `ENVOY_ENABLE_UHV`
+   * pre-processor variable is defined.
+   * @param protocol HTTP protocol version that is to be validated.
+   * @return pointer to the header validator.
+   *         If nullptr, header validation will not be done.
+   */
+  virtual HeaderValidatorPtr makeHeaderValidator(Protocol protocol) PURE;
+
+  /**
+   * @return whether to append the x-forwarded-port header.
+   */
+  virtual bool appendXForwardedPort() const PURE;
+
+  /**
+   * @return whether the HCM will insert ProxyProtocolFilterState into the filter state at the
+   *         Connection Lifetime.
+   */
+  virtual bool addProxyProtocolConnectionState() const PURE;
 };
 } // namespace Http
 } // namespace Envoy
