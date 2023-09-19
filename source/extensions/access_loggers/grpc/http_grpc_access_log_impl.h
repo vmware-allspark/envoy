@@ -1,6 +1,6 @@
 #pragma once
 
-#include <unordered_map>
+#include <memory>
 #include <vector>
 
 #include "envoy/extensions/access_loggers/grpc/v3/als.pb.h"
@@ -10,10 +10,9 @@
 #include "envoy/singleton/instance.h"
 #include "envoy/thread_local/thread_local.h"
 
-#include "common/grpc/typed_async_client.h"
-
-#include "extensions/access_loggers/common/access_log_base.h"
-#include "extensions/access_loggers/grpc/grpc_access_log_impl.h"
+#include "source/common/grpc/typed_async_client.h"
+#include "source/extensions/access_loggers/common/access_log_base.h"
+#include "source/extensions/access_loggers/grpc/grpc_access_log_impl.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -22,13 +21,15 @@ namespace HttpGrpc {
 
 // TODO(mattklein123): Stats
 
+using envoy::extensions::access_loggers::grpc::v3::HttpGrpcAccessLogConfig;
+using HttpGrpcAccessLogConfigConstSharedPtr = std::shared_ptr<const HttpGrpcAccessLogConfig>;
+
 /**
  * Access log Instance that streams HTTP logs over gRPC.
  */
 class HttpGrpcAccessLog : public Common::ImplBase {
 public:
-  HttpGrpcAccessLog(AccessLog::FilterPtr&& filter,
-                    envoy::extensions::access_loggers::grpc::v3::HttpGrpcAccessLogConfig config,
+  HttpGrpcAccessLog(AccessLog::FilterPtr&& filter, const HttpGrpcAccessLogConfig config,
                     ThreadLocal::SlotAllocator& tls,
                     GrpcCommon::GrpcAccessLoggerCacheSharedPtr access_logger_cache);
 
@@ -46,9 +47,10 @@ private:
   void emitLog(const Http::RequestHeaderMap& request_headers,
                const Http::ResponseHeaderMap& response_headers,
                const Http::ResponseTrailerMap& response_trailers,
-               const StreamInfo::StreamInfo& stream_info) override;
+               const StreamInfo::StreamInfo& stream_info,
+               AccessLog::AccessLogType access_log_type) override;
 
-  const envoy::extensions::access_loggers::grpc::v3::HttpGrpcAccessLogConfig config_;
+  const HttpGrpcAccessLogConfigConstSharedPtr config_;
   const ThreadLocal::SlotPtr tls_slot_;
   const GrpcCommon::GrpcAccessLoggerCacheSharedPtr access_logger_cache_;
   std::vector<Http::LowerCaseString> request_headers_to_log_;
@@ -56,6 +58,8 @@ private:
   std::vector<Http::LowerCaseString> response_trailers_to_log_;
   std::vector<std::string> filter_states_to_log_;
 };
+
+using HttpGrpcAccessLogPtr = std::unique_ptr<HttpGrpcAccessLog>;
 
 } // namespace HttpGrpc
 } // namespace AccessLoggers

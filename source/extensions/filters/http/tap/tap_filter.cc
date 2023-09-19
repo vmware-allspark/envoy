@@ -1,4 +1,4 @@
-#include "extensions/filters/http/tap/tap_filter.h"
+#include "source/extensions/filters/http/tap/tap_filter.h"
 
 #include "envoy/extensions/filters/http/tap/v3/tap.pb.h"
 
@@ -10,7 +10,7 @@ namespace TapFilter {
 FilterConfigImpl::FilterConfigImpl(
     const envoy::extensions::filters::http::tap::v3::Tap& proto_config,
     const std::string& stats_prefix, Common::Tap::TapConfigFactoryPtr&& config_factory,
-    Stats::Scope& scope, Server::Admin& admin, Singleton::Manager& singleton_manager,
+    Stats::Scope& scope, OptRef<Server::Admin> admin, Singleton::Manager& singleton_manager,
     ThreadLocal::SlotAllocator& tls, Event::Dispatcher& main_thread_dispatcher)
     : ExtensionConfigBase(proto_config.common_config(), std::move(config_factory), admin,
                           singleton_manager, tls, main_thread_dispatcher),
@@ -35,7 +35,7 @@ Http::FilterHeadersStatus Filter::decodeHeaders(Http::RequestHeaderMap& headers,
 }
 
 Http::FilterDataStatus Filter::decodeData(Buffer::Instance& data, bool) {
-  if (tapper_ != nullptr) {
+  if ((tapper_ != nullptr) && (0 != data.length())) {
     tapper_->onRequestBody(data);
   }
   return Http::FilterDataStatus::Continue;
@@ -56,7 +56,7 @@ Http::FilterHeadersStatus Filter::encodeHeaders(Http::ResponseHeaderMap& headers
 }
 
 Http::FilterDataStatus Filter::encodeData(Buffer::Instance& data, bool) {
-  if (tapper_ != nullptr) {
+  if ((tapper_ != nullptr) && (0 != data.length())) {
     tapper_->onResponseBody(data);
   }
   return Http::FilterDataStatus::Continue;
@@ -70,7 +70,8 @@ Http::FilterTrailersStatus Filter::encodeTrailers(Http::ResponseTrailerMap& trai
 }
 
 void Filter::log(const Http::RequestHeaderMap*, const Http::ResponseHeaderMap*,
-                 const Http::ResponseTrailerMap*, const StreamInfo::StreamInfo&) {
+                 const Http::ResponseTrailerMap*, const StreamInfo::StreamInfo&,
+                 AccessLog::AccessLogType) {
   if (tapper_ != nullptr && tapper_->onDestroyLog()) {
     config_->stats().rq_tapped_.inc();
   }

@@ -1,9 +1,14 @@
 #pragma once
 
+#include "envoy/common/random_generator.h"
 #include "envoy/event/dispatcher.h"
 #include "envoy/extensions/common/dynamic_forward_proxy/v3/dns_cache.pb.h"
 #include "envoy/singleton/manager.h"
 #include "envoy/thread_local/thread_local.h"
+#include "envoy/upstream/resource_manager.h"
+
+#include "source/common/http/header_utility.h"
+#include "source/common/runtime/runtime_features.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -15,13 +20,36 @@ namespace DynamicForwardProxy {
  */
 class DnsHostInfo {
 public:
+  // DFP hosts are created after a DNS lookup for a domain name (e.g. foo.com) but are created
+  // with an IP address and port to resolve to. To prevent bugs where we insert say foo.com
+  // (default port 80) then later look up foo.com (default port 443) and get IP addresses with
+  // port 80, we "fully qualify" hostnames with the port.
+  //
+  // This normalizes hostnames, respecting the port if it exists, and adding the default port
+  // if there is no port.
+  static std::string normalizeHostForDfp(absl::string_view host, uint16_t default_port) {
+    if (!Runtime::runtimeFeatureEnabled("envoy.reloadable_features.dfp_mixed_scheme")) {
+      return std::string(host);
+    }
+    if (Http::HeaderUtility::hostHasPort(host)) {
+      return std::string(host);
+    }
+    return absl::StrCat(host, ":", default_port);
+  }
+
   virtual ~DnsHostInfo() = default;
 
   /**
    * Returns the host's currently resolved address. This address may change periodically due to
+   * async re-resolution. This address may be null in the case of failed resolution.
+   */
+  virtual Network::Address::InstanceConstSharedPtr address() const PURE;
+
+  /**
+   * Returns the host's currently resolved address. These addresses may change periodically due to
    * async re-resolution.
    */
-  virtual Network::Address::InstanceConstSharedPtr address() PURE;
+  virtual std::vector<Network::Address::InstanceConstSharedPtr> addressList() const PURE;
 
   /**
    * Returns the host that was actually resolved via DNS. If port was originally specified it will
@@ -43,6 +71,32 @@ public:
 
 using DnsHostInfoSharedPtr = std::shared_ptr<DnsHostInfo>;
 
+#define ALL_DNS_CACHE_CIRCUIT_BREAKERS_STATS(OPEN_GAUGE, REMAINING_GAUGE)                          \
+  OPEN_GAUGE(rq_pending_open, Accumulate)                                                          \
+  REMAINING_GAUGE(rq_pending_remaining, Accumulate)
+
+struct DnsCacheCircuitBreakersStats {
+  ALL_DNS_CACHE_CIRCUIT_BREAKERS_STATS(GENERATE_GAUGE_STRUCT, GENERATE_GAUGE_STRUCT)
+};
+
+/**
+ * A resource manager of DNS Cache.
+ */
+class DnsCacheResourceManager {
+public:
+  virtual ~DnsCacheResourceManager() = default;
+
+  /**
+   * Returns the resource limit of pending requests to DNS.
+   */
+  virtual ResourceLimit& pendingRequests() PURE;
+
+  /**
+   * Returns the reference of stats for dns cache circuit breakers.
+   */
+  virtual DnsCacheCircuitBreakersStats& stats() PURE;
+};
+
 /**
  * A cache of DNS hosts. Hosts will re-resolve their addresses or be automatically purged
  * depending on configured policy.
@@ -58,8 +112,10 @@ public:
 
     /**
      * Called when the DNS cache load is complete (or failed).
+     *
+     * @param host_info the DnsHostInfo for the resolved host.
      */
-    virtual void onLoadDnsCacheComplete() PURE;
+    virtual void onLoadDnsCacheComplete(const DnsHostInfoSharedPtr& host_info) PURE;
   };
 
   /**
@@ -93,6 +149,16 @@ public:
      * @param host supplies the removed host.
      */
     virtual void onDnsHostRemove(const std::string& host) PURE;
+
+    /**
+     * Called when any resolution for a host completes.
+     * @param host supplies the added/updated host.
+     * @param host_info supplies the associated host info.
+     * @param status supplies the resolution status.
+     */
+    virtual void onDnsResolutionComplete(const std::string& host,
+                                         const DnsHostInfoSharedPtr& host_info,
+                                         Network::DnsResolver::ResolutionStatus status) PURE;
   };
 
   /**
@@ -132,9 +198,19 @@ public:
   struct LoadDnsCacheEntryResult {
     LoadDnsCacheEntryStatus status_;
     LoadDnsCacheEntryHandlePtr handle_;
+    absl::optional<DnsHostInfoSharedPtr> host_info_;
   };
 
+  /**
+   * Attempt to load a DNS cache entry.
+   * @param host the hostname to lookup
+   * @param default_port the port to use
+   * @param is_proxy_lookup indicates if the request is safe to fast-fail. The Dynamic Forward Proxy
+   * filter sets this to true if no address is necessary due to an upstream proxy being configured.
+   * @return a handle that on destruction will de-register the callbacks.
+   */
   virtual LoadDnsCacheEntryResult loadDnsCacheEntry(absl::string_view host, uint16_t default_port,
+                                                    bool is_proxy_lookup,
                                                     LoadDnsCacheEntryCallbacks& callbacks) PURE;
 
   /**
@@ -144,10 +220,34 @@ public:
    */
   virtual AddUpdateCallbacksHandlePtr addUpdateCallbacks(UpdateCallbacks& callbacks) PURE;
 
+  using IterateHostMapCb = std::function<void(absl::string_view, const DnsHostInfoSharedPtr&)>;
+
   /**
-   * @return all hosts currently stored in the cache.
+   * Iterates over all entries in the cache, calling a callback for each entry
+   *
+   * @param iterate_callback the callback to invoke for each entry in the cache
    */
-  virtual absl::flat_hash_map<std::string, DnsHostInfoSharedPtr> hosts() PURE;
+  virtual void iterateHostMap(IterateHostMapCb iterate_callback) PURE;
+
+  /**
+   * Retrieve the DNS host info of a given host currently stored in the cache.
+   * @param host_name supplies the host name.
+   * @return the DNS host info associated with the given host name if the host's address is cached,
+   * otherwise `absl::nullopt`.
+   */
+  virtual absl::optional<const DnsHostInfoSharedPtr> getHost(absl::string_view host_name) PURE;
+
+  /**
+   * Check if a DNS request is allowed given resource limits.
+   * @return RAII handle for pending request circuit breaker if the request was allowed.
+   */
+  virtual Upstream::ResourceAutoIncDecPtr canCreateDnsRequest() PURE;
+
+  /**
+   * Force a DNS refresh of all known hosts, ignoring any ongoing failure or success timers. This
+   * can be used in response to network changes which might alter DNS responses, for example.
+   */
+  virtual void forceRefreshHosts() PURE;
 };
 
 using DnsCacheSharedPtr = std::shared_ptr<DnsCache>;
@@ -166,18 +266,17 @@ public:
    */
   virtual DnsCacheSharedPtr
   getCache(const envoy::extensions::common::dynamic_forward_proxy::v3::DnsCacheConfig& config) PURE;
+
+  /**
+   * Look up an existing DNS cache by name.
+   * @param name supplies the cache name to look up. If a cache exists with the same name it
+   *             will be returned.
+   * @return pointer to the cache if it exists, nullptr otherwise.
+   */
+  virtual DnsCacheSharedPtr lookUpCacheByName(absl::string_view cache_name) PURE;
 };
 
 using DnsCacheManagerSharedPtr = std::shared_ptr<DnsCacheManager>;
-
-/**
- * Get the singleton cache manager for the entire server.
- */
-DnsCacheManagerSharedPtr getCacheManager(Singleton::Manager& manager,
-                                         Event::Dispatcher& main_thread_dispatcher,
-                                         ThreadLocal::SlotAllocator& tls,
-                                         Runtime::RandomGenerator& random,
-                                         Stats::Scope& root_scope);
 
 /**
  * Factory for getting a DNS cache manager.

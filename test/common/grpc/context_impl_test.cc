@@ -1,13 +1,14 @@
 #include "envoy/common/platform.h"
 
-#include "common/grpc/common.h"
-#include "common/grpc/context_impl.h"
-#include "common/http/headers.h"
-#include "common/http/message_impl.h"
-#include "common/http/utility.h"
-#include "common/stats/fake_symbol_table_impl.h"
+#include "source/common/grpc/common.h"
+#include "source/common/grpc/context_impl.h"
+#include "source/common/http/headers.h"
+#include "source/common/http/message_impl.h"
+#include "source/common/http/utility.h"
+#include "source/common/stats/symbol_table.h"
+#include "source/common/stats/utility.h"
 
-#include "test/mocks/upstream/mocks.h"
+#include "test/mocks/upstream/cluster_info.h"
 #include "test/test_common/global.h"
 #include "test/test_common/utility.h"
 
@@ -18,7 +19,7 @@ namespace Grpc {
 
 TEST(GrpcContextTest, ChargeStats) {
   NiceMock<Upstream::MockClusterInfo> cluster;
-  Stats::TestSymbolTable symbol_table_;
+  Stats::TestUtil::TestSymbolTable symbol_table_;
   Stats::StatNamePool pool(*symbol_table_);
   const Stats::StatName service = pool.add("service");
   const Stats::StatName method = pool.add("method");
@@ -65,16 +66,16 @@ TEST(GrpcContextTest, ChargeStats) {
 TEST(GrpcContextTest, ResolveServiceAndMethod) {
   std::string service;
   std::string method;
-  Http::RequestHeaderMapImpl headers;
+  Http::TestRequestHeaderMapImpl headers;
   headers.setPath("/service_name/method_name?a=b");
   const Http::HeaderEntry* path = headers.Path();
-  Stats::TestSymbolTable symbol_table;
+  Stats::TestUtil::TestSymbolTable symbol_table;
   ContextImpl context(*symbol_table);
   absl::optional<Context::RequestStatNames> request_names =
       context.resolveDynamicServiceAndMethod(path);
   EXPECT_TRUE(request_names);
-  EXPECT_EQ("service_name", symbol_table->toString(request_names->service_));
-  EXPECT_EQ("method_name", symbol_table->toString(request_names->method_));
+  EXPECT_EQ("service_name", absl::get<Stats::DynamicSavedName>(request_names->service_));
+  EXPECT_EQ("method_name", absl::get<Stats::DynamicSavedName>(request_names->method_));
   headers.setPath("");
   EXPECT_FALSE(context.resolveDynamicServiceAndMethod(path));
   headers.setPath("/");
@@ -85,6 +86,52 @@ TEST(GrpcContextTest, ResolveServiceAndMethod) {
   EXPECT_FALSE(context.resolveDynamicServiceAndMethod(path));
   headers.setPath("/service_name/");
   EXPECT_FALSE(context.resolveDynamicServiceAndMethod(path));
+}
+
+TEST(GrpcContextTest, ResolvedServiceAndMethodOutliveChangesInRequestNames) {
+  Http::TestRequestHeaderMapImpl headers;
+  headers.setPath("/service_name/method_name?a=b");
+  const Http::HeaderEntry* path = headers.Path();
+  Stats::TestUtil::TestSymbolTable symbol_table;
+  ContextImpl context(*symbol_table);
+
+  auto request_names = context.resolveDynamicServiceAndMethod(path);
+
+  EXPECT_TRUE(request_names);
+  EXPECT_EQ("service_name", absl::get<Stats::DynamicSavedName>(request_names->service_));
+  EXPECT_EQ("method_name", absl::get<Stats::DynamicSavedName>(request_names->method_));
+
+  headers.setPath("/service_name1/method1");
+  // old values stay the same
+  EXPECT_EQ("service_name", absl::get<Stats::DynamicSavedName>(request_names->service_));
+  EXPECT_EQ("method_name", absl::get<Stats::DynamicSavedName>(request_names->method_));
+
+  auto new_request_names = context.resolveDynamicServiceAndMethod(path);
+  EXPECT_EQ("service_name1", absl::get<Stats::DynamicSavedName>(new_request_names->service_));
+  EXPECT_EQ("method1", absl::get<Stats::DynamicSavedName>(new_request_names->method_));
+}
+
+TEST(GrpcContextTest, resolveDynamicServiceAndMethodWithDotReplaced) {
+  Http::TestRequestHeaderMapImpl headers;
+  headers.setPath("/foo.bar.zoo/method.name?a=b");
+  const Http::HeaderEntry* path = headers.Path();
+  Stats::TestUtil::TestSymbolTable symbol_table;
+  ContextImpl context(*symbol_table);
+  absl::optional<Context::RequestStatNames> request_names;
+  request_names = context.resolveDynamicServiceAndMethodWithDotReplaced(path);
+  EXPECT_TRUE(request_names);
+  EXPECT_EQ("foo_bar_zoo", absl::get<Stats::DynamicSavedName>(request_names->service_));
+  EXPECT_EQ("method.name", absl::get<Stats::DynamicSavedName>(request_names->method_));
+  headers.setPath("");
+  EXPECT_FALSE(context.resolveDynamicServiceAndMethodWithDotReplaced(path));
+  headers.setPath("/");
+  EXPECT_FALSE(context.resolveDynamicServiceAndMethodWithDotReplaced(path));
+  headers.setPath("//");
+  EXPECT_FALSE(context.resolveDynamicServiceAndMethodWithDotReplaced(path));
+  headers.setPath("/service_name");
+  EXPECT_FALSE(context.resolveDynamicServiceAndMethodWithDotReplaced(path));
+  headers.setPath("/service_name/");
+  EXPECT_FALSE(context.resolveDynamicServiceAndMethodWithDotReplaced(path));
 }
 
 } // namespace Grpc

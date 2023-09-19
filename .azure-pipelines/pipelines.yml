@@ -1,145 +1,112 @@
 trigger:
   branches:
     include:
-      - "master"
+    - "main"
+    - "release/v*"
   tags:
     include:
-      - "v*"
+    - "v*"
+
 
 # PR build config is manually overridden in Azure pipelines UI with different secrets
 pr: none
 
-jobs:
-  - job: format
-    dependsOn: [] # this removes the implicit dependency on previous stage and causes this to run in parallel.
-    pool:
-      vmImage: "ubuntu-16.04"
-    steps:
-      - task: CacheBeta@1
-        inputs:
-          key: "format | ./WORKSPACE | **/*.bzl"
-          path: $(Build.StagingDirectory)/repository_cache
 
-      - script: ci/run_envoy_docker.sh 'ci/check_and_fix_format.sh'
-        workingDirectory: $(Build.SourcesDirectory)
-        env:
-          ENVOY_DOCKER_BUILD_DIR: $(Build.StagingDirectory)
-          BAZEL_REMOTE_CACHE: grpcs://remotebuildexecution.googleapis.com
-          BAZEL_REMOTE_INSTANCE: projects/envoy-ci/instances/default_instance
-          GCP_SERVICE_ACCOUNT_KEY: $(GcpServiceAccountKey)
-        displayName: "Run check format scripts"
+variables:
+- name: agentUbuntu
+  value: ubuntu-22.04
 
-      - task: PublishBuildArtifacts@1
-        inputs:
-          pathtoPublish: "$(Build.StagingDirectory)/fix_format.diff"
-          artifactName: format
-        condition: failed()
+- name: isDev
+  # This must be checked/set in a `step` from the VERSION.txt file, in order to be useful
+  value: true
+- name: isMain
+  value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+- name: isReleaseBranch
+  value: $[startsWith(variables['Build.SourceBranch'], 'refs/heads/release/v')]
+- name: isTaggedRelease
+  value: $[startsWith(variables['Build.SourceBranch'], 'refs/tags/v')]
+- name: isStableBranch
+  # A release branch can be either `main` or a `release/v1.x` stable branch
+  value: $[or(eq(variables['isMain'], 'true'), eq(variables['isReleaseBranch'], 'true'))]
 
-  - job: release
-    displayName: "Linux-x64 release"
-    dependsOn: ["format"]
-    # For master builds, continue even if format fails
-    condition: and(not(canceled()), or(succeeded(), ne(variables['Build.Reason'], 'PullRequest')))
-    timeoutInMinutes: 360
-    pool:
-      vmImage: "ubuntu-16.04"
-    steps:
-      - template: bazel.yml
-        parameters:
-          ciTarget: bazel.release
+## CI runs
+# Any scheduled run
+- name: pipelineScheduled
+  value: ${{ eq(variables['Build.Reason'], 'Schedule') }}
+# Non-scheduled postsubmit run
+- name: pipelinePostsubmit
+  value: ${{ and(eq(variables['Build.DefinitionName'], 'envoy-postsubmit'), ne(variables.pipelineScheduled, true)) }}
+- name: pipelineCacheWarm
+  value: ${{ and(eq(variables['Build.DefinitionName'], 'envoy-presubmit'), ne(variables['Build.Reason'], 'PullRequest')) }}
+# Any other run (ie PRs)
+- name: pipelineDefault
+  value: ${{ and(ne(variables.pipelineScheduled, true), ne(variables.pipelinePostsubmit, true), ne(variables.pipelineCacheWarm, true)) }}
 
-  - job: bazel
-    displayName: "Linux-x64"
-    dependsOn: ["release"]
-    # For master builds, continue even if format fails
-    condition: and(not(canceled()), or(succeeded(), ne(variables['Build.Reason'], 'PullRequest')))
-    strategy:
-      maxParallel: 3
-      matrix:
-        gcc:
-          CI_TARGET: "bazel.gcc"
-        clang_tidy:
-          CI_TARGET: "bazel.clang_tidy"
-        asan:
-          CI_TARGET: "bazel.asan"
-        tsan:
-          CI_TARGET: "bazel.tsan"
-        compile_time_options:
-          CI_TARGET: "bazel.compile_time_options"
-    timeoutInMinutes: 360
-    pool:
-      vmImage: "Ubuntu 16.04"
-    steps:
-      - template: bazel.yml
-        parameters:
-          ciTarget: $(CI_TARGET)
+## Variable settings
+# Caches (tip: append a version suffix while testing caches)
+- name: cacheKeyName
+  value: envoy
+- name: cacheKeyVersion
+  value: v1
+- name: cacheKeyBazel
+  value: '.bazelversion | ./WORKSPACE | **/*.bzl, !mobile/**, !envoy-docs/**'
+- name: cacheKeyDocker
+  value: ".devcontainer/Dockerfile"
+# Docker build uses separate docker cache
+- name: cacheKeyDockerBuild
+  # VERSION.txt is included to refresh Docker images for release
+  value: '"publish_docker" | ci/Dockerfile-envoy | VERSION.txt'
+- name: cacheKeyDockerBuildVersion
+  value: v0
 
-  - job: docker
-    displayName: "Linux-x64 docker"
-    dependsOn: ["release"]
-    condition: and(succeeded(), eq(variables['PostSubmit'], 'true'), ne(variables['Build.Reason'], 'PullRequest'))
-    pool:
-      vmImage: "ubuntu-16.04"
-    steps:
-      - task: DownloadBuildArtifacts@0
-        inputs:
-          buildType: current
-          artifactName: "bazel.release"
-          itemPattern: "bazel.release/envoy_binary.tar.gz"
-          downloadType: single
-          targetPath: $(Build.StagingDirectory)
+- name: pathCacheTemp
+  value: /mnt/cache
+- name: pathDockerBind
+  value: /mnt/docker
 
-      - bash: |
-          set -e
-          tar zxf $(Build.StagingDirectory)/bazel.release/envoy_binary.tar.gz
-          ci/docker_build.sh
-          ci/docker_push.sh
-          ci/docker_tag.sh
-        workingDirectory: $(Build.SourcesDirectory)
-        env:
-          AZP_BRANCH: $(Build.SourceBranch)
-          CIRCLE_SHA1: $(Build.SourceVersion)
-          DOCKERHUB_USERNAME: $(DockerUsername)
-          DOCKERHUB_PASSWORD: $(DockerPassword)
+- name: authGithubSSHKeyPublic
+  value: "github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk="
 
-  - job: macOS
-    dependsOn: ["format"]
-    timeoutInMinutes: 360
-    pool:
-      vmImage: "macos-latest"
-    steps:
-      - script: ./ci/mac_ci_setup.sh
-        displayName: "Install dependencies"
 
-      - script: ./ci/mac_ci_steps.sh
-        displayName: "Run Mac CI"
-        env:
-          BAZEL_REMOTE_CACHE: grpcs://remotebuildexecution.googleapis.com
-          BAZEL_REMOTE_INSTANCE: projects/envoy-ci/instances/default_instance
-          GCP_SERVICE_ACCOUNT_KEY: $(GcpServiceAccountKey)
+stages:
 
-      - task: PublishTestResults@2
-        inputs:
-          testResultsFiles: "**/bazel-testlogs/**/test.xml"
-          testRunTitle: "macOS"
-        condition: always()
+# Presubmit/default
+- ${{ if eq(variables.pipelineDefault, true) }}:
+  - template: stages.yml
 
-  - job: Windows
-    dependsOn: ["format"]
-    timeoutInMinutes: 360
-    pool:
-      vmImage: "windows-latest"
-    steps:
-      - powershell: |
-          .\ci\windows_ci_setup.ps1
-          Write-Host "##vso[task.prependpath]$env:TOOLS_BIN_DIR"
-        displayName: "Install dependencies"
-        env:
-          TOOLS_BIN_DIR: $(Pipeline.Workspace)\bin
+# Scheduled run anywhere
+- ${{ if eq(variables.pipelineScheduled, true) }}:
+  - template: stages.yml
+    parameters:
+      cacheTestResults: false
 
-      - bash: ci/windows_ci_steps.sh
-        displayName: "Run Windows CI"
-        env:
-          TMPDIR: $(Agent.TempDirectory)
-          BAZEL_VC: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Enterprise\\VC"
-          BAZEL_SH: "C:\\Program Files\\Git\\bin\\bash.exe"
+# Cache warming in presubmit
+- ${{ if eq(variables.pipelineCacheWarm, true) }}:
+  - template: stages.yml
+    parameters:
+      buildStageDeps:
+      - env
+      checkStageDeps:
+      - env
+      concurrencyChecks: 10
+      macBuildStageDeps:
+      - env
+      windowsBuildStageDeps:
+      - env
+
+# Postsubmit main/release branches
+- ${{ if eq(variables.pipelinePostsubmit, true) }}:
+  - template: stages.yml
+    parameters:
+      # Build/publish can take longer in postsubmit, esp during release
+      timeoutDockerBuild: 720
+      timeoutDockerPublish: 30
+      buildStageDeps:
+      - env
+      checkStageDeps:
+      - env
+      concurrencyChecks: 10
+      macBuildStageDeps:
+      - env
+      windowsBuildStageDeps:
+      - env

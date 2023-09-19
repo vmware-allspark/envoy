@@ -1,8 +1,11 @@
 #pragma once
 
 #include <chrono>
+#include <memory>
 
 #include "envoy/grpc/async_client.h"
+
+#include "source/common/common/empty_string.h"
 
 namespace Envoy {
 namespace Grpc {
@@ -32,12 +35,14 @@ template <typename Request> class AsyncStream /* : public RawAsyncStream */ {
 public:
   AsyncStream() = default;
   AsyncStream(RawAsyncStream* stream) : stream_(stream) {}
-  AsyncStream(const AsyncStream& other) = default;
-  void sendMessage(const Request& request, bool end_stream) {
+  void sendMessage(const Protobuf::Message& request, bool end_stream) {
     Internal::sendMessageUntyped(stream_, std::move(request), end_stream);
   }
   void closeStream() { stream_->closeStream(); }
   void resetStream() { stream_->resetStream(); }
+  bool isAboveWriteBufferHighWatermark() const {
+    return stream_->isAboveWriteBufferHighWatermark();
+  }
   AsyncStream* operator->() { return this; }
   AsyncStream<Request> operator=(RawAsyncStream* stream) {
     stream_ = stream;
@@ -45,10 +50,13 @@ public:
   }
   bool operator==(RawAsyncStream* stream) const { return stream_ == stream; }
   bool operator!=(RawAsyncStream* stream) const { return stream_ != stream; }
+  const StreamInfo::StreamInfo& streamInfo() const { return stream_->streamInfo(); }
 
 private:
   RawAsyncStream* stream_{};
 };
+
+template <typename Response> using ResponsePtr = std::unique_ptr<Response>;
 
 /**
  * Convenience subclasses for AsyncRequestCallbacks.
@@ -56,11 +64,11 @@ private:
 template <typename Response> class AsyncRequestCallbacks : public RawAsyncRequestCallbacks {
 public:
   ~AsyncRequestCallbacks() override = default;
-  virtual void onSuccess(std::unique_ptr<Response>&& response, Tracing::Span& span) PURE;
+  virtual void onSuccess(ResponsePtr<Response>&& response, Tracing::Span& span) PURE;
 
 private:
   void onSuccessRaw(Buffer::InstancePtr&& response, Tracing::Span& span) override {
-    auto message = std::unique_ptr<Response>(dynamic_cast<Response*>(
+    auto message = ResponsePtr<Response>(dynamic_cast<Response*>(
         Internal::parseMessageUntyped(std::make_unique<Response>(), std::move(response))
             .release()));
     if (!message) {
@@ -77,11 +85,11 @@ private:
 template <typename Response> class AsyncStreamCallbacks : public RawAsyncStreamCallbacks {
 public:
   ~AsyncStreamCallbacks() override = default;
-  virtual void onReceiveMessage(std::unique_ptr<Response>&& message) PURE;
+  virtual void onReceiveMessage(ResponsePtr<Response>&& message) PURE;
 
 private:
   bool onReceiveMessageRaw(Buffer::InstancePtr&& response) override {
-    auto message = std::unique_ptr<Response>(dynamic_cast<Response*>(
+    auto message = ResponsePtr<Response>(dynamic_cast<Response*>(
         Internal::parseMessageUntyped(std::make_unique<Response>(), std::move(response))
             .release()));
     if (!message) {
@@ -96,6 +104,7 @@ template <typename Request, typename Response> class AsyncClient /* : public Raw
 public:
   AsyncClient() = default;
   AsyncClient(RawAsyncClientPtr&& client) : client_(std::move(client)) {}
+  AsyncClient(RawAsyncClientSharedPtr client) : client_(client) {}
   virtual ~AsyncClient() = default;
 
   virtual AsyncRequest* send(const Protobuf::MethodDescriptor& service_method,
@@ -105,6 +114,7 @@ public:
     return Internal::sendUntyped(client_.get(), service_method, request, callbacks, parent_span,
                                  options);
   }
+
   virtual AsyncStream<Request> start(const Protobuf::MethodDescriptor& service_method,
                                      AsyncStreamCallbacks<Response>& callbacks,
                                      const Http::AsyncClient::StreamOptions& options) {
@@ -112,12 +122,14 @@ public:
         Internal::startUntyped(client_.get(), service_method, callbacks, options));
   }
 
+  absl::string_view destination() { return client_->destination(); }
+
   AsyncClient* operator->() { return this; }
   void operator=(RawAsyncClientPtr&& client) { client_ = std::move(client); }
   void reset() { client_.reset(); }
 
 private:
-  RawAsyncClientPtr client_{};
+  RawAsyncClientSharedPtr client_{};
 };
 
 } // namespace Grpc

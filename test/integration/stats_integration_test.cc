@@ -2,14 +2,16 @@
 
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
 #include "envoy/config/core/v3/address.pb.h"
+#include "envoy/extensions/transport_sockets/tls/v3/cert.pb.h"
 #include "envoy/stats/scope.h"
 #include "envoy/stats/stats.h"
 
-#include "common/config/well_known_names.h"
-#include "common/memory/stats.h"
-#include "common/stats/symbol_table_creator.h"
+#include "source/common/config/well_known_names.h"
+#include "source/common/memory/stats.h"
 
 #include "test/common/stats/stat_test_utility.h"
+#include "test/config/integration/certs/clientcert_hash.h"
+#include "test/config/integration/certs/servercert_info.h"
 #include "test/config/utility.h"
 #include "test/integration/integration.h"
 #include "test/test_common/network_utility.h"
@@ -24,11 +26,6 @@ class StatsIntegrationTest : public testing::TestWithParam<Network::Address::IpV
                              public BaseIntegrationTest {
 public:
   StatsIntegrationTest() : BaseIntegrationTest(GetParam()) {}
-
-  void TearDown() override {
-    test_server_.reset();
-    fake_upstreams_.clear();
-  }
 
   void initialize() override { BaseIntegrationTest::initialize(); }
 };
@@ -51,6 +48,7 @@ TEST_P(StatsIntegrationTest, WithDefaultConfig) {
 }
 
 TEST_P(StatsIntegrationTest, WithoutDefaultTagExtractors) {
+  skip_tag_extraction_rule_check_ = true;
   config_helper_.addConfigModifier([&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
     bootstrap.mutable_stats_config()->mutable_use_all_default_tags()->set_value(false);
   });
@@ -58,6 +56,26 @@ TEST_P(StatsIntegrationTest, WithoutDefaultTagExtractors) {
 
   auto counter = test_server_->counter("http.config_test.rq_total");
   EXPECT_EQ(counter->tags().size(), 0);
+}
+
+// Regression test for https://github.com/envoyproxy/envoy/pull/21069 making
+// sure that the default error_level limits are not applied before runtime is
+// created. As described by the linked issue, this simply bypasses regex size checks.
+TEST_P(StatsIntegrationTest, DEPRECATED_FEATURE_TEST(WithLargeGoogleRE2Regex)) {
+  // This limit of 1000 will be ignored.
+  config_helper_.addRuntimeOverride("re2.max_program_size.error_level", "1000");
+  config_helper_.addConfigModifier([&](envoy::config::bootstrap::v3::Bootstrap& bootstrap) -> void {
+    auto pattern = bootstrap.mutable_stats_config()
+                       ->mutable_stats_matcher()
+                       ->mutable_inclusion_list()
+                       ->add_patterns();
+    pattern->mutable_safe_regex()->mutable_google_re2();
+    pattern->mutable_safe_regex()->set_regex(
+        "cluster.(metadata-cluster|iam-cluster|service-control-cluster|backend-cluster-sample-"
+        "backend-s3fctubhaq-uc.a.run.app_443).upstream_rq_(reset|timeout|[1-5]xx)|listener.*");
+  });
+  use_lds_ = false;
+  initialize();
 }
 
 TEST_P(StatsIntegrationTest, WithDefaultTagExtractors) {
@@ -137,6 +155,88 @@ TEST_P(StatsIntegrationTest, WithTagSpecifierWithFixedValue) {
   EXPECT_EQ(live->tags()[0].value_, "xxx");
 }
 
+TEST_P(StatsIntegrationTest, WithoutCert) {
+  initialize();
+
+  EXPECT_EQ(test_server_->gauge("server.days_until_first_cert_expiring")->value(),
+            std::numeric_limits<uint32_t>::max());
+}
+
+TEST_P(StatsIntegrationTest, WithExpiringCert) {
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    auto* transport_socket = bootstrap.mutable_static_resources()
+                                 ->mutable_listeners(0)
+                                 ->mutable_filter_chains(0)
+                                 ->mutable_transport_socket();
+    envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext tls_context;
+    auto* common_tls_context = tls_context.mutable_common_tls_context();
+    common_tls_context->add_alpn_protocols(Http::Utility::AlpnNames::get().Http11);
+
+    common_tls_context->mutable_validation_context_sds_secret_config()->set_name(
+        "validation_context");
+    common_tls_context->add_tls_certificate_sds_secret_configs()->set_name("server_cert");
+    transport_socket->set_name("envoy.transport_sockets.tls");
+    transport_socket->mutable_typed_config()->PackFrom(tls_context);
+
+    auto* secret = bootstrap.mutable_static_resources()->add_secrets();
+    secret->set_name("validation_context");
+    auto* validation_context = secret->mutable_validation_context();
+    validation_context->mutable_trusted_ca()->set_filename(
+        TestEnvironment::runfilesPath("test/config/integration/certs/cacert.pem"));
+    validation_context->add_verify_certificate_hash(TEST_CLIENT_CERT_HASH);
+
+    secret = bootstrap.mutable_static_resources()->add_secrets();
+    secret->set_name("server_cert");
+    auto* tls_certificate = secret->mutable_tls_certificate();
+    tls_certificate->mutable_certificate_chain()->set_filename(
+        TestEnvironment::runfilesPath("test/config/integration/certs/servercert.pem"));
+    tls_certificate->mutable_private_key()->set_filename(
+        TestEnvironment::runfilesPath("test/config/integration/certs/serverkey.pem"));
+  });
+
+  initialize();
+  auto cert_expiry = TestUtility::parseTime(TEST_SERVER_CERT_NOT_AFTER, "%b %d %H:%M:%S %Y GMT");
+  int64_t days_until_expiry = absl::ToInt64Hours(cert_expiry - absl::Now()) / 24;
+  EXPECT_EQ(test_server_->gauge("server.days_until_first_cert_expiring")->value(),
+            days_until_expiry);
+}
+
+TEST_P(StatsIntegrationTest, WithExpiredCert) {
+  config_helper_.addConfigModifier([](envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+    auto* transport_socket = bootstrap.mutable_static_resources()
+                                 ->mutable_listeners(0)
+                                 ->mutable_filter_chains(0)
+                                 ->mutable_transport_socket();
+    envoy::extensions::transport_sockets::tls::v3::DownstreamTlsContext tls_context;
+    auto* common_tls_context = tls_context.mutable_common_tls_context();
+    common_tls_context->add_alpn_protocols(Http::Utility::AlpnNames::get().Http11);
+
+    common_tls_context->mutable_validation_context_sds_secret_config()->set_name(
+        "validation_context");
+    common_tls_context->add_tls_certificate_sds_secret_configs()->set_name("server_cert");
+    transport_socket->set_name("envoy.transport_sockets.tls");
+    transport_socket->mutable_typed_config()->PackFrom(tls_context);
+
+    auto* secret = bootstrap.mutable_static_resources()->add_secrets();
+    secret->set_name("validation_context");
+    auto* validation_context = secret->mutable_validation_context();
+    validation_context->mutable_trusted_ca()->set_filename(
+        TestEnvironment::runfilesPath("test/config/integration/certs/cacert.pem"));
+    validation_context->add_verify_certificate_hash(TEST_CLIENT_CERT_HASH);
+
+    secret = bootstrap.mutable_static_resources()->add_secrets();
+    secret->set_name("server_cert");
+    auto* tls_certificate = secret->mutable_tls_certificate();
+    tls_certificate->mutable_certificate_chain()->set_filename(
+        TestEnvironment::runfilesPath("test/config/integration/certs/expired_cert.pem"));
+    tls_certificate->mutable_private_key()->set_filename(
+        TestEnvironment::runfilesPath("test/config/integration/certs/expired_key.pem"));
+  });
+
+  initialize();
+  EXPECT_EQ(test_server_->gauge("server.days_until_first_cert_expiring")->value(), 0);
+}
+
 // TODO(cmluciano) Refactor once https://github.com/envoyproxy/envoy/issues/5624 is solved
 // TODO(cmluciano) Add options to measure multiple workers & without stats
 // This class itself does not add additional tests. It is a helper for use in other tests measuring
@@ -144,7 +244,9 @@ TEST_P(StatsIntegrationTest, WithTagSpecifierWithFixedValue) {
 class ClusterMemoryTestHelper : public BaseIntegrationTest {
 public:
   ClusterMemoryTestHelper()
-      : BaseIntegrationTest(testing::TestWithParam<Network::Address::IpVersion>::GetParam()) {}
+      : BaseIntegrationTest(testing::TestWithParam<Network::Address::IpVersion>::GetParam()) {
+    use_real_stats_ = true;
+  }
 
   static size_t computeMemoryDelta(int initial_num_clusters, int initial_num_hosts,
                                    int final_num_clusters, int final_num_hosts, bool allow_stats) {
@@ -195,7 +297,6 @@ private:
           auto* socket_address = host->mutable_socket_address();
           socket_address->set_protocol(envoy::config::core::v3::SocketAddress::TCP);
           socket_address->set_address("0.0.0.0");
-          socket_address->set_port_value(80);
         }
       }
     });
@@ -204,93 +305,20 @@ private:
     return memory_test.consumedBytes();
   }
 };
+
 class ClusterMemoryTestRunner : public testing::TestWithParam<Network::Address::IpVersion> {
 protected:
-  Stats::TestUtil::SymbolTableCreatorTestPeer symbol_table_creator_test_peer_;
+  ClusterMemoryTestRunner()
+      : ip_version_(testing::TestWithParam<Network::Address::IpVersion>::GetParam()) {}
+
+  Network::Address::IpVersion ip_version_;
 };
 
 INSTANTIATE_TEST_SUITE_P(IpVersions, ClusterMemoryTestRunner,
                          testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
                          TestUtility::ipTestParamsToString);
 
-TEST_P(ClusterMemoryTestRunner, MemoryLargeClusterSizeWithFakeSymbolTable) {
-  symbol_table_creator_test_peer_.setUseFakeSymbolTables(true);
-
-  // A unique instance of ClusterMemoryTest allows for multiple runs of Envoy with
-  // differing configuration. This is necessary for measuring the memory consumption
-  // between the different instances within the same test.
-  const size_t m100 = ClusterMemoryTestHelper::computeMemoryDelta(1, 0, 101, 0, true);
-  const size_t m_per_cluster = (m100) / 100;
-
-  // Note: if you are increasing this golden value because you are adding a
-  // stat, please confirm that this will be generally useful to most Envoy
-  // users. Otherwise you are adding to the per-cluster memory overhead, which
-  // will be significant for Envoy installations that are massively
-  // multi-tenant.
-  //
-  // History of golden values:
-  //
-  // Date        PR       Bytes Per Cluster   Notes
-  //                      exact upper-bound
-  // ----------  -----    -----------------   -----
-  // 2019/03/20  6329     59015               Initial version
-  // 2019/04/12  6477     59576               Implementing Endpoint lease...
-  // 2019/04/23  6659     59512               Reintroduce dispatcher stats...
-  // 2019/04/24  6161     49415               Pack tags and tag extracted names
-  // 2019/05/07  6794     49957               Stats for excluded hosts in cluster
-  // 2019/04/27  6733     50213               Use SymbolTable API for HTTP codes
-  // 2019/05/31  6866     50157               libstdc++ upgrade in CI
-  // 2019/06/03  7199     49393               absl update
-  // 2019/06/06  7208     49650               make memory targets approximate
-  // 2019/06/17  7243     49412       49700   macros for exact/upper-bound memory checks
-  // 2019/06/29  7364     45685       46000   combine 2 levels of stat ref-counting into 1
-  // 2019/06/30  7428     42742       43000   remove stats multiple inheritance, inline HeapStatData
-  // 2019/07/06  7477     42742       43000   fork gauge representation to drop pending_increment_
-  // 2019/07/15  7555     42806       43000   static link libstdc++ in tests
-  // 2019/07/24  7503     43030       44000   add upstream filters to clusters
-  // 2019/08/13  7877     42838       44000   skip EdfScheduler creation if all host weights equal
-  // 2019/09/02  8118     42830       43000   Share symbol-tables in cluster/host stats.
-  // 2019/09/16  8100     42894       43000   Add transport socket matcher in cluster.
-  // 2019/09/25  8226     43022       44000   dns: enable dns failure refresh rate configuration
-  // 2019/09/30  8354     43310       44000   Implement transport socket match.
-  // 2019/10/17  8537     43308       44000   add new enum value HTTP3
-  // 2019/10/17  8484     43340       44000   stats: add unit support to histogram
-  // 2019/11/01  8859     43563       44000   build: switch to libc++ by default
-  // 2019/11/15  9040     43371       44000   build: update protobuf to 3.10.1
-  // 2019/11/15  9031     43403       44000   upstream: track whether cluster is local
-  // 2019/12/10  8779     42919       43500   use var-length coding for name length
-  // 2020/01/07  9069     43413       44000   upstream: Implement retry concurrency budgets
-  // 2020/01/07  9564     43445       44000   use RefcountPtr for CentralCache.
-  // 2020/01/09  8889     43509       44000   api: add UpstreamHttpProtocolOptions message
-  // 2020/01/09  9227     43637       44000   router: per-cluster histograms w/ timeout budget
-  // 2020/01/12  9633     43797       44104   config: support recovery of original message when
-  //                                          upgrading.
-  // 2020/02/13  10042    43797       44136   Metadata: Metadata are shared across different
-  //                                          clusters and hosts.
-  // 2020/03/16  9964     44085       44600   http2: support custom SETTINGS parameters.
-  // 2020/03/24  10501    44261       44600   upstream: upstream_rq_retry_limit_exceeded.
-  // 2020/04/02  10624    43356       44000   Use 100 clusters rather than 1000 to avoid timeouts
-  // 2020/04/07  10661    43349       44000   fix clang tidy on master
-
-  // Note: when adjusting this value: EXPECT_MEMORY_EQ is active only in CI
-  // 'release' builds, where we control the platform and tool-chain. So you
-  // will need to find the correct value only after failing CI and looking
-  // at the logs.
-  //
-  // On a local clang8/libstdc++/linux flow, the memory usage was observed in
-  // June 2019 to be 64 bytes higher than it is in CI/release. Your mileage may
-  // vary.
-  //
-  // If you encounter a failure here, please see
-  // https://github.com/envoyproxy/envoy/blob/master/source/docs/stats.md#stats-memory-tests
-  // for details on how to fix.
-  EXPECT_MEMORY_EQ(m_per_cluster, 43349);
-  EXPECT_MEMORY_LE(m_per_cluster, 44000);
-}
-
-TEST_P(ClusterMemoryTestRunner, MemoryLargeClusterSizeWithRealSymbolTable) {
-  symbol_table_creator_test_peer_.setUseFakeSymbolTables(false);
-
+TEST_P(ClusterMemoryTestRunner, MemoryLargeClusterSize) {
   // A unique instance of ClusterMemoryTest allows for multiple runs of Envoy with
   // differing configuration. This is necessary for measuring the memory consumption
   // between the different instances within the same test.
@@ -329,6 +357,28 @@ TEST_P(ClusterMemoryTestRunner, MemoryLargeClusterSizeWithRealSymbolTable) {
   // 2020/03/24  10501    36300       36800   upstream: upstream_rq_retry_limit_exceeded.
   // 2020/04/02  10624    35564       36000   Use 100 clusters rather than 1000 to avoid timeouts
   // 2020/04/07  10661    35557       36000   fix clang tidy on master
+  // 2020/04/23  10531    36281       36800   http: max stream duration upstream support.
+  // 2020/04/23  10661    36537       37000   per-listener connection limits
+  // 2020/05/05  10908    36345       36800   router: add InternalRedirectPolicy and predicate
+  // 2020/05/13  10531    36537       36800   Refactor resource manager
+  // 2020/05/20  11223    36603       36800   Add primary clusters tracking to cluster manager.
+  // 2020/06/10  11561    36603       36923   Make upstreams pluggable
+  // 2020/06/29  11751    36827       38000   Improve time complexity of removing callback handle.
+  // 2020/07/07  11252    37083       38000   Introduce Least Request LB active request bias config
+  // 2020/07/15  11748    37115       38000   Stream error on invalid messaging
+  // 2020/07/20  11559    36859       38000   stats: add histograms for request/response headers
+  //                                          and body sizes.
+  // 2020/07/21  12034    36923       38000   Add configurable histogram buckets.
+  // 2020/07/31  12035    37114       38000   Init manager store unready targets in hash map.
+  // 2020/08/10  12275    37061       38000   Re-organize tls histogram maps to improve continuity.
+  // 2020/08/11  12202    37061       38500   router: add new retry back-off strategy
+  // 2020/09/11  12973                38993   upstream: predictive preconnect
+  // 2020/10/02  13251                39326   switch to google tcmalloc
+  // 2021/08/15  17290                40349   add all host map to priority set for fast host
+  //                                          searching
+  // 2021/08/18  13176    40577       40700   Support slow start mode
+  // 2022/03/14                       42000   Fix test flakes
+  // 2022/10/27                       44000   Update tcmalloc
 
   // Note: when adjusting this value: EXPECT_MEMORY_EQ is active only in CI
   // 'release' builds, where we control the platform and tool-chain. So you
@@ -340,15 +390,19 @@ TEST_P(ClusterMemoryTestRunner, MemoryLargeClusterSizeWithRealSymbolTable) {
   // vary.
   //
   // If you encounter a failure here, please see
-  // https://github.com/envoyproxy/envoy/blob/master/source/docs/stats.md#stats-memory-tests
+  // https://github.com/envoyproxy/envoy/blob/main/source/docs/stats.md#stats-memory-tests
   // for details on how to fix.
-  EXPECT_MEMORY_EQ(m_per_cluster, 35557);
-  EXPECT_MEMORY_LE(m_per_cluster, 36000);
+  //
+  // We only run the exact test for ipv6 because ipv4 in some cases may allocate a
+  // different number of bytes. We still run the approximate test.
+  if (ip_version_ != Network::Address::IpVersion::v6) {
+    // https://github.com/envoyproxy/envoy/issues/12209
+    // EXPECT_MEMORY_EQ(m_per_cluster, 37061);
+  }
+  EXPECT_MEMORY_LE(m_per_cluster, 44000); // Round up to allow platform variations.
 }
 
 TEST_P(ClusterMemoryTestRunner, MemoryLargeHostSizeWithStats) {
-  symbol_table_creator_test_peer_.setUseFakeSymbolTables(false);
-
   // A unique instance of ClusterMemoryTest allows for multiple runs of Envoy with
   // differing configuration. This is necessary for measuring the memory consumption
   // between the different instances within the same test.
@@ -375,6 +429,9 @@ TEST_P(ClusterMemoryTestRunner, MemoryLargeHostSizeWithStats) {
   // 2020/02/13  10042    1363         1655   Metadata object are shared across different clusters
   //                                          and hosts.
   // 2020/04/02  10624    1380         1655   Use 100 clusters rather than 1000 to avoid timeouts
+  // 2020/09/10                        2000   Reduce flakes
+  // 2020/03/23                        3000   Reduce flakes
+  // 2023/07/21                        3005   Additional 4 bytes for new health status
 
   // Note: when adjusting this value: EXPECT_MEMORY_EQ is active only in CI
   // 'release' builds, where we control the platform and tool-chain. So you
@@ -382,10 +439,16 @@ TEST_P(ClusterMemoryTestRunner, MemoryLargeHostSizeWithStats) {
   // at the logs.
   //
   // If you encounter a failure here, please see
-  // https://github.com/envoyproxy/envoy/blob/master/source/docs/stats.md#stats-memory-tests
+  // https://github.com/envoyproxy/envoy/blob/main/source/docs/stats.md#stats-memory-tests
   // for details on how to fix.
-  EXPECT_MEMORY_EQ(m_per_host, 1380);
-  EXPECT_MEMORY_LE(m_per_host, 1655);
+  //
+  // We only run the exact test for ipv6 because ipv4 in some cases may allocate a
+  // different number of bytes. We still run the approximate test.
+  if (ip_version_ != Network::Address::IpVersion::v6) {
+    // https://github.com/envoyproxy/envoy/issues/12209
+    // EXPECT_MEMORY_EQ(m_per_host, 1380);
+  }
+  EXPECT_MEMORY_LE(m_per_host, 3005); // Round up to allow platform variations.
 }
 
 } // namespace

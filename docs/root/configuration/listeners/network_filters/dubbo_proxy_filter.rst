@@ -9,15 +9,15 @@ the metadata includes the basic request ID, request type, serialization type,
 and the required service name, method name, parameter name,
 and parameter value for routing.
 
-* :ref:`v2 API reference <envoy_api_msg_config.filter.network.dubbo_proxy.v2alpha1.DubboProxy>`
-* This filter should be configured with the name *envoy.filters.network.dubbo_proxy*.
+* This filter should be configured with the type URL ``type.googleapis.com/envoy.extensions.filters.network.dubbo_proxy.v3.DubboProxy``.
+* :ref:`v3 API reference <envoy_v3_api_msg_extensions.filters.network.dubbo_proxy.v3.DubboProxy>`
 
 .. _config_network_filters_dubbo_proxy_stats:
 
 Statistics
 ----------
 
-Every configured dubbo proxy filter has statistics rooted at *redis.<stat_prefix>.* with the
+Every configured dubbo proxy filter has statistics rooted at *dubbo.<stat_prefix>.* with the
 following statistics:
 
 .. csv-table::
@@ -60,20 +60,21 @@ the second step is to add your configuration, configuration method refer to the 
   - filters:
     - name: envoy.filters.network.dubbo_proxy
       typed_config:
-        "@type": type.googleapis.com/envoy.config.filter.network.dubbo_proxy.v2alpha1.DubboProxy
+        "@type": type.googleapis.com/envoy.extensions.filters.network.dubbo_proxy.v3.DubboProxy
         stat_prefix: dubbo_incomming_stats
         protocol_type: Dubbo
         serialization_type: Hessian2
-        route_config:
+        multiple_route_config:
           name: local_route
-          interface: org.apache.dubbo.demo.DemoService
-          routes:
-          - match:
-              method:
-                name:
-                  exact: sayHello
-            route:
-              cluster: user_service_dubbo_server
+          route_config:
+          - interface: org.apache.dubbo.demo.DemoService
+            routes:
+            - match:
+                method:
+                  name:
+                    exact: sayHello
+              route:
+                cluster: user_service_dubbo_server
         dubbo_filters:
         - name: envoy.filters.dubbo.testFilter
           typed_config:

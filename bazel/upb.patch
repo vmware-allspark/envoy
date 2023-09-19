@@ -1,27 +1,38 @@
-# https://github.com/protocolbuffers/upb/pull/226
-diff --git a/bazel/upb_proto_library.bzl b/bazel/upb_proto_library.bzl
-index f148745be..21ed34b48 100644
---- a/bazel/upb_proto_library.bzl
-+++ b/bazel/upb_proto_library.bzl
-@@ -8,7 +8,7 @@ load("@bazel_tools//tools/cpp:toolchain_utils.bzl", "find_cpp_toolchain")
+diff --git a/upb/message/tagged_ptr.h b/upb/message/tagged_ptr.h
+index 64602923..ae44146a 100644
+--- a/upb/message/tagged_ptr.h
++++ b/upb/message/tagged_ptr.h
+@@ -37,7 +37,14 @@
+ extern "C" {
+ #endif
  
- # copybara:strip_for_google3_begin
- load("@bazel_skylib//lib:versions.bzl", "versions")
--load("@bazel_version//:bazel_version.bzl", "bazel_version")
-+load("@upb_bazel_version//:bazel_version.bzl", "bazel_version")
- # copybara:strip_end
++#ifdef __clang__
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wtypedef-redefinition"
++#endif
+ typedef void upb_Message;
++#ifdef __clang__
++#pragma GCC diagnostic pop
++#endif
  
- # Generic support code #########################################################
-diff --git a/bazel/workspace_deps.bzl b/bazel/workspace_deps.bzl
-index 39bf524a7..aabbc3411 100644
---- a/bazel/workspace_deps.bzl
-+++ b/bazel/workspace_deps.bzl
-@@ -5,7 +5,7 @@ load("//bazel:repository_defs.bzl", "bazel_version_repository")
+ // When a upb_Message* is stored in a message, array, or map, it is stored in a
+ // tagged form.  If the tag bit is set, the referenced upb_Message is of type
+diff --git a/upb/mini_table/internal/message.h b/upb/mini_table/internal/message.h
+index 7e928d52..c652077a 100644
+--- a/upb/mini_table/internal/message.h
++++ b/upb/mini_table/internal/message.h
+@@ -33,7 +33,14 @@
+ // Must be last.
+ #include "upb/port/def.inc"
  
- def upb_deps():
-     bazel_version_repository(
--        name = "bazel_version",
-+        name = "upb_bazel_version",
-     )
++#ifdef __clang__
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wtypedef-redefinition"
++#endif
+ typedef void upb_Message;
++#ifdef __clang__
++#pragma GCC diagnostic pop
++#endif
  
-     git_repository(
+ struct upb_Decoder;
+ typedef const char* _upb_FieldParser(struct upb_Decoder* d, const char* ptr,

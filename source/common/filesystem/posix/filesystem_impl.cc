@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -11,10 +12,12 @@
 
 #include "envoy/common/exception.h"
 
-#include "common/common/assert.h"
-#include "common/common/fmt.h"
-#include "common/common/logger.h"
-#include "common/filesystem/filesystem_impl.h"
+#include "source/common/common/assert.h"
+#include "source/common/common/fmt.h"
+#include "source/common/common/logger.h"
+#include "source/common/common/utility.h"
+#include "source/common/filesystem/filesystem_impl.h"
+#include "source/common/runtime/runtime_features.h"
 
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
@@ -24,18 +27,193 @@ namespace Filesystem {
 
 FileImplPosix::~FileImplPosix() {
   if (isOpen()) {
-    const Api::IoCallBoolResult result = close();
-    ASSERT(result.rc_);
+    // Explicit version of close because virtual calls in destructors are ambiguous.
+    const Api::IoCallBoolResult result = FileImplPosix::close();
+    ASSERT(result.return_value_);
   }
 }
 
-void FileImplPosix::openFile(FlagSet in) {
-  const auto flags_and_mode = translateFlag(in);
-  fd_ = ::open(path_.c_str(), flags_and_mode.flags_, flags_and_mode.mode_);
+TmpFileImplPosix::~TmpFileImplPosix() {
+  if (isOpen()) {
+    // Explicit version of close because virtual calls in destructors are ambiguous.
+    // (We have to duplicate the destructor to ensure the overridden close is called.)
+    const Api::IoCallBoolResult result = TmpFileImplPosix::close();
+    ASSERT(result.return_value_);
+  }
 }
 
-ssize_t FileImplPosix::writeFile(absl::string_view buffer) {
-  return ::write(fd_, buffer.data(), buffer.size());
+Api::IoCallBoolResult FileImplPosix::open(FlagSet in) {
+  if (isOpen()) {
+    return resultSuccess(true);
+  }
+
+  const auto flags_and_mode = translateFlag(in);
+  fd_ = ::open(path().c_str(), flags_and_mode.flags_, flags_and_mode.mode_);
+  return fd_ != -1 ? resultSuccess(true) : resultFailure(false, errno);
+}
+
+Api::IoCallBoolResult TmpFileImplPosix::open(FlagSet in) {
+  if (isOpen()) {
+    return resultSuccess(true);
+  }
+
+  const auto flags_and_mode = translateFlag(in);
+#ifdef O_TMPFILE
+  // Try to create a temp file with no name. Only some file systems support this.
+  fd_ =
+      ::open(path().c_str(), (flags_and_mode.flags_ & ~O_CREAT) | O_TMPFILE, flags_and_mode.mode_);
+  if (fd_ != -1) {
+    return resultSuccess(true);
+  }
+#endif
+  // If we couldn't do a nameless temp file, open a named temp file.
+  return openNamedTmpFile(flags_and_mode);
+}
+
+Api::IoCallBoolResult TmpFileImplPosix::openNamedTmpFile(FlagsAndMode flags_and_mode,
+                                                         bool with_unlink) {
+  for (int tries = 5; tries > 0; tries--) {
+    std::string try_path = generateTmpFilePath(path());
+    fd_ = ::open(try_path.c_str(), flags_and_mode.flags_, flags_and_mode.mode_);
+    if (fd_ != -1) {
+      // Try to unlink the temp file while it's still open. Again this only works on
+      // a (different) subset of file systems.
+      if (!with_unlink || ::unlink(try_path.c_str()) != 0) {
+        // If we couldn't unlink it, set tmp_file_path_, to unlink after close.
+        tmp_file_path_ = try_path;
+      }
+      return resultSuccess(true);
+    }
+  }
+  return resultFailure(false, errno);
+}
+
+Api::IoCallSizeResult FileImplPosix::write(absl::string_view buffer) {
+  const ssize_t rc = ::write(fd_, buffer.data(), buffer.size());
+  return rc != -1 ? resultSuccess(rc) : resultFailure(rc, errno);
+};
+
+Api::IoCallBoolResult FileImplPosix::close() {
+  ASSERT(isOpen());
+  int rc = ::close(fd_);
+  fd_ = -1;
+  return (rc != -1) ? resultSuccess(true) : resultFailure(false, errno);
+}
+
+Api::IoCallBoolResult TmpFileImplPosix::close() {
+  ASSERT(isOpen());
+  int rc = ::close(fd_);
+  fd_ = -1;
+  int rc2 = tmp_file_path_.empty() ? 0 : ::unlink(tmp_file_path_.c_str());
+  return (rc != -1 && rc2 != -1) ? resultSuccess(true) : resultFailure(false, errno);
+}
+
+Api::IoCallSizeResult FileImplPosix::pread(void* buf, uint64_t count, uint64_t offset) {
+  ASSERT(isOpen());
+  ssize_t rc = ::pread(fd_, buf, count, offset);
+  return (rc == -1) ? resultFailure(rc, errno) : resultSuccess(rc);
+}
+
+Api::IoCallSizeResult FileImplPosix::pwrite(const void* buf, uint64_t count, uint64_t offset) {
+  ASSERT(isOpen());
+  ssize_t rc = ::pwrite(fd_, buf, count, offset);
+  return (rc == -1) ? resultFailure(rc, errno) : resultSuccess(rc);
+}
+
+static FileType typeFromStat(const struct stat& s) {
+  if (S_ISDIR(s.st_mode)) {
+    return FileType::Directory;
+  }
+  if (S_ISREG(s.st_mode)) {
+    return FileType::Regular;
+  }
+  return FileType::Other;
+}
+
+static constexpr absl::optional<SystemTime> systemTimeFromTimespec(const struct timespec& t) {
+  if (t.tv_sec == 0) {
+    return absl::nullopt;
+  }
+  return timespecToChrono(t);
+}
+
+static FileInfo infoFromStat(absl::string_view path, const struct stat& s, FileType type) {
+  return {
+      std::string{InstanceImplPosix().splitPathFromFilename(path).file_},
+      s.st_size,
+      type,
+#ifdef _DARWIN_FEATURE_64_BIT_INODE
+      systemTimeFromTimespec(s.st_ctimespec),
+      systemTimeFromTimespec(s.st_atimespec),
+      systemTimeFromTimespec(s.st_mtimespec),
+#else
+      systemTimeFromTimespec(s.st_ctim),
+      systemTimeFromTimespec(s.st_atim),
+      systemTimeFromTimespec(s.st_mtim),
+#endif
+  };
+}
+
+static FileInfo infoFromStat(absl::string_view path, const struct stat& s) {
+  return infoFromStat(path, s, typeFromStat(s));
+}
+
+Api::IoCallResult<FileInfo> FileImplPosix::info() {
+  ASSERT(isOpen());
+  struct stat s;
+  if (::fstat(fd_, &s) != 0) {
+    return resultFailure<FileInfo>({}, errno);
+  }
+  return resultSuccess(infoFromStat(path(), s));
+}
+
+Api::IoCallResult<FileInfo> InstanceImplPosix::stat(absl::string_view path) {
+  struct stat s;
+  std::string full_path{path};
+  if (::stat(full_path.c_str(), &s) != 0) {
+    if (errno == ENOENT) {
+      if (::lstat(full_path.c_str(), &s) == 0 && S_ISLNK(s.st_mode)) {
+        // Special case. This directory entity is a symlink,
+        // but the reference is broken as the target could not be stat()'ed.
+        // After confirming this with an lstat, treat this file entity as
+        // a regular file, which may be unlink()'ed.
+        return resultSuccess(infoFromStat(path, s, FileType::Regular));
+      }
+    }
+    return resultFailure<FileInfo>({}, errno);
+  }
+  return resultSuccess(infoFromStat(path, s));
+}
+
+Api::IoCallBoolResult InstanceImplPosix::createPath(absl::string_view path) {
+  // Ideally we could just use std::filesystem::create_directories for this,
+  // identical to ../win32/filesystem_impl.cc, but the OS version used in mobile
+  // CI doesn't support it, so we have to do recursive path creation manually.
+  while (!path.empty() && path.back() == '/') {
+    path.remove_suffix(1);
+  }
+  if (directoryExists(std::string{path})) {
+    return resultSuccess(false);
+  }
+  absl::string_view subpath = path;
+  do {
+    size_t slashpos = subpath.find_last_of('/');
+    if (slashpos == absl::string_view::npos) {
+      return resultFailure(false, ENOENT);
+    }
+    subpath = subpath.substr(0, slashpos);
+  } while (!directoryExists(std::string{subpath}));
+  // We're now at the most-nested directory that already exists.
+  // Time to create paths recursively.
+  while (subpath != path) {
+    size_t slashpos = path.find_first_of('/', subpath.size() + 2);
+    subpath = (slashpos == absl::string_view::npos) ? path : path.substr(0, slashpos);
+    std::string dir_to_create{subpath};
+    if (mkdir(dir_to_create.c_str(), 0777)) {
+      return resultFailure(false, errno);
+    }
+  }
+  return resultSuccess(true);
 }
 
 FileImplPosix::FlagsAndMode FileImplPosix::translateFlag(FlagSet in) {
@@ -48,6 +226,8 @@ FileImplPosix::FlagsAndMode FileImplPosix::translateFlag(FlagSet in) {
 
   if (in.test(File::Operation::Append)) {
     out |= O_APPEND;
+  } else if (in.test(File::Operation::Write) && !in.test(File::Operation::KeepExistingData)) {
+    out |= O_TRUNC;
   }
 
   if (in.test(File::Operation::Read) && in.test(File::Operation::Write)) {
@@ -61,10 +241,22 @@ FileImplPosix::FlagsAndMode FileImplPosix::translateFlag(FlagSet in) {
   return {out, mode};
 }
 
-bool FileImplPosix::closeFile() { return ::close(fd_) != -1; }
-
-FilePtr InstanceImplPosix::createFile(const std::string& path) {
-  return std::make_unique<FileImplPosix>(path);
+FilePtr InstanceImplPosix::createFile(const FilePathAndType& file_info) {
+  switch (file_info.file_type_) {
+  case DestinationType::File:
+    return std::make_unique<FileImplPosix>(file_info);
+  case DestinationType::TmpFile:
+    if (!file_info.path_.empty() && file_info.path_.back() == '/') {
+      return std::make_unique<TmpFileImplPosix>(FilePathAndType{
+          DestinationType::TmpFile, file_info.path_.substr(0, file_info.path_.size() - 1)});
+    }
+    return std::make_unique<TmpFileImplPosix>(file_info);
+  case DestinationType::Stderr:
+    return std::make_unique<FileImplPosix>(FilePathAndType{DestinationType::Stderr, "/dev/stderr"});
+  case DestinationType::Stdout:
+    return std::make_unique<FileImplPosix>(FilePathAndType{DestinationType::Stdout, "/dev/stdout"});
+  }
+  return nullptr; // for gcc
 }
 
 bool InstanceImplPosix::fileExists(const std::string& path) {
@@ -94,8 +286,6 @@ std::string InstanceImplPosix::fileReadToEnd(const std::string& path) {
   if (illegalPath(path)) {
     throw EnvoyException(absl::StrCat("Invalid path: ", path));
   }
-
-  std::ios::sync_with_stdio(false);
 
   std::ifstream file(path);
   if (file.fail()) {
@@ -127,16 +317,16 @@ bool InstanceImplPosix::illegalPath(const std::string& path) {
   // _before_ canonicalizing the path is that different unix flavors implement
   // /dev/fd/* differently, for example on linux they are symlinks to /dev/pts/*
   // which are symlinks to /proc/self/fds/. On BSD (and darwin) they are not
-  // symlinks at all. To avoid lots of platform, specifics, we whitelist
+  // symlinks at all. To avoid lots of platform, specifics, we allowlist
   // /dev/fd/* _before_ resolving the canonical path.
   if (absl::StartsWith(path, "/dev/fd/")) {
     return false;
   }
 
   const Api::SysCallStringResult canonical_path = canonicalPath(path);
-  if (canonical_path.rc_.empty()) {
+  if (canonical_path.return_value_.empty()) {
     ENVOY_LOG_MISC(debug, "Unable to determine canonical path for {}: {}", path,
-                   ::strerror(canonical_path.errno_));
+                   errorDetails(canonical_path.errno_));
     return true;
   }
 
@@ -145,9 +335,9 @@ bool InstanceImplPosix::illegalPath(const std::string& path) {
   // platform in the future, growing these or relaxing some constraints (e.g.
   // there are valid reasons to go via /proc for file paths).
   // TODO(htuch): Optimize this as a hash lookup if we grow any further.
-  if (absl::StartsWith(canonical_path.rc_, "/dev") ||
-      absl::StartsWith(canonical_path.rc_, "/sys") ||
-      absl::StartsWith(canonical_path.rc_, "/proc")) {
+  if (absl::StartsWith(canonical_path.return_value_, "/dev") ||
+      absl::StartsWith(canonical_path.return_value_, "/sys") ||
+      absl::StartsWith(canonical_path.return_value_, "/proc")) {
     return true;
   }
   return false;

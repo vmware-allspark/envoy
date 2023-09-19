@@ -1,23 +1,25 @@
-#include "common/grpc/common.h"
+#include "source/common/grpc/common.h"
 
 #include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <string>
 
-#include "common/buffer/buffer_impl.h"
-#include "common/buffer/zero_copy_input_stream_impl.h"
-#include "common/common/assert.h"
-#include "common/common/base64.h"
-#include "common/common/empty_string.h"
-#include "common/common/enum_to_int.h"
-#include "common/common/fmt.h"
-#include "common/common/macros.h"
-#include "common/common/utility.h"
-#include "common/http/headers.h"
-#include "common/http/message_impl.h"
-#include "common/http/utility.h"
-#include "common/protobuf/protobuf.h"
+#include "source/common/buffer/buffer_impl.h"
+#include "source/common/buffer/zero_copy_input_stream_impl.h"
+#include "source/common/common/assert.h"
+#include "source/common/common/base64.h"
+#include "source/common/common/empty_string.h"
+#include "source/common/common/enum_to_int.h"
+#include "source/common/common/fmt.h"
+#include "source/common/common/macros.h"
+#include "source/common/common/safe_memcpy.h"
+#include "source/common/common/utility.h"
+#include "source/common/http/header_utility.h"
+#include "source/common/http/headers.h"
+#include "source/common/http/message_impl.h"
+#include "source/common/http/utility.h"
+#include "source/common/protobuf/protobuf.h"
 
 #include "absl/container/fixed_array.h"
 #include "absl/strings/match.h"
@@ -26,18 +28,58 @@ namespace Envoy {
 namespace Grpc {
 
 bool Common::hasGrpcContentType(const Http::RequestOrResponseHeaderMap& headers) {
-  const Http::HeaderEntry* content_type = headers.ContentType();
+  const absl::string_view content_type = headers.getContentTypeValue();
   // Content type is gRPC if it is exactly "application/grpc" or starts with
   // "application/grpc+". Specifically, something like application/grpc-web is not gRPC.
-  return content_type != nullptr &&
-         absl::StartsWith(content_type->value().getStringView(),
-                          Http::Headers::get().ContentTypeValues.Grpc) &&
-         (content_type->value().size() == Http::Headers::get().ContentTypeValues.Grpc.size() ||
-          content_type->value()
-                  .getStringView()[Http::Headers::get().ContentTypeValues.Grpc.size()] == '+');
+  return absl::StartsWith(content_type, Http::Headers::get().ContentTypeValues.Grpc) &&
+         (content_type.size() == Http::Headers::get().ContentTypeValues.Grpc.size() ||
+          content_type[Http::Headers::get().ContentTypeValues.Grpc.size()] == '+');
 }
 
-bool Common::isGrpcResponseHeader(const Http::ResponseHeaderMap& headers, bool end_stream) {
+bool Common::hasConnectProtocolVersionHeader(const Http::RequestOrResponseHeaderMap& headers) {
+  return !headers.get(Http::CustomHeaders::get().ConnectProtocolVersion).empty();
+}
+
+bool Common::hasConnectStreamingContentType(const Http::RequestOrResponseHeaderMap& headers) {
+  // Consider the request a connect request if the content type starts with "application/connect+".
+  static constexpr absl::string_view connect_prefix{"application/connect+"};
+  const absl::string_view content_type = headers.getContentTypeValue();
+  return absl::StartsWith(content_type, connect_prefix);
+}
+
+bool Common::hasProtobufContentType(const Http::RequestOrResponseHeaderMap& headers) {
+  return headers.getContentTypeValue() == Http::Headers::get().ContentTypeValues.Protobuf;
+}
+
+bool Common::isGrpcRequestHeaders(const Http::RequestHeaderMap& headers) {
+  if (!headers.Path()) {
+    return false;
+  }
+  return hasGrpcContentType(headers);
+}
+
+bool Common::isConnectRequestHeaders(const Http::RequestHeaderMap& headers) {
+  if (!headers.Path()) {
+    return false;
+  }
+  return hasConnectProtocolVersionHeader(headers);
+}
+
+bool Common::isConnectStreamingRequestHeaders(const Http::RequestHeaderMap& headers) {
+  if (!headers.Path()) {
+    return false;
+  }
+  return hasConnectStreamingContentType(headers);
+}
+
+bool Common::isProtobufRequestHeaders(const Http::RequestHeaderMap& headers) {
+  if (!headers.Path()) {
+    return false;
+  }
+  return hasProtobufContentType(headers);
+}
+
+bool Common::isGrpcResponseHeaders(const Http::ResponseHeaderMap& headers, bool end_stream) {
   if (end_stream) {
     // Trailers-only response, only grpc-status is required.
     return headers.GrpcStatus() != nullptr;
@@ -48,15 +90,22 @@ bool Common::isGrpcResponseHeader(const Http::ResponseHeaderMap& headers, bool e
   return hasGrpcContentType(headers);
 }
 
+bool Common::isConnectStreamingResponseHeaders(const Http::ResponseHeaderMap& headers) {
+  if (Http::Utility::getResponseStatus(headers) != enumToInt(Http::Code::OK)) {
+    return false;
+  }
+  return hasConnectStreamingContentType(headers);
+}
+
 absl::optional<Status::GrpcStatus>
 Common::getGrpcStatus(const Http::ResponseHeaderOrTrailerMap& trailers, bool allow_user_defined) {
-  const Http::HeaderEntry* grpc_status_header = trailers.GrpcStatus();
+  const absl::string_view grpc_status_header = trailers.getGrpcStatusValue();
   uint64_t grpc_status_code;
 
-  if (!grpc_status_header || grpc_status_header->value().empty()) {
+  if (grpc_status_header.empty()) {
     return absl::nullopt;
   }
-  if (!absl::SimpleAtoi(grpc_status_header->value().getStringView(), &grpc_status_code) ||
+  if (!absl::SimpleAtoi(grpc_status_header, &grpc_status_code) ||
       (grpc_status_code > Status::WellKnownGrpcStatus::MaximumKnown && !allow_user_defined)) {
     return {Status::WellKnownGrpcStatus::InvalidCode};
   }
@@ -74,21 +123,18 @@ absl::optional<Status::GrpcStatus> Common::getGrpcStatus(const Http::ResponseTra
   //   1. trailers gRPC status, if it exists.
   //   2. headers gRPC status, if it exists.
   //   3. Inferred from info HTTP status, if it exists.
-  const std::array<absl::optional<Grpc::Status::GrpcStatus>, 3> optional_statuses = {{
-      {Grpc::Common::getGrpcStatus(trailers, allow_user_defined)},
-      {Grpc::Common::getGrpcStatus(headers, allow_user_defined)},
-      {info.responseCode() ? absl::optional<Grpc::Status::GrpcStatus>(
-                                 Grpc::Utility::httpToGrpcStatus(info.responseCode().value()))
-                           : absl::nullopt},
-  }};
-
-  for (const auto& optional_status : optional_statuses) {
-    if (optional_status.has_value()) {
-      return optional_status;
-    }
+  absl::optional<Grpc::Status::GrpcStatus> optional_status;
+  optional_status = Grpc::Common::getGrpcStatus(trailers, allow_user_defined);
+  if (optional_status.has_value()) {
+    return optional_status;
   }
-
-  return absl::nullopt;
+  optional_status = Grpc::Common::getGrpcStatus(headers, allow_user_defined);
+  if (optional_status.has_value()) {
+    return optional_status;
+  }
+  return info.responseCode() ? absl::optional<Grpc::Status::GrpcStatus>(
+                                   Grpc::Utility::httpToGrpcStatus(info.responseCode().value()))
+                             : absl::nullopt;
 }
 
 std::string Common::getGrpcMessage(const Http::ResponseHeaderOrTrailerMap& trailers) {
@@ -98,13 +144,14 @@ std::string Common::getGrpcMessage(const Http::ResponseHeaderOrTrailerMap& trail
 
 absl::optional<google::rpc::Status>
 Common::getGrpcStatusDetailsBin(const Http::HeaderMap& trailers) {
-  const Http::HeaderEntry* details_header = trailers.get(Http::Headers::get().GrpcStatusDetailsBin);
-  if (!details_header) {
+  const auto details_header = trailers.get(Http::Headers::get().GrpcStatusDetailsBin);
+  if (details_header.empty()) {
     return absl::nullopt;
   }
 
   // Some implementations use non-padded base64 encoding for grpc-status-details-bin.
-  auto decoded_value = Base64::decodeWithoutPadding(details_header->value().getStringView());
+  // This is effectively a trusted header so using the first value is fine.
+  auto decoded_value = Base64::decodeWithoutPadding(details_header[0]->value().getStringView());
   if (decoded_value.empty()) {
     return absl::nullopt;
   }
@@ -125,58 +172,58 @@ Buffer::InstancePtr Common::serializeToGrpcFrame(const Protobuf::Message& messag
   Buffer::InstancePtr body(new Buffer::OwnedImpl());
   const uint32_t size = message.ByteSize();
   const uint32_t alloc_size = size + 5;
-  Buffer::RawSlice iovec;
-  body->reserve(alloc_size, &iovec, 1);
-  ASSERT(iovec.len_ >= alloc_size);
-  iovec.len_ = alloc_size;
-  uint8_t* current = reinterpret_cast<uint8_t*>(iovec.mem_);
+  auto reservation = body->reserveSingleSlice(alloc_size);
+  ASSERT(reservation.slice().len_ >= alloc_size);
+  uint8_t* current = reinterpret_cast<uint8_t*>(reservation.slice().mem_);
   *current++ = 0; // flags
   const uint32_t nsize = htonl(size);
-  std::memcpy(current, reinterpret_cast<const void*>(&nsize), sizeof(uint32_t));
+  safeMemcpyUnsafeDst(current, &nsize);
   current += sizeof(uint32_t);
   Protobuf::io::ArrayOutputStream stream(current, size, -1);
   Protobuf::io::CodedOutputStream codec_stream(&stream);
   message.SerializeWithCachedSizes(&codec_stream);
-  body->commit(&iovec, 1);
+  reservation.commit(alloc_size);
   return body;
 }
 
 Buffer::InstancePtr Common::serializeMessage(const Protobuf::Message& message) {
   auto body = std::make_unique<Buffer::OwnedImpl>();
   const uint32_t size = message.ByteSize();
-  Buffer::RawSlice iovec;
-  body->reserve(size, &iovec, 1);
-  ASSERT(iovec.len_ >= size);
-  iovec.len_ = size;
-  uint8_t* current = reinterpret_cast<uint8_t*>(iovec.mem_);
+  auto reservation = body->reserveSingleSlice(size);
+  ASSERT(reservation.slice().len_ >= size);
+  uint8_t* current = reinterpret_cast<uint8_t*>(reservation.slice().mem_);
   Protobuf::io::ArrayOutputStream stream(current, size, -1);
   Protobuf::io::CodedOutputStream codec_stream(&stream);
   message.SerializeWithCachedSizes(&codec_stream);
-  body->commit(&iovec, 1);
+  reservation.commit(size);
   return body;
 }
 
-std::chrono::milliseconds Common::getGrpcTimeout(const Http::RequestHeaderMap& request_headers) {
-  std::chrono::milliseconds timeout(0);
+absl::optional<std::chrono::milliseconds>
+Common::getGrpcTimeout(const Http::RequestHeaderMap& request_headers) {
   const Http::HeaderEntry* header_grpc_timeout_entry = request_headers.GrpcTimeout();
+  std::chrono::milliseconds timeout;
   if (header_grpc_timeout_entry) {
-    uint64_t grpc_timeout;
-    // TODO(dnoe): Migrate to pure string_view (#6580)
-    std::string grpc_timeout_string(header_grpc_timeout_entry->value().getStringView());
-    const char* unit = StringUtil::strtoull(grpc_timeout_string.c_str(), grpc_timeout);
-    if (unit != nullptr && *unit != '\0') {
-      switch (*unit) {
+    int64_t grpc_timeout;
+    absl::string_view timeout_entry = header_grpc_timeout_entry->value().getStringView();
+    if (timeout_entry.empty()) {
+      // Must be of the form TimeoutValue TimeoutUnit. See
+      // https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#requests.
+      return absl::nullopt;
+    }
+    // TimeoutValue must be a positive integer of at most 8 digits.
+    if (absl::SimpleAtoi(timeout_entry.substr(0, timeout_entry.size() - 1), &grpc_timeout) &&
+        grpc_timeout >= 0 && static_cast<uint64_t>(grpc_timeout) <= MAX_GRPC_TIMEOUT_VALUE) {
+      const char unit = timeout_entry[timeout_entry.size() - 1];
+      switch (unit) {
       case 'H':
-        timeout = std::chrono::hours(grpc_timeout);
-        break;
+        return std::chrono::hours(grpc_timeout);
       case 'M':
-        timeout = std::chrono::minutes(grpc_timeout);
-        break;
+        return std::chrono::minutes(grpc_timeout);
       case 'S':
-        timeout = std::chrono::seconds(grpc_timeout);
-        break;
+        return std::chrono::seconds(grpc_timeout);
       case 'm':
-        timeout = std::chrono::milliseconds(grpc_timeout);
+        return std::chrono::milliseconds(grpc_timeout);
         break;
       case 'u':
         timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -184,18 +231,18 @@ std::chrono::milliseconds Common::getGrpcTimeout(const Http::RequestHeaderMap& r
         if (timeout < std::chrono::microseconds(grpc_timeout)) {
           timeout++;
         }
-        break;
+        return timeout;
       case 'n':
         timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::nanoseconds(grpc_timeout));
         if (timeout < std::chrono::nanoseconds(grpc_timeout)) {
           timeout++;
         }
-        break;
+        return timeout;
       }
     }
   }
-  return timeout;
+  return absl::nullopt;
 }
 
 void Common::toGrpcTimeout(const std::chrono::milliseconds& timeout,
@@ -203,7 +250,6 @@ void Common::toGrpcTimeout(const std::chrono::milliseconds& timeout,
   uint64_t time = timeout.count();
   static const char units[] = "mSMH";
   const char* unit = units; // start with milliseconds
-  static constexpr size_t MAX_GRPC_TIMEOUT_VALUE = 99999999;
   if (time > MAX_GRPC_TIMEOUT_VALUE) {
     time /= 1000; // Convert from milliseconds to seconds
     unit++;
@@ -220,13 +266,13 @@ void Common::toGrpcTimeout(const std::chrono::milliseconds& timeout,
 }
 
 Http::RequestMessagePtr
-Common::prepareHeaders(const std::string& upstream_cluster, const std::string& service_full_name,
+Common::prepareHeaders(const std::string& host_name, const std::string& service_full_name,
                        const std::string& method_name,
                        const absl::optional<std::chrono::milliseconds>& timeout) {
   Http::RequestMessagePtr message(new Http::RequestMessageImpl());
   message->headers().setReferenceMethod(Http::Headers::get().MethodValues.Post);
   message->headers().setPath(absl::StrCat("/", service_full_name, "/", method_name));
-  message->headers().setHost(upstream_cluster);
+  message->headers().setHost(host_name);
   // According to https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md TE should appear
   // before Timeout and ContentType.
   message->headers().setReferenceTE(Http::Headers::get().TEValues.Trailers);
@@ -288,7 +334,7 @@ void Common::prependGrpcFrameHeader(Buffer::Instance& buffer) {
   std::array<char, 5> header;
   header[0] = 0; // flags
   const uint32_t nsize = htonl(buffer.length());
-  std::memcpy(&header[1], reinterpret_cast<const void*>(&nsize), sizeof(uint32_t));
+  safeMemcpyUnsafeDst(&header[1], &nsize);
   buffer.prepend(absl::string_view(&header[0], 5));
 }
 

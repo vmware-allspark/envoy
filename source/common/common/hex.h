@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -16,7 +17,7 @@ public:
    * @return the hex encoded string representing data
    */
   static std::string encode(const std::vector<uint8_t>& data) {
-    return encode(&data[0], data.size());
+    return encode(data.data(), data.size());
   }
 
   /**
@@ -49,5 +50,13 @@ public:
    * @return value as hexadecimal string
    */
   static std::string uint32ToHex(uint32_t value);
+
+  /**
+   * Converts the given 16-bit unsigned integer into a hexadecimal string.
+   * The result is always a string of 4 characters left padded with zeroes.
+   * @param value The unsigned integer to be converted.
+   * @return value as hexadecimal string
+   */
+  static std::string uint16ToHex(uint16_t value);
 };
 } // namespace Envoy

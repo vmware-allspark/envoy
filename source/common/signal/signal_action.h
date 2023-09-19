@@ -6,10 +6,9 @@
 #include <csignal>
 #include <list>
 
-#include "common/common/non_copyable.h"
-#include "common/signal/fatal_error_handler.h"
-
-#include "server/backtrace.h"
+#include "source/common/common/non_copyable.h"
+#include "source/common/signal/fatal_error_handler.h"
+#include "source/server/backtrace.h"
 
 namespace Envoy {
 
@@ -53,7 +52,9 @@ class SignalAction : NonCopyable {
 public:
   SignalAction()
       : guard_size_(sysconf(_SC_PAGE_SIZE)),
-        altstack_size_(std::max(guard_size_ * 4, static_cast<size_t>(MINSIGSTKSZ))) {
+        altstack_size_(
+            std::max(guard_size_ * 4, (static_cast<size_t>(MINSIGSTKSZ) + guard_size_ - 1) /
+                                          guard_size_ * guard_size_)) {
     mapAndProtectStackMemory();
     installSigHandlers();
   }
@@ -72,18 +73,6 @@ public:
    * Public so that we can exercise it directly from a test.
    */
   static void sigHandler(int sig, siginfo_t* info, void* context);
-
-  /**
-   * Add this handler to the list of functions which will be called if Envoy
-   * receives a fatal signal.
-   */
-  static void registerFatalErrorHandler(const FatalErrorHandlerInterface& handler);
-
-  /**
-   * Removes this handler from the list of functions which will be called if Envoy
-   * receives a fatal signal.
-   */
-  static void removeFatalErrorHandler(const FatalErrorHandlerInterface& handler);
 
 private:
   /**
@@ -141,8 +130,11 @@ private:
   void unmapStackMemory();
   char* altstack_{};
   std::array<struct sigaction, sizeof(FATAL_SIGS) / sizeof(int)> previous_handlers_;
+// sigaltstack and backtrace() are incompatible on Apple platforms
+// https://reviews.llvm.org/D28265
+#if !defined(__APPLE__)
   stack_t previous_altstack_;
-  std::list<const FatalErrorHandlerInterface*> fatal_error_handlers_;
+#endif
 };
 
 } // namespace Envoy

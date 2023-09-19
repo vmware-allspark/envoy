@@ -4,91 +4,52 @@
 #include <memory>
 #include <string>
 
-#include "envoy/access_log/access_log.h"
+#include "envoy/formatter/substitution_formatter.h"
 
+#include "source/common/http/header_map_impl.h"
+
+#include "absl/container/node_hash_map.h"
 #include "absl/strings/string_view.h"
 
 namespace Envoy {
 namespace Router {
 
 /**
- * Interface for all types of header formatters used for custom request headers.
- */
-class HeaderFormatter {
+ * HttpHeaderFormatter is used by HTTP headers manipulators.
+ **/
+class HttpHeaderFormatter {
 public:
-  virtual ~HeaderFormatter() = default;
+  virtual ~HttpHeaderFormatter() = default;
 
-  virtual const std::string format(const Envoy::StreamInfo::StreamInfo& stream_info) const PURE;
-
-  /**
-   * @return bool indicating whether the formatted header should be appended to the existing
-   *              headers
-   */
-  virtual bool append() const PURE;
+  virtual const std::string format(const Http::RequestHeaderMap& request_headers,
+                                   const Http::ResponseHeaderMap& response_headers,
+                                   const Envoy::StreamInfo::StreamInfo& stream_info) const PURE;
 };
 
-using HeaderFormatterPtr = std::unique_ptr<HeaderFormatter>;
+using HttpHeaderFormatterPtr = std::unique_ptr<HttpHeaderFormatter>;
 
 /**
- * A formatter that expands the request header variable to a value based on info in StreamInfo.
+ * Implementation of HttpHeaderFormatter.
+ * Actual formatting is done via substitution formatters.
  */
-class StreamInfoHeaderFormatter : public HeaderFormatter {
+class HttpHeaderFormatterImpl : public HttpHeaderFormatter {
 public:
-  StreamInfoHeaderFormatter(absl::string_view field_name, bool append);
+  HttpHeaderFormatterImpl(Formatter::FormatterPtr&& formatter) : formatter_(std::move(formatter)) {}
 
-  // HeaderFormatter::format
-  const std::string format(const Envoy::StreamInfo::StreamInfo& stream_info) const override;
-  bool append() const override { return append_; }
-
-  using FieldExtractor = std::function<std::string(const Envoy::StreamInfo::StreamInfo&)>;
-
-private:
-  FieldExtractor field_extractor_;
-  const bool append_;
-  std::unordered_map<std::string, std::vector<Envoy::AccessLog::FormatterProviderPtr>>
-      start_time_formatters_;
-};
-
-/**
- * A formatter that returns back the same static header value.
- */
-class PlainHeaderFormatter : public HeaderFormatter {
-public:
-  PlainHeaderFormatter(const std::string& static_header_value, bool append)
-      : static_value_(static_header_value), append_(append) {}
-
-  // HeaderFormatter::format
-  const std::string format(const Envoy::StreamInfo::StreamInfo&) const override {
-    return static_value_;
-  };
-  bool append() const override { return append_; }
-
-private:
-  const std::string static_value_;
-  const bool append_;
-};
-
-/**
- * A formatter that produces a value by concatenating the results of multiple HeaderFormatters.
- */
-class CompoundHeaderFormatter : public HeaderFormatter {
-public:
-  CompoundHeaderFormatter(std::vector<HeaderFormatterPtr>&& formatters, bool append)
-      : formatters_(std::move(formatters)), append_(append) {}
-
-  // HeaderFormatter::format
-  const std::string format(const Envoy::StreamInfo::StreamInfo& stream_info) const override {
+  // HttpHeaderFormatter::format
+  // Trailers are not available when HTTP headers are manipulated.
+  const std::string format(const Http::RequestHeaderMap& request_headers,
+                           const Http::ResponseHeaderMap& response_headers,
+                           const Envoy::StreamInfo::StreamInfo& stream_info) const override {
     std::string buf;
-    for (const auto& formatter : formatters_) {
-      buf += formatter->format(stream_info);
-    }
+    buf = formatter_->format(request_headers, response_headers,
+                             *Http::StaticEmptyHeaders::get().response_trailers, stream_info, "",
+                             AccessLog::AccessLogType::NotSet);
     return buf;
   };
-  bool append() const override { return append_; }
 
 private:
-  const std::vector<HeaderFormatterPtr> formatters_;
-  const bool append_;
+  const Formatter::FormatterPtr formatter_;
 };
 
 } // namespace Router

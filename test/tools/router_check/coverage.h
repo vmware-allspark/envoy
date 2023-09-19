@@ -3,8 +3,6 @@
 #include "envoy/config/route/v3/route.pb.h"
 #include "envoy/router/router.h"
 
-#include "test/mocks/server/mocks.h"
-
 namespace Envoy {
 class RouteCoverage : Logger::Loggable<Logger::Id::testing> {
 public:
@@ -20,6 +18,7 @@ public:
   void setPathRewriteCovered() { path_rewrite_covered_ = true; }
   void setHostRewriteCovered() { host_rewrite_covered_ = true; }
   void setRedirectPathCovered() { redirect_path_covered_ = true; }
+  void setRedirectCodeCovered() { redirect_code_covered_ = true; }
   bool covers(const Envoy::Router::RouteEntry* route) { return route_entry_ == route; }
   bool covers(const Envoy::Router::DirectResponseEntry* route) {
     return direct_response_entry_ == route;
@@ -36,6 +35,7 @@ private:
   bool path_rewrite_covered_{false};
   bool host_rewrite_covered_{false};
   bool redirect_path_covered_{false};
+  bool redirect_code_covered_{false};
   std::vector<bool> coverageFields();
 };
 
@@ -48,6 +48,7 @@ public:
   void markPathRewriteCovered(const Envoy::Router::Route& route);
   void markHostRewriteCovered(const Envoy::Router::Route& route);
   void markRedirectPathCovered(const Envoy::Router::Route& route);
+  void markRedirectCodeCovered(const Envoy::Router::Route& route);
   double report();
   double detailedReport();
 

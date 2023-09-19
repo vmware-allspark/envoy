@@ -6,7 +6,7 @@
 
 #include "envoy/common/pure.h"
 
-#include "extensions/filters/network/redis_proxy/conn_pool.h"
+#include "source/extensions/filters/network/redis_proxy/conn_pool.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -66,6 +66,8 @@ public:
    * @return a handle to the connection pool.
    */
   virtual RouteSharedPtr upstreamPool(std::string& key) PURE;
+
+  virtual void setReadFilterCallback(Network::ReadFilterCallbacks* callbacks) PURE;
 };
 
 using RouterPtr = std::unique_ptr<Router>;

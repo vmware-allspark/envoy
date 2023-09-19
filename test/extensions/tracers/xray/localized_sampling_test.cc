@@ -1,6 +1,6 @@
-#include "extensions/tracers/xray/localized_sampling.h"
+#include "source/extensions/tracers/xray/localized_sampling.h"
 
-#include "test/mocks/runtime/mocks.h"
+#include "test/mocks/common.h"
 #include "test/test_common/simulated_time_system.h"
 
 #include "gmock/gmock.h"
@@ -22,19 +22,49 @@ protected:
 };
 
 TEST_F(LocalizedSamplingStrategyTest, EmptyRules) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   LocalizedSamplingStrategy strategy{"", random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
 }
 
 TEST_F(LocalizedSamplingStrategyTest, BadJson) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   LocalizedSamplingStrategy strategy{"{{}", random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+}
+
+TEST_F(LocalizedSamplingStrategyTest, EmptyRulesDefaultRate) {
+  NiceMock<Random::MockRandomGenerator> random_generator;
+  LocalizedSamplingStrategy strategy{"{{}", random_generator, time_system_};
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  // Make a copy of default_manifest_(LocalizedSamplingManifest object) since the
+  // object returned is a const reference and defaultRule() function is not a
+  // 'const member function' of LocalizedSamplingManifest class.
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  // default sampling rate of 0.05
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.05);
+}
+
+TEST_F(LocalizedSamplingStrategyTest, MissingRulesUseCustomDefault) {
+  NiceMock<Random::MockRandomGenerator> random_generator;
+  constexpr auto rules_json = R"EOF(
+{
+    "version": 2,
+    "rules": [],
+    "default": {
+        "fixed_target": 1,
+        "rate": 0.1
+    }
+}
+    )EOF";
+  LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.1);
 }
 
 TEST_F(LocalizedSamplingStrategyTest, ValidCustomRules) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto rules_json = R"EOF(
 {
   "version": 2,
@@ -55,11 +85,41 @@ TEST_F(LocalizedSamplingStrategyTest, ValidCustomRules) {
 }
   )EOF";
   LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
-  ASSERT_FALSE(strategy.usingDefaultManifest());
+  ASSERT_TRUE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.1);
 }
 
-TEST_F(LocalizedSamplingStrategyTest, InvalidRate) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+TEST_F(LocalizedSamplingStrategyTest, InvalidDefaultRuleRate) {
+  NiceMock<Random::MockRandomGenerator> random_generator;
+  constexpr auto rules_json = R"EOF(
+{
+  "version": 2,
+  "rules": [
+    {
+      "description": "X-Ray rule",
+      "host": "*",
+      "http_method": "*",
+      "url_path": "/api/move/*",
+      "fixed_target": 0,
+      "rate": 0.5
+    }
+  ],
+  "default": {
+    "fixed_target": 1,
+    "rate": 1.5
+  }
+}
+  )EOF";
+  LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  // default sampling rate of 0.05
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.05);
+}
+
+TEST_F(LocalizedSamplingStrategyTest, InvalidRulesRate) {
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto rules_json = R"EOF(
 {
   "version": 2,
@@ -80,11 +140,13 @@ TEST_F(LocalizedSamplingStrategyTest, InvalidRate) {
 }
   )EOF";
   LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0);
 }
 
 TEST_F(LocalizedSamplingStrategyTest, InvalidFixedTarget) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto rules_json = R"EOF(
 {
   "version": 2,
@@ -105,11 +167,11 @@ TEST_F(LocalizedSamplingStrategyTest, InvalidFixedTarget) {
 }
   )EOF";
   LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
 }
 
 TEST_F(LocalizedSamplingStrategyTest, DefaultRuleMissingRate) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto rules_json = R"EOF(
 {
   "version": 2,
@@ -129,11 +191,14 @@ TEST_F(LocalizedSamplingStrategyTest, DefaultRuleMissingRate) {
 }
   )EOF";
   LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  // default sampling rate of 0.05
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.05);
 }
 
 TEST_F(LocalizedSamplingStrategyTest, DefaultRuleMissingFixedTarget) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto rules_json = R"EOF(
 {
   "version": 2,
@@ -153,11 +218,14 @@ TEST_F(LocalizedSamplingStrategyTest, DefaultRuleMissingFixedTarget) {
 }
   )EOF";
   LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  // default sampling rate of 0.05
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.05);
 }
 
 TEST_F(LocalizedSamplingStrategyTest, WrongVersion) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto wrong_version = R"EOF(
 {
   "version": 1,
@@ -178,11 +246,14 @@ TEST_F(LocalizedSamplingStrategyTest, WrongVersion) {
 }
   )EOF";
   LocalizedSamplingStrategy strategy{wrong_version, random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  // default sampling rate of 0.05
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.05);
 }
 
 TEST_F(LocalizedSamplingStrategyTest, MissingVersion) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto missing_version = R"EOF(
 {
   "rules": [
@@ -202,11 +273,14 @@ TEST_F(LocalizedSamplingStrategyTest, MissingVersion) {
 }
   )EOF";
   LocalizedSamplingStrategy strategy{missing_version, random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  // default sampling rate of 0.05
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.05);
 }
 
 TEST_F(LocalizedSamplingStrategyTest, MissingDefaultRules) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto rules_json = R"EOF(
 {
   "version": 2,
@@ -223,11 +297,14 @@ TEST_F(LocalizedSamplingStrategyTest, MissingDefaultRules) {
 }
   )EOF";
   LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  // default sampling rate of 0.05
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.05);
 }
 
 TEST_F(LocalizedSamplingStrategyTest, CustomRuleHostIsNotString) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto rules_json = R"EOF(
 {
   "version": 2,
@@ -248,11 +325,13 @@ TEST_F(LocalizedSamplingStrategyTest, CustomRuleHostIsNotString) {
 }
   )EOF";
   LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.1);
 }
 
 TEST_F(LocalizedSamplingStrategyTest, CustomRuleHttpMethodIsNotString) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto rules_json = R"EOF(
 {
   "version": 2,
@@ -273,11 +352,13 @@ TEST_F(LocalizedSamplingStrategyTest, CustomRuleHttpMethodIsNotString) {
 }
   )EOF";
   LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.1);
 }
 
 TEST_F(LocalizedSamplingStrategyTest, CustomRuleUrlPathIsNotString) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto rules_json = R"EOF(
 {
   "version": 2,
@@ -298,11 +379,14 @@ TEST_F(LocalizedSamplingStrategyTest, CustomRuleUrlPathIsNotString) {
 }
   )EOF";
   LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  // custom default rate
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.1);
 }
 
 TEST_F(LocalizedSamplingStrategyTest, CustomRuleMissingFixedTarget) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto rules_json = R"EOF(
 {
   "version": 2,
@@ -322,11 +406,14 @@ TEST_F(LocalizedSamplingStrategyTest, CustomRuleMissingFixedTarget) {
 }
   )EOF";
   LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  // custom default rate
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.1);
 }
 
 TEST_F(LocalizedSamplingStrategyTest, CustomRuleMissingRate) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto rules_json = R"EOF(
 {
   "version": 2,
@@ -346,11 +433,14 @@ TEST_F(LocalizedSamplingStrategyTest, CustomRuleMissingRate) {
 }
   )EOF";
   LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  // custom default rate
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.1);
 }
 
 TEST_F(LocalizedSamplingStrategyTest, CustomRuleArrayElementWithWrongType) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto rules_json = R"EOF(
 {
   "version": 2,
@@ -371,11 +461,14 @@ TEST_F(LocalizedSamplingStrategyTest, CustomRuleArrayElementWithWrongType) {
 }
   )EOF";
   LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  // custom default rate
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.1);
 }
 
-TEST_F(LocalizedSamplingStrategyTest, CustomRuleNegativeFixedRate) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+TEST_F(LocalizedSamplingStrategyTest, CustomRuleNegativeFixedTarget) {
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto rules_json = R"EOF(
 {
   "version": 2,
@@ -396,11 +489,14 @@ TEST_F(LocalizedSamplingStrategyTest, CustomRuleNegativeFixedRate) {
 }
   )EOF";
   LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  // custom default rate
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.1);
 }
 
 TEST_F(LocalizedSamplingStrategyTest, CustomRuleNegativeRate) {
-  NiceMock<Runtime::MockRandomGenerator> random_generator;
+  NiceMock<Random::MockRandomGenerator> random_generator;
   constexpr auto rules_json = R"EOF(
 {
   "version": 2,
@@ -411,21 +507,24 @@ TEST_F(LocalizedSamplingStrategyTest, CustomRuleNegativeRate) {
       "http_method": "*",
       "url_path": "/api/move/*",
       "fixed_target": 0,
-      "rate": 0.05
+      "rate": -0.05
     }
   ],
   "default": {
     "fixed_target": 1,
-    "rate": -0.1
+    "rate": 0.1
   }
 }
   )EOF";
   LocalizedSamplingStrategy strategy{rules_json, random_generator, time_system_};
-  ASSERT_TRUE(strategy.usingDefaultManifest());
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+  LocalizedSamplingManifest manifest_copy{strategy.manifest()};
+  // custom default rate
+  ASSERT_EQ(manifest_copy.defaultRule().rate(), 0.1);
 }
 
 TEST_F(LocalizedSamplingStrategyTest, TraceOnlyFromReservoir) {
-  NiceMock<Runtime::MockRandomGenerator> rng;
+  NiceMock<Random::MockRandomGenerator> rng;
   EXPECT_CALL(rng, random()).WillRepeatedly(Return(90));
   constexpr auto rules_json = R"EOF(
 {
@@ -448,18 +547,17 @@ TEST_F(LocalizedSamplingStrategyTest, TraceOnlyFromReservoir) {
   )EOF";
 
   LocalizedSamplingStrategy strategy{rules_json, rng, time_system_};
-  ASSERT_FALSE(strategy.usingDefaultManifest());
+  ASSERT_TRUE(strategy.manifest().hasCustomRules());
 
   SamplingRequest req;
   ASSERT_TRUE(strategy.shouldTrace(req)); // first one should be traced
-  int i = 10;
-  while (i-- > 0) {
+  for (int i = 0; i < 10; ++i) {
     ASSERT_FALSE(strategy.shouldTrace(req));
   }
 }
 
 TEST_F(LocalizedSamplingStrategyTest, TraceFromReservoirAndByRate) {
-  NiceMock<Runtime::MockRandomGenerator> rng;
+  NiceMock<Random::MockRandomGenerator> rng;
   EXPECT_CALL(rng, random()).WillRepeatedly(Return(1));
   constexpr auto rules_json = R"EOF(
 {
@@ -482,17 +580,16 @@ TEST_F(LocalizedSamplingStrategyTest, TraceFromReservoirAndByRate) {
   )EOF";
 
   LocalizedSamplingStrategy strategy{rules_json, rng, time_system_};
-  ASSERT_FALSE(strategy.usingDefaultManifest());
+  ASSERT_TRUE(strategy.manifest().hasCustomRules());
 
   SamplingRequest req;
-  int i = 10;
-  while (i-- > 0) {
+  for (int i = 0; i < 10; ++i) {
     ASSERT_TRUE(strategy.shouldTrace(req));
   }
 }
 
 TEST_F(LocalizedSamplingStrategyTest, NoMatchingHost) {
-  NiceMock<Runtime::MockRandomGenerator> rng;
+  NiceMock<Random::MockRandomGenerator> rng;
   // this following value doesn't affect the test
   EXPECT_CALL(rng, random()).WillRepeatedly(Return(50 /*50 percent*/));
   // the following rules say:
@@ -519,18 +616,17 @@ TEST_F(LocalizedSamplingStrategyTest, NoMatchingHost) {
   )EOF";
 
   LocalizedSamplingStrategy strategy{rules_json, rng, time_system_};
-  ASSERT_FALSE(strategy.usingDefaultManifest());
+  ASSERT_TRUE(strategy.manifest().hasCustomRules());
 
   SamplingRequest req;
   req.host_ = "amazon.com"; // host does not match, so default rules apply.
-  int i = 10;
-  while (i-- > 0) {
+  for (int i = 0; i < 10; ++i) {
     ASSERT_FALSE(strategy.shouldTrace(req));
   }
 }
 
 TEST_F(LocalizedSamplingStrategyTest, NoMatchingHttpMethod) {
-  NiceMock<Runtime::MockRandomGenerator> rng;
+  NiceMock<Random::MockRandomGenerator> rng;
   // this following value doesn't affect the test
   EXPECT_CALL(rng, random()).WillRepeatedly(Return(50 /*50 percent*/));
   // the following rules say:
@@ -557,18 +653,17 @@ TEST_F(LocalizedSamplingStrategyTest, NoMatchingHttpMethod) {
   )EOF";
 
   LocalizedSamplingStrategy strategy{rules_json, rng, time_system_};
-  ASSERT_FALSE(strategy.usingDefaultManifest());
+  ASSERT_TRUE(strategy.manifest().hasCustomRules());
 
   SamplingRequest req;
   req.http_method_ = "GET"; // method does not match, so default rules apply.
-  int i = 10;
-  while (i-- > 0) {
+  for (int i = 0; i < 10; ++i) {
     ASSERT_FALSE(strategy.shouldTrace(req));
   }
 }
 
 TEST_F(LocalizedSamplingStrategyTest, NoMatchingPath) {
-  NiceMock<Runtime::MockRandomGenerator> rng;
+  NiceMock<Random::MockRandomGenerator> rng;
   // this following value doesn't affect the test
   EXPECT_CALL(rng, random()).WillRepeatedly(Return(50 /*50 percent*/));
   // the following rules say:
@@ -595,12 +690,61 @@ TEST_F(LocalizedSamplingStrategyTest, NoMatchingPath) {
   )EOF";
 
   LocalizedSamplingStrategy strategy{rules_json, rng, time_system_};
-  ASSERT_FALSE(strategy.usingDefaultManifest());
+  ASSERT_TRUE(strategy.manifest().hasCustomRules());
 
   SamplingRequest req;
   req.http_url_ = "/"; // method does not match, so default rules apply.
-  int i = 10;
-  while (i-- > 0) {
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_FALSE(strategy.shouldTrace(req));
+  }
+}
+
+TEST_F(LocalizedSamplingStrategyTest, CustomDefaultRule) {
+  NiceMock<Random::MockRandomGenerator> rng;
+  // this following value doesn't affect the test
+  EXPECT_CALL(rng, random()).WillRepeatedly(Return(50 /*50 percent*/));
+
+  constexpr auto rules_json = R"EOF(
+{
+  "version": 2,
+  "default": {
+    "fixed_target": 0,
+    "rate": 0
+  }
+}
+  )EOF";
+
+  LocalizedSamplingStrategy strategy{rules_json, rng, time_system_};
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+
+  SamplingRequest req;
+  req.http_url_ = "/";
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_FALSE(strategy.shouldTrace(req));
+  }
+}
+
+TEST_F(LocalizedSamplingStrategyTest, InvalidCustomDefaultRule) {
+  NiceMock<Random::MockRandomGenerator> rng;
+  // this following value doesn't affect the test
+  EXPECT_CALL(rng, random()).WillRepeatedly(Return(50 /*50 percent*/));
+  constexpr auto rules_json = R"EOF(
+{
+"version": 2,
+"default": {
+  "fixed_target": 0,
+  "rate": 2.0
+  }
+}
+)EOF";
+
+  LocalizedSamplingStrategy strategy{rules_json, rng, time_system_};
+  ASSERT_FALSE(strategy.manifest().hasCustomRules());
+
+  SamplingRequest req;
+  req.http_url_ = "/";
+  ASSERT_TRUE(strategy.shouldTrace(req)); // The default rule traces the first request each second
+  for (int i = 0; i < 10; ++i) {
     ASSERT_FALSE(strategy.shouldTrace(req));
   }
 }

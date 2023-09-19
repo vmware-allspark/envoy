@@ -1,6 +1,4 @@
-#include "common/config/utility.h"
-
-#include <unordered_set>
+#include "source/common/config/utility.h"
 
 #include "envoy/config/bootstrap/v3/bootstrap.pb.h"
 #include "envoy/config/cluster/v3/cluster.pb.h"
@@ -11,17 +9,11 @@
 #include "envoy/config/endpoint/v3/endpoint_components.pb.h"
 #include "envoy/stats/scope.h"
 
-#include "common/common/assert.h"
-#include "common/common/fmt.h"
-#include "common/common/hex.h"
-#include "common/common/utility.h"
-#include "common/config/api_type_oracle.h"
-#include "common/config/version_converter.h"
-#include "common/config/well_known_names.h"
-#include "common/protobuf/protobuf.h"
-#include "common/protobuf/utility.h"
-#include "common/stats/stats_matcher_impl.h"
-#include "common/stats/tag_producer_impl.h"
+#include "source/common/common/assert.h"
+#include "source/common/protobuf/utility.h"
+#include "source/common/stats/histogram_impl.h"
+#include "source/common/stats/stats_matcher_impl.h"
+#include "source/common/stats/tag_producer_impl.h"
 
 namespace Envoy {
 namespace Config {
@@ -45,12 +37,8 @@ void Utility::translateApiConfigSource(
     envoy::config::core::v3::GrpcService* grpc_service = api_config_source.add_grpc_services();
     grpc_service->mutable_envoy_grpc()->set_cluster_name(cluster);
   } else {
-    if (api_type == ApiType::get().UnsupportedRestLegacy) {
-      api_config_source.set_api_type(envoy::config::core::v3::ApiConfigSource::
-                                         hidden_envoy_deprecated_UNSUPPORTED_REST_LEGACY);
-    } else if (api_type == ApiType::get().Rest) {
-      api_config_source.set_api_type(envoy::config::core::v3::ApiConfigSource::REST);
-    }
+    ASSERT(api_type == ApiType::get().Rest);
+    api_config_source.set_api_type(envoy::config::core::v3::ApiConfigSource::REST);
     api_config_source.add_cluster_names(cluster);
   }
 
@@ -58,25 +46,29 @@ void Utility::translateApiConfigSource(
       Protobuf::util::TimeUtil::MillisecondsToDuration(refresh_delay_ms));
 }
 
-void Utility::checkCluster(absl::string_view error_prefix, absl::string_view cluster_name,
-                           Upstream::ClusterManager& cm, bool allow_added_via_api) {
-  Upstream::ThreadLocalCluster* cluster = cm.get(cluster_name);
-  if (cluster == nullptr) {
+Upstream::ClusterConstOptRef Utility::checkCluster(absl::string_view error_prefix,
+                                                   absl::string_view cluster_name,
+                                                   Upstream::ClusterManager& cm,
+                                                   bool allow_added_via_api) {
+  const auto cluster = cm.clusters().getCluster(cluster_name);
+  if (!cluster.has_value()) {
     throw EnvoyException(fmt::format("{}: unknown cluster '{}'", error_prefix, cluster_name));
   }
 
-  if (!allow_added_via_api && cluster->info()->addedViaApi()) {
-    throw EnvoyException(fmt::format("{}: invalid cluster '{}': currently only "
-                                     "static (non-CDS) clusters are supported",
-                                     error_prefix, cluster_name));
+  if (!allow_added_via_api && cluster->get().info()->addedViaApi()) {
+    throw EnvoyException(fmt::format(
+        "{}: invalid cluster '{}': currently only static (non-CDS) clusters are supported",
+        error_prefix, cluster_name));
   }
+  return cluster;
 }
 
-void Utility::checkClusterAndLocalInfo(absl::string_view error_prefix,
-                                       absl::string_view cluster_name, Upstream::ClusterManager& cm,
-                                       const LocalInfo::LocalInfo& local_info) {
-  checkCluster(error_prefix, cluster_name, cm);
+Upstream::ClusterConstOptRef
+Utility::checkClusterAndLocalInfo(absl::string_view error_prefix, absl::string_view cluster_name,
+                                  Upstream::ClusterManager& cm,
+                                  const LocalInfo::LocalInfo& local_info) {
   checkLocalInfo(error_prefix, local_info);
+  return checkCluster(error_prefix, cluster_name, cm);
 }
 
 void Utility::checkLocalInfo(absl::string_view error_prefix,
@@ -94,8 +86,7 @@ void Utility::checkFilesystemSubscriptionBackingPath(const std::string& path, Ap
   // watch addition.
   if (!api.fileSystem().fileExists(path)) {
     throw EnvoyException(fmt::format(
-        "envoy::api::v2::Path must refer to an existing path in the system: '{}' does not exist",
-        path));
+        "paths must refer to an existing path in the system: '{}' does not exist", path));
   }
 }
 
@@ -113,46 +104,50 @@ void Utility::checkApiConfigSourceNames(
 
   if (is_grpc) {
     if (!api_config_source.cluster_names().empty()) {
-      throw EnvoyException(fmt::format("envoy::api::v2::core::ConfigSource::(DELTA_)GRPC "
-                                       "must not have a cluster name specified: {}",
-                                       api_config_source.DebugString()));
+      throw EnvoyException(
+          fmt::format("{}::(DELTA_)GRPC must not have a cluster name specified: {}",
+                      api_config_source.GetTypeName(), api_config_source.DebugString()));
     }
     if (api_config_source.grpc_services().size() > 1) {
-      throw EnvoyException(fmt::format("envoy::api::v2::core::ConfigSource::(DELTA_)GRPC "
-                                       "must have a single gRPC service specified: {}",
-                                       api_config_source.DebugString()));
+      throw EnvoyException(
+          fmt::format("{}::(DELTA_)GRPC must have a single gRPC service specified: {}",
+                      api_config_source.GetTypeName(), api_config_source.DebugString()));
     }
   } else {
     if (!api_config_source.grpc_services().empty()) {
       throw EnvoyException(
-          fmt::format("envoy::api::v2::core::ConfigSource, if not a gRPC type, must not have "
-                      "a gRPC service specified: {}",
-                      api_config_source.DebugString()));
+          fmt::format("{}, if not a gRPC type, must not have a gRPC service specified: {}",
+                      api_config_source.GetTypeName(), api_config_source.DebugString()));
     }
     if (api_config_source.cluster_names().size() != 1) {
-      throw EnvoyException(fmt::format(
-          "envoy::api::v2::core::ConfigSource must have a singleton cluster name specified: {}",
-          api_config_source.DebugString()));
+      throw EnvoyException(fmt::format("{} must have a singleton cluster name specified: {}",
+                                       api_config_source.GetTypeName(),
+                                       api_config_source.DebugString()));
     }
   }
 }
 
-void Utility::validateClusterName(const Upstream::ClusterManager::ClusterInfoMap& clusters,
-                                  const std::string& cluster_name) {
-  const auto& it = clusters.find(cluster_name);
-
-  if (it == clusters.end() || it->second.get().info()->addedViaApi() ||
-      it->second.get().info()->type() == envoy::config::cluster::v3::Cluster::EDS) {
-    throw EnvoyException(fmt::format(
-        "envoy::api::v2::core::ConfigSource must have a statically "
-        "defined non-EDS cluster: '{}' does not exist, was added via api, or is an EDS cluster",
-        cluster_name));
+void Utility::validateClusterName(const Upstream::ClusterManager::ClusterSet& primary_clusters,
+                                  const std::string& cluster_name,
+                                  const std::string& config_source) {
+  const auto& it = primary_clusters.find(cluster_name);
+  if (it == primary_clusters.end()) {
+    throw EnvoyException(fmt::format("{} must have a statically defined non-EDS cluster: '{}' does "
+                                     "not exist, was added via api, or is an EDS cluster",
+                                     config_source, cluster_name));
   }
 }
 
 void Utility::checkApiConfigSourceSubscriptionBackingCluster(
-    const Upstream::ClusterManager::ClusterInfoMap& clusters,
+    const Upstream::ClusterManager::ClusterSet& primary_clusters,
     const envoy::config::core::v3::ApiConfigSource& api_config_source) {
+  // We don't need to check backing sources for ADS sources, the backing cluster must be verified in
+  // the ads_config.
+  if (api_config_source.api_type() == envoy::config::core::v3::ApiConfigSource::AGGREGATED_GRPC ||
+      api_config_source.api_type() ==
+          envoy::config::core::v3::ApiConfigSource::AGGREGATED_DELTA_GRPC) {
+    return;
+  }
   Utility::checkApiConfigSourceNames(api_config_source);
 
   const bool is_grpc =
@@ -162,17 +157,35 @@ void Utility::checkApiConfigSourceSubscriptionBackingCluster(
     // All API configs of type REST and UNSUPPORTED_REST_LEGACY should have cluster names.
     // Additionally, some gRPC API configs might have a cluster name set instead
     // of an envoy gRPC.
-    Utility::validateClusterName(clusters, api_config_source.cluster_names()[0]);
+    Utility::validateClusterName(primary_clusters, api_config_source.cluster_names()[0],
+                                 api_config_source.GetTypeName());
   } else if (is_grpc) {
     // Some ApiConfigSources of type GRPC won't have a cluster name, such as if
     // they've been configured with google_grpc.
     if (api_config_source.grpc_services()[0].has_envoy_grpc()) {
       // If an Envoy gRPC exists, we take its cluster name.
-      Utility::validateClusterName(
-          clusters, api_config_source.grpc_services()[0].envoy_grpc().cluster_name());
+      Utility::validateClusterName(primary_clusters,
+                                   api_config_source.grpc_services()[0].envoy_grpc().cluster_name(),
+                                   api_config_source.GetTypeName());
     }
   }
   // Otherwise, there is no cluster name to validate.
+}
+
+absl::optional<std::string>
+Utility::getGrpcControlPlane(const envoy::config::core::v3::ApiConfigSource& api_config_source) {
+  if (api_config_source.grpc_services_size() > 0) {
+    // Only checking for the first entry in grpc_services, because Envoy's xDS implementation
+    // currently only considers the first gRPC endpoint and ignores any other xDS management servers
+    // specified in an ApiConfigSource.
+    if (api_config_source.grpc_services(0).has_envoy_grpc()) {
+      return api_config_source.grpc_services(0).envoy_grpc().cluster_name();
+    }
+    if (api_config_source.grpc_services(0).has_google_grpc()) {
+      return api_config_source.grpc_services(0).google_grpc().target_uri();
+    }
+  }
+  return absl::nullopt;
 }
 
 std::chrono::milliseconds Utility::apiConfigSourceRefreshDelay(
@@ -213,55 +226,48 @@ Utility::parseRateLimitSettings(const envoy::config::core::v3::ApiConfigSource& 
 }
 
 Stats::TagProducerPtr
-Utility::createTagProducer(const envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
-  return std::make_unique<Stats::TagProducerImpl>(bootstrap.stats_config());
+Utility::createTagProducer(const envoy::config::bootstrap::v3::Bootstrap& bootstrap,
+                           const Stats::TagVector& cli_tags) {
+  return std::make_unique<Stats::TagProducerImpl>(bootstrap.stats_config(), cli_tags);
 }
 
 Stats::StatsMatcherPtr
-Utility::createStatsMatcher(const envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
-  return std::make_unique<Stats::StatsMatcherImpl>(bootstrap.stats_config());
+Utility::createStatsMatcher(const envoy::config::bootstrap::v3::Bootstrap& bootstrap,
+                            Stats::SymbolTable& symbol_table) {
+  return std::make_unique<Stats::StatsMatcherImpl>(bootstrap.stats_config(), symbol_table);
+}
+
+Stats::HistogramSettingsConstPtr
+Utility::createHistogramSettings(const envoy::config::bootstrap::v3::Bootstrap& bootstrap) {
+  return std::make_unique<Stats::HistogramSettingsImpl>(bootstrap.stats_config());
 }
 
 Grpc::AsyncClientFactoryPtr Utility::factoryForGrpcApiConfigSource(
     Grpc::AsyncClientManager& async_client_manager,
-    const envoy::config::core::v3::ApiConfigSource& api_config_source, Stats::Scope& scope) {
+    const envoy::config::core::v3::ApiConfigSource& api_config_source, Stats::Scope& scope,
+    bool skip_cluster_check) {
   Utility::checkApiConfigSourceNames(api_config_source);
 
   if (api_config_source.api_type() != envoy::config::core::v3::ApiConfigSource::GRPC &&
       api_config_source.api_type() != envoy::config::core::v3::ApiConfigSource::DELTA_GRPC) {
-    throw EnvoyException(fmt::format("envoy::api::v2::core::ConfigSource type must be gRPC: {}",
+    throw EnvoyException(fmt::format("{} type must be gRPC: {}", api_config_source.GetTypeName(),
                                      api_config_source.DebugString()));
   }
 
   envoy::config::core::v3::GrpcService grpc_service;
   grpc_service.MergeFrom(api_config_source.grpc_services(0));
 
-  return async_client_manager.factoryForGrpcService(grpc_service, scope, false);
-}
-
-envoy::config::endpoint::v3::ClusterLoadAssignment Utility::translateClusterHosts(
-    const Protobuf::RepeatedPtrField<envoy::config::core::v3::Address>& hosts) {
-  envoy::config::endpoint::v3::ClusterLoadAssignment load_assignment;
-  envoy::config::endpoint::v3::LocalityLbEndpoints* locality_lb_endpoints =
-      load_assignment.add_endpoints();
-  // Since this LocalityLbEndpoints is built from hosts list, set the default weight to 1.
-  locality_lb_endpoints->mutable_load_balancing_weight()->set_value(1);
-  for (const envoy::config::core::v3::Address& host : hosts) {
-    envoy::config::endpoint::v3::LbEndpoint* lb_endpoint =
-        locality_lb_endpoints->add_lb_endpoints();
-    lb_endpoint->mutable_endpoint()->mutable_address()->MergeFrom(host);
-    lb_endpoint->mutable_load_balancing_weight()->set_value(1);
-  }
-  return load_assignment;
+  return async_client_manager.factoryForGrpcService(grpc_service, scope, skip_cluster_check);
 }
 
 void Utility::translateOpaqueConfig(const ProtobufWkt::Any& typed_config,
-                                    const ProtobufWkt::Struct& config,
                                     ProtobufMessage::ValidationVisitor& validation_visitor,
                                     Protobuf::Message& out_proto) {
   static const std::string struct_type =
       ProtobufWkt::Struct::default_instance().GetDescriptor()->full_name();
   static const std::string typed_struct_type =
+      xds::type::v3::TypedStruct::default_instance().GetDescriptor()->full_name();
+  static const std::string legacy_typed_struct_type =
       udpa::type::v1::TypedStruct::default_instance().GetDescriptor()->full_name();
 
   if (!typed_config.value().empty()) {
@@ -270,6 +276,21 @@ void Utility::translateOpaqueConfig(const ProtobufWkt::Any& typed_config,
     absl::string_view type = TypeUtil::typeUrlToDescriptorFullName(typed_config.type_url());
 
     if (type == typed_struct_type) {
+      xds::type::v3::TypedStruct typed_struct;
+      MessageUtil::unpackTo(typed_config, typed_struct);
+      // if out_proto is expecting Struct, return directly
+      if (out_proto.GetDescriptor()->full_name() == struct_type) {
+        out_proto.CopyFrom(typed_struct.value());
+      } else {
+        // The typed struct might match out_proto, or some earlier version, let
+        // MessageUtil::jsonConvert sort this out.
+#ifdef ENVOY_ENABLE_YAML
+        MessageUtil::jsonConvert(typed_struct.value(), validation_visitor, out_proto);
+#else
+        throw EnvoyException("Attempting to use JSON typed structs with JSON compiled out");
+#endif
+      }
+    } else if (type == legacy_typed_struct_type) {
       udpa::type::v1::TypedStruct typed_struct;
       MessageUtil::unpackTo(typed_config, typed_struct);
       // if out_proto is expecting Struct, return directly
@@ -278,21 +299,62 @@ void Utility::translateOpaqueConfig(const ProtobufWkt::Any& typed_config,
       } else {
         // The typed struct might match out_proto, or some earlier version, let
         // MessageUtil::jsonConvert sort this out.
+#ifdef ENVOY_ENABLE_YAML
         MessageUtil::jsonConvert(typed_struct.value(), validation_visitor, out_proto);
+#else
+        UNREFERENCED_PARAMETER(validation_visitor);
+        throw EnvoyException("Attempting to use legacy JSON structs with JSON compiled out");
+#endif
       }
     } // out_proto is expecting Struct, unpack directly
     else if (type != struct_type || out_proto.GetDescriptor()->full_name() == struct_type) {
       MessageUtil::unpackTo(typed_config, out_proto);
     } else {
+#ifdef ENVOY_ENABLE_YAML
       ProtobufWkt::Struct struct_config;
       MessageUtil::unpackTo(typed_config, struct_config);
       MessageUtil::jsonConvert(struct_config, validation_visitor, out_proto);
+#else
+      throw EnvoyException("Attempting to use JSON structs with JSON compiled out");
+#endif
     }
   }
+}
 
-  if (!config.fields().empty()) {
-    MessageUtil::jsonConvert(config, validation_visitor, out_proto);
+JitteredExponentialBackOffStrategyPtr Utility::buildJitteredExponentialBackOffStrategy(
+    absl::optional<const envoy::config::core::v3::BackoffStrategy> backoff,
+    Random::RandomGenerator& random, const uint32_t default_base_interval_ms,
+    absl::optional<const uint32_t> default_max_interval_ms) {
+  // BackoffStrategy config is specified
+  if (backoff != absl::nullopt) {
+    uint32_t base_interval_ms = PROTOBUF_GET_MS_REQUIRED(backoff.value(), base_interval);
+    uint32_t max_interval_ms =
+        PROTOBUF_GET_MS_OR_DEFAULT(backoff.value(), max_interval, base_interval_ms * 10);
+
+    if (max_interval_ms < base_interval_ms) {
+      throw EnvoyException("max_interval must be greater than or equal to the base_interval");
+    }
+    return std::make_unique<JitteredExponentialBackOffStrategy>(base_interval_ms, max_interval_ms,
+                                                                random);
   }
+
+  // default_base_interval_ms must be greater than zero
+  if (default_base_interval_ms == 0) {
+    throw EnvoyException("default_base_interval_ms must be greater than zero");
+  }
+
+  // default maximum interval is specified
+  if (default_max_interval_ms != absl::nullopt) {
+    if (default_max_interval_ms.value() < default_base_interval_ms) {
+      throw EnvoyException(
+          "default_max_interval_ms must be greater than or equal to the default_base_interval_ms");
+    }
+    return std::make_unique<JitteredExponentialBackOffStrategy>(
+        default_base_interval_ms, default_max_interval_ms.value(), random);
+  }
+  // use default base interval
+  return std::make_unique<JitteredExponentialBackOffStrategy>(
+      default_base_interval_ms, default_base_interval_ms * 10, random);
 }
 
 } // namespace Config

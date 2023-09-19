@@ -1,10 +1,10 @@
-#include "extensions/filters/http/ip_tagging/ip_tagging_filter.h"
+#include "source/extensions/filters/http/ip_tagging/ip_tagging_filter.h"
 
 #include "envoy/config/core/v3/address.pb.h"
 #include "envoy/extensions/filters/http/ip_tagging/v3/ip_tagging.pb.h"
 
-#include "common/http/header_map_impl.h"
-#include "common/http/headers.h"
+#include "source/common/http/header_map_impl.h"
+#include "source/common/http/headers.h"
 
 #include "absl/strings/str_join.h"
 
@@ -19,8 +19,8 @@ IpTaggingFilterConfig::IpTaggingFilterConfig(
     : request_type_(requestTypeEnum(config.request_type())), scope_(scope), runtime_(runtime),
       stat_name_set_(scope.symbolTable().makeSet("IpTagging")),
       stats_prefix_(stat_name_set_->add(stat_prefix + "ip_tagging")),
-      hit_(stat_name_set_->add("hit")), no_hit_(stat_name_set_->add("no_hit")),
-      total_(stat_name_set_->add("total")) {
+      no_hit_(stat_name_set_->add("no_hit")), total_(stat_name_set_->add("total")),
+      unknown_tag_(stat_name_set_->add("unknown_tag.hit")) {
 
   // Once loading IP tags from a file system is supported, the restriction on the size
   // of the set should be removed and observability into what tags are loaded needs
@@ -48,20 +48,15 @@ IpTaggingFilterConfig::IpTaggingFilterConfig(
                         entry.address_prefix(), entry.prefix_len().value()));
       }
     }
+
     tag_data.emplace_back(ip_tag.ip_tag_name(), cidr_set);
+    stat_name_set_->rememberBuiltin(absl::StrCat(ip_tag.ip_tag_name(), ".hit"));
   }
   trie_ = std::make_unique<Network::LcTrie::LcTrie<std::string>>(tag_data);
-  // TODO(jmarantz): save stat-names for each tag as stat_name_set builtins.
 }
 
-void IpTaggingFilterConfig::incCounter(Stats::StatName name, absl::string_view tag) {
-  Stats::SymbolTable::StoragePtr storage;
-  if (tag.empty()) {
-    storage = scope_.symbolTable().join({stats_prefix_, name});
-  } else {
-    Stats::StatNameDynamicStorage tag_storage(tag, scope_.symbolTable());
-    storage = scope_.symbolTable().join({stats_prefix_, tag_storage.statName(), name});
-  }
+void IpTaggingFilterConfig::incCounter(Stats::StatName name) {
+  Stats::SymbolTable::StoragePtr storage = scope_.symbolTable().join({stats_prefix_, name});
   scope_.counterFromStatName(Stats::StatName(storage.get())).inc();
 }
 
@@ -83,14 +78,14 @@ Http::FilterHeadersStatus IpTaggingFilter::decodeHeaders(Http::RequestHeaderMap&
   }
 
   std::vector<std::string> tags =
-      config_->trie().getData(callbacks_->streamInfo().downstreamRemoteAddress());
+      config_->trie().getData(callbacks_->streamInfo().downstreamAddressProvider().remoteAddress());
 
   if (!tags.empty()) {
     const std::string tags_join = absl::StrJoin(tags, ",");
     headers.appendEnvoyIpTags(tags_join, ",");
 
     // We must clear the route cache or else we can't match on x-envoy-ip-tags.
-    callbacks_->clearRouteCache();
+    callbacks_->downstreamCallbacks()->clearRouteCache();
 
     // For a large number(ex > 1000) of tags, stats cardinality will be an issue.
     // If there are use cases with a large set of tags, a way to opt into these stats

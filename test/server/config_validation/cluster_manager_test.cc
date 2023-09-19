@@ -2,13 +2,12 @@
 #include "envoy/upstream/resource_manager.h"
 #include "envoy/upstream/upstream.h"
 
-#include "common/api/api_impl.h"
-#include "common/http/context_impl.h"
-#include "common/singleton/manager_impl.h"
-
-#include "server/config_validation/cluster_manager.h"
-
-#include "extensions/transport_sockets/tls/context_manager_impl.h"
+#include "source/common/api/api_impl.h"
+#include "source/common/grpc/context_impl.h"
+#include "source/common/http/context_impl.h"
+#include "source/common/singleton/manager_impl.h"
+#include "source/extensions/transport_sockets/tls/context_manager_impl.h"
+#include "source/server/config_validation/cluster_manager.h"
 
 #include "test/mocks/access_log/mocks.h"
 #include "test/mocks/event/mocks.h"
@@ -18,9 +17,10 @@
 #include "test/mocks/protobuf/mocks.h"
 #include "test/mocks/runtime/mocks.h"
 #include "test/mocks/secret/mocks.h"
-#include "test/mocks/server/mocks.h"
+#include "test/mocks/server/admin.h"
+#include "test/mocks/server/instance.h"
+#include "test/mocks/server/options.h"
 #include "test/mocks/thread_local/mocks.h"
-#include "test/mocks/upstream/mocks.h"
 #include "test/test_common/simulated_time_system.h"
 #include "test/test_common/utility.h"
 
@@ -29,40 +29,30 @@ namespace Upstream {
 namespace {
 
 TEST(ValidationClusterManagerTest, MockedMethods) {
-  Stats::IsolatedStoreImpl stats_store;
-  Event::SimulatedTimeSystem time_system;
-  NiceMock<ProtobufMessage::MockValidationContext> validation_context;
+  NiceMock<Server::MockInstance> server;
+
+  Stats::TestUtil::TestStore& stats_store = server.server_factory_context_->store_;
+  Event::GlobalTimeSystem& time_system = server.server_factory_context_->time_system_;
   Api::ApiPtr api(Api::createApiForTest(stats_store, time_system));
-  NiceMock<Runtime::MockLoader> runtime;
-  NiceMock<ThreadLocal::MockInstance> tls;
-  NiceMock<Runtime::MockRandomGenerator> random;
+  ON_CALL(*server.server_factory_context_, api()).WillByDefault(testing::ReturnRef(*api));
+
+  NiceMock<ThreadLocal::MockInstance>& tls = server.server_factory_context_->thread_local_;
+
   testing::NiceMock<Secret::MockSecretManager> secret_manager;
   auto dns_resolver = std::make_shared<NiceMock<Network::MockDnsResolver>>();
   Extensions::TransportSockets::Tls::ContextManagerImpl ssl_context_manager{api->timeSource()};
-  NiceMock<Event::MockDispatcher> dispatcher;
-  LocalInfo::MockLocalInfo local_info;
-  NiceMock<Server::MockAdmin> admin;
+
   Http::ContextImpl http_context(stats_store.symbolTable());
-  Grpc::ContextImpl grpc_context(stats_store.symbolTable());
-  AccessLog::MockAccessLogManager log_manager;
-  Singleton::ManagerImpl singleton_manager{Thread::threadFactoryForTest()};
+  Quic::QuicStatNames quic_stat_names(stats_store.symbolTable());
 
   ValidationClusterManagerFactory factory(
-      admin, runtime, stats_store, tls, random, dns_resolver, ssl_context_manager, dispatcher,
-      local_info, secret_manager, validation_context, *api, http_context, grpc_context, log_manager,
-      singleton_manager, time_system);
+      *server.server_factory_context_, stats_store, tls, http_context,
+      [dns_resolver]() -> Network::DnsResolverSharedPtr { return dns_resolver; },
+      ssl_context_manager, secret_manager, quic_stat_names, server);
 
   const envoy::config::bootstrap::v3::Bootstrap bootstrap;
   ClusterManagerPtr cluster_manager = factory.clusterManagerFromProto(bootstrap);
-  EXPECT_EQ(nullptr, cluster_manager->httpConnPoolForCluster("cluster", ResourcePriority::Default,
-                                                             Http::Protocol::Http11, nullptr));
-  Host::CreateConnectionData data = cluster_manager->tcpConnForCluster("cluster", nullptr);
-  EXPECT_EQ(nullptr, data.connection_);
-  EXPECT_EQ(nullptr, data.host_description_);
-
-  Http::AsyncClient& client = cluster_manager->httpAsyncClientForCluster("cluster");
-  Http::MockAsyncClientStreamCallbacks stream_callbacks;
-  EXPECT_EQ(nullptr, client.start(stream_callbacks, Http::AsyncClient::StreamOptions()));
+  EXPECT_EQ(nullptr, cluster_manager->getThreadLocalCluster("cluster"));
 }
 
 } // namespace

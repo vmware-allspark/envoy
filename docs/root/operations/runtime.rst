@@ -3,6 +3,5 @@
 Runtime
 =======
 
-:ref:`Runtime configuration <config_runtime>` can be used to modify various server settings
-without restarting Envoy. The runtime settings that are available depend on how the server is
-configured. They are documented in the relevant sections of the :ref:`configuration guide <config>`.
+See the :ref:`architecture overview <arch_overview_runtime>` for more information as well as the
+:ref:`configuration guide <config_runtime>`.

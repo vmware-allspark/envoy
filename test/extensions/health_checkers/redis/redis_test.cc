@@ -4,15 +4,20 @@
 #include "envoy/extensions/filters/network/redis_proxy/v3/redis_proxy.pb.h"
 #include "envoy/extensions/filters/network/redis_proxy/v3/redis_proxy.pb.validate.h"
 
-#include "extensions/health_checkers/redis/redis.h"
-#include "extensions/health_checkers/redis/utility.h"
+#include "source/extensions/health_checkers/redis/redis.h"
+#include "source/extensions/health_checkers/redis/utility.h"
 
 #include "test/common/upstream/utility.h"
 #include "test/extensions/filters/network/common/redis/mocks.h"
 #include "test/extensions/filters/network/redis_proxy/mocks.h"
+#include "test/mocks/common.h"
 #include "test/mocks/network/mocks.h"
 #include "test/mocks/runtime/mocks.h"
-#include "test/mocks/upstream/mocks.h"
+#include "test/mocks/upstream/cluster_priority_set.h"
+#include "test/mocks/upstream/health_check_event_logger.h"
+#include "test/mocks/upstream/host.h"
+#include "test/mocks/upstream/host_set.h"
+#include "test/mocks/upstream/priority_set.h"
 
 using testing::_;
 using testing::DoAll;
@@ -28,7 +33,8 @@ namespace HealthCheckers {
 namespace RedisHealthChecker {
 
 class RedisHealthCheckerTest
-    : public testing::Test,
+    : public Event::TestUsingSimulatedTime,
+      public testing::Test,
       public Extensions::NetworkFilters::Common::Redis::Client::ClientFactory {
 public:
   RedisHealthCheckerTest()
@@ -46,15 +52,51 @@ public:
     custom_health_check:
       name: redis
       typed_config:
-        "@type": type.googleapis.com/envoy.config.health_checker.redis.v2.Redis
+        "@type": type.googleapis.com/envoy.extensions.health_checkers.redis.v3.Redis
     )EOF";
 
-    const auto& health_check_config = Upstream::parseHealthCheckFromV2Yaml(yaml);
+    const auto& health_check_config = Upstream::parseHealthCheckFromV3Yaml(yaml);
     const auto& redis_config = getRedisHealthCheckConfig(
         health_check_config, ProtobufMessage::getStrictValidationVisitor());
 
     health_checker_ = std::make_shared<RedisHealthChecker>(
-        *cluster_, health_check_config, redis_config, dispatcher_, runtime_, random_,
+        *cluster_, health_check_config, redis_config, dispatcher_, runtime_,
+        Upstream::HealthCheckEventLoggerPtr(event_logger_), *api_, *this);
+  }
+
+  void setupWithAuth() {
+    const std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    no_traffic_interval: 5s
+    interval_jitter: 1s
+    unhealthy_threshold: 1
+    healthy_threshold: 1
+    custom_health_check:
+      name: redis
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.health_checkers.redis.v3.Redis
+    )EOF";
+
+    const auto& health_check_config = Upstream::parseHealthCheckFromV3Yaml(yaml);
+    const auto& redis_config = getRedisHealthCheckConfig(
+        health_check_config, ProtobufMessage::getStrictValidationVisitor());
+
+    std::string auth_yaml = R"EOF(
+    auth_username: { inline_string: "test user" }
+    auth_password: { inline_string: "test password" }
+    )EOF";
+    envoy::extensions::filters::network::redis_proxy::v3::RedisProtocolOptions proto_config{};
+    TestUtility::loadFromYaml(auth_yaml, proto_config);
+
+    Upstream::ProtocolOptionsConfigConstSharedPtr options = std::make_shared<
+        const Envoy::Extensions::NetworkFilters::RedisProxy::ProtocolOptionsConfigImpl>(
+        proto_config);
+
+    EXPECT_CALL(*cluster_->info_, extensionProtocolOptions(_)).WillRepeatedly(Return(options));
+
+    health_checker_ = std::make_shared<RedisHealthChecker>(
+        *cluster_, health_check_config, redis_config, dispatcher_, runtime_,
         Upstream::HealthCheckEventLoggerPtr(event_logger_), *api_, *this);
   }
 
@@ -70,19 +112,43 @@ public:
     custom_health_check:
       name: redis
       typed_config:
-        "@type": type.googleapis.com/envoy.config.health_checker.redis.v2.Redis
+        "@type": type.googleapis.com/envoy.extensions.health_checkers.redis.v3.Redis
     )EOF";
 
-    const auto& health_check_config = Upstream::parseHealthCheckFromV2Yaml(yaml);
+    const auto& health_check_config = Upstream::parseHealthCheckFromV3Yaml(yaml);
     const auto& redis_config = getRedisHealthCheckConfig(
         health_check_config, ProtobufMessage::getStrictValidationVisitor());
 
     health_checker_ = std::make_shared<RedisHealthChecker>(
-        *cluster_, health_check_config, redis_config, dispatcher_, runtime_, random_,
+        *cluster_, health_check_config, redis_config, dispatcher_, runtime_,
         Upstream::HealthCheckEventLoggerPtr(event_logger_), *api_, *this);
   }
 
   void setupExistsHealthcheck() {
+    const std::string yaml = R"EOF(
+    timeout: 1s
+    interval: 1s
+    no_traffic_interval: 5s
+    interval_jitter: 1s
+    unhealthy_threshold: 2
+    healthy_threshold: 1
+    custom_health_check:
+      name: redis
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.health_checkers.redis.v3.Redis
+        key: foo
+    )EOF";
+
+    const auto& health_check_config = Upstream::parseHealthCheckFromV3Yaml(yaml);
+    const auto& redis_config = getRedisHealthCheckConfig(
+        health_check_config, ProtobufMessage::getStrictValidationVisitor());
+
+    health_checker_ = std::make_shared<RedisHealthChecker>(
+        *cluster_, health_check_config, redis_config, dispatcher_, runtime_,
+        Upstream::HealthCheckEventLoggerPtr(event_logger_), *api_, *this);
+  }
+
+  void setupExistsHealthcheckWithAuth() {
     const std::string yaml = R"EOF(
     timeout: 1s
     interval: 1s
@@ -93,39 +159,29 @@ public:
     custom_health_check:
       name: redis
       typed_config:
-        "@type": type.googleapis.com/envoy.config.health_checker.redis.v2.Redis
+        "@type": type.googleapis.com/envoy.extensions.health_checkers.redis.v3.Redis
         key: foo
     )EOF";
 
-    const auto& health_check_config = Upstream::parseHealthCheckFromV2Yaml(yaml);
+    const auto& health_check_config = Upstream::parseHealthCheckFromV3Yaml(yaml);
     const auto& redis_config = getRedisHealthCheckConfig(
         health_check_config, ProtobufMessage::getStrictValidationVisitor());
 
-    health_checker_ = std::make_shared<RedisHealthChecker>(
-        *cluster_, health_check_config, redis_config, dispatcher_, runtime_, random_,
-        Upstream::HealthCheckEventLoggerPtr(event_logger_), *api_, *this);
-  }
-
-  void setupExistsHealthcheckDeprecated() {
-    const std::string yaml = R"EOF(
-    timeout: 1s
-    interval: 1s
-    no_traffic_interval: 5s
-    interval_jitter: 1s
-    unhealthy_threshold: 1
-    healthy_threshold: 1
-    custom_health_check:
-      name: envoy.health_checkers.redis
-      config:
-        key: foo
+    std::string auth_yaml = R"EOF(
+    auth_username: { inline_string: "test user" }
+    auth_password: { inline_string: "test password" }
     )EOF";
+    envoy::extensions::filters::network::redis_proxy::v3::RedisProtocolOptions proto_config{};
+    TestUtility::loadFromYaml(auth_yaml, proto_config);
 
-    const auto& health_check_config = Upstream::parseHealthCheckFromV2Yaml(yaml);
-    const auto& redis_config = getRedisHealthCheckConfig(
-        health_check_config, ProtobufMessage::getStrictValidationVisitor());
+    Upstream::ProtocolOptionsConfigConstSharedPtr options = std::make_shared<
+        const Envoy::Extensions::NetworkFilters::RedisProxy::ProtocolOptionsConfigImpl>(
+        proto_config);
+
+    EXPECT_CALL(*cluster_->info_, extensionProtocolOptions(_)).WillRepeatedly(Return(options));
 
     health_checker_ = std::make_shared<RedisHealthChecker>(
-        *cluster_, health_check_config, redis_config, dispatcher_, runtime_, random_,
+        *cluster_, health_check_config, redis_config, dispatcher_, runtime_,
         Upstream::HealthCheckEventLoggerPtr(event_logger_), *api_, *this);
   }
 
@@ -141,15 +197,15 @@ public:
     custom_health_check:
       name: redis
       typed_config:
-        "@type": type.googleapis.com/envoy.config.health_checker.redis.v2.Redis
+        "@type": type.googleapis.com/envoy.extensions.health_checkers.redis.v3.Redis
     )EOF";
 
-    const auto& health_check_config = Upstream::parseHealthCheckFromV2Yaml(yaml);
+    const auto& health_check_config = Upstream::parseHealthCheckFromV3Yaml(yaml);
     const auto& redis_config = getRedisHealthCheckConfig(
         health_check_config, ProtobufMessage::getStrictValidationVisitor());
 
     health_checker_ = std::make_shared<RedisHealthChecker>(
-        *cluster_, health_check_config, redis_config, dispatcher_, runtime_, random_,
+        *cluster_, health_check_config, redis_config, dispatcher_, runtime_,
         Upstream::HealthCheckEventLoggerPtr(event_logger_), *api_, *this);
   }
 
@@ -157,7 +213,9 @@ public:
   create(Upstream::HostConstSharedPtr, Event::Dispatcher&,
          const Extensions::NetworkFilters::Common::Redis::Client::Config&,
          const Extensions::NetworkFilters::Common::Redis::RedisCommandStatsSharedPtr&,
-         Stats::Scope&, const std::string&) override {
+         Stats::Scope&, const std::string& username, const std::string& password, bool) override {
+    EXPECT_EQ(auth_username_, username);
+    EXPECT_EQ(auth_password_, password);
     return Extensions::NetworkFilters::Common::Redis::Client::ClientPtr{create_()};
   }
 
@@ -187,7 +245,8 @@ public:
   }
 
   void exerciseStubs() {
-    Upstream::HostSharedPtr host = Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:100");
+    Upstream::HostSharedPtr host =
+        Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:100", simTime());
     RedisHealthChecker::RedisActiveHealthCheckSessionPtr session =
         std::make_unique<RedisHealthChecker::RedisActiveHealthCheckSession>(*health_checker_, host);
 
@@ -206,7 +265,6 @@ public:
   std::shared_ptr<Upstream::MockClusterMockPrioritySet> cluster_;
   NiceMock<Event::MockDispatcher> dispatcher_;
   NiceMock<Runtime::MockLoader> runtime_;
-  NiceMock<Runtime::MockRandomGenerator> random_;
   Upstream::MockHealthCheckEventLogger* event_logger_{};
   Event::MockTimer* timeout_timer_{};
   Event::MockTimer* interval_timer_{};
@@ -215,7 +273,104 @@ public:
   Extensions::NetworkFilters::Common::Redis::Client::ClientCallbacks* pool_callbacks_{};
   std::shared_ptr<RedisHealthChecker> health_checker_;
   Api::ApiPtr api_;
+  std::string auth_username_;
+  std::string auth_password_;
 };
+
+TEST_F(RedisHealthCheckerTest, PingWithAuth) {
+  InSequence s;
+
+  auth_username_ = "test user";
+  auth_password_ = "test password";
+
+  setupWithAuth();
+
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
+      Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+
+  expectSessionCreate();
+  expectClientCreate();
+  expectPingRequestCreate();
+  health_checker_->start();
+
+  client_->runHighWatermarkCallbacks();
+  client_->runLowWatermarkCallbacks();
+
+  // Success
+  EXPECT_CALL(*timeout_timer_, disableTimer());
+  EXPECT_CALL(*interval_timer_, enableTimer(_, _));
+  NetworkFilters::Common::Redis::RespValuePtr response(
+      new NetworkFilters::Common::Redis::RespValue());
+  response->type(NetworkFilters::Common::Redis::RespType::SimpleString);
+  response->asString() = "PONG";
+  pool_callbacks_->onResponse(std::move(response));
+
+  expectPingRequestCreate();
+  interval_timer_->invokeCallback();
+
+  // Failure, invalid auth
+  EXPECT_CALL(*event_logger_, logEjectUnhealthy(_, _, _));
+  EXPECT_CALL(*timeout_timer_, disableTimer());
+  EXPECT_CALL(*interval_timer_, enableTimer(_, _));
+  response = std::make_unique<NetworkFilters::Common::Redis::RespValue>();
+  response->type(NetworkFilters::Common::Redis::RespType::Error);
+  response->asString() = "WRONGPASS invalid username-password pair";
+  pool_callbacks_->onResponse(std::move(response));
+
+  EXPECT_CALL(*client_, close());
+
+  EXPECT_EQ(2UL, cluster_->info_->stats_store_.counter("health_check.attempt").value());
+  EXPECT_EQ(1UL, cluster_->info_->stats_store_.counter("health_check.success").value());
+  EXPECT_EQ(1UL, cluster_->info_->stats_store_.counter("health_check.failure").value());
+  EXPECT_EQ(0UL, cluster_->info_->stats_store_.counter("health_check.network_failure").value());
+}
+
+TEST_F(RedisHealthCheckerTest, ExistsWithAuth) {
+  InSequence s;
+
+  auth_username_ = "test user";
+  auth_password_ = "test password";
+
+  setupExistsHealthcheckWithAuth();
+
+  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
+      Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
+
+  expectSessionCreate();
+  expectClientCreate();
+  expectExistsRequestCreate();
+  health_checker_->start();
+
+  client_->runHighWatermarkCallbacks();
+  client_->runLowWatermarkCallbacks();
+
+  // Success
+  EXPECT_CALL(*timeout_timer_, disableTimer());
+  EXPECT_CALL(*interval_timer_, enableTimer(_, _));
+  NetworkFilters::Common::Redis::RespValuePtr response(
+      new NetworkFilters::Common::Redis::RespValue());
+  response->type(NetworkFilters::Common::Redis::RespType::Integer);
+  response->asInteger() = 0;
+  pool_callbacks_->onResponse(std::move(response));
+
+  expectExistsRequestCreate();
+  interval_timer_->invokeCallback();
+
+  // Failure, invalid auth
+  EXPECT_CALL(*event_logger_, logEjectUnhealthy(_, _, _));
+  EXPECT_CALL(*timeout_timer_, disableTimer());
+  EXPECT_CALL(*interval_timer_, enableTimer(_, _));
+  response = std::make_unique<NetworkFilters::Common::Redis::RespValue>();
+  response->type(NetworkFilters::Common::Redis::RespType::Error);
+  response->asString() = "WRONGPASS invalid username-password pair";
+  pool_callbacks_->onResponse(std::move(response));
+
+  EXPECT_CALL(*client_, close());
+
+  EXPECT_EQ(2UL, cluster_->info_->stats_store_.counter("health_check.attempt").value());
+  EXPECT_EQ(1UL, cluster_->info_->stats_store_.counter("health_check.success").value());
+  EXPECT_EQ(1UL, cluster_->info_->stats_store_.counter("health_check.failure").value());
+}
 
 TEST_F(RedisHealthCheckerTest, PingAndVariousFailures) {
   InSequence s;
@@ -225,7 +380,7 @@ TEST_F(RedisHealthCheckerTest, PingAndVariousFailures) {
   exerciseStubs();
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
+      Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
 
   expectSessionCreate();
   expectClientCreate();
@@ -293,7 +448,7 @@ TEST_F(RedisHealthCheckerTest, FailuresLogging) {
   setupAlwaysLogHealthCheckFailures();
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
+      Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
 
   expectSessionCreate();
   expectClientCreate();
@@ -351,7 +506,7 @@ TEST_F(RedisHealthCheckerTest, LogInitialFailure) {
   setup();
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
+      Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
 
   expectSessionCreate();
   expectClientCreate();
@@ -396,64 +551,12 @@ TEST_F(RedisHealthCheckerTest, LogInitialFailure) {
   EXPECT_EQ(1UL, cluster_->info_->stats_store_.counter("health_check.network_failure").value());
 }
 
-TEST_F(RedisHealthCheckerTest, DEPRECATED_FEATURE_TEST(ExistsDeprecated)) {
-  InSequence s;
-  setupExistsHealthcheckDeprecated();
-
-  cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
-
-  expectSessionCreate();
-  expectClientCreate();
-  expectExistsRequestCreate();
-  health_checker_->start();
-
-  client_->runHighWatermarkCallbacks();
-  client_->runLowWatermarkCallbacks();
-
-  // Success
-  EXPECT_CALL(*timeout_timer_, disableTimer());
-  EXPECT_CALL(*interval_timer_, enableTimer(_, _));
-  NetworkFilters::Common::Redis::RespValuePtr response(
-      new NetworkFilters::Common::Redis::RespValue());
-  response->type(NetworkFilters::Common::Redis::RespType::Integer);
-  response->asInteger() = 0;
-  pool_callbacks_->onResponse(std::move(response));
-
-  expectExistsRequestCreate();
-  interval_timer_->invokeCallback();
-
-  // Failure, exists
-  EXPECT_CALL(*event_logger_, logEjectUnhealthy(_, _, _));
-  EXPECT_CALL(*timeout_timer_, disableTimer());
-  EXPECT_CALL(*interval_timer_, enableTimer(_, _));
-  response = std::make_unique<NetworkFilters::Common::Redis::RespValue>();
-  response->type(NetworkFilters::Common::Redis::RespType::Integer);
-  response->asInteger() = 1;
-  pool_callbacks_->onResponse(std::move(response));
-
-  expectExistsRequestCreate();
-  interval_timer_->invokeCallback();
-
-  // Failure, no value
-  EXPECT_CALL(*timeout_timer_, disableTimer());
-  EXPECT_CALL(*interval_timer_, enableTimer(_, _));
-  response = std::make_unique<NetworkFilters::Common::Redis::RespValue>();
-  pool_callbacks_->onResponse(std::move(response));
-
-  EXPECT_CALL(*client_, close());
-
-  EXPECT_EQ(3UL, cluster_->info_->stats_store_.counter("health_check.attempt").value());
-  EXPECT_EQ(1UL, cluster_->info_->stats_store_.counter("health_check.success").value());
-  EXPECT_EQ(2UL, cluster_->info_->stats_store_.counter("health_check.failure").value());
-}
-
 TEST_F(RedisHealthCheckerTest, Exists) {
   InSequence s;
   setupExistsHealthcheck();
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
+      Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
 
   expectSessionCreate();
   expectClientCreate();
@@ -498,6 +601,8 @@ TEST_F(RedisHealthCheckerTest, Exists) {
   EXPECT_EQ(3UL, cluster_->info_->stats_store_.counter("health_check.attempt").value());
   EXPECT_EQ(1UL, cluster_->info_->stats_store_.counter("health_check.success").value());
   EXPECT_EQ(2UL, cluster_->info_->stats_store_.counter("health_check.failure").value());
+  EXPECT_EQ(2UL,
+            cluster_->info_->stats_store_.counter("health_check.redis.exists_failure").value());
 }
 
 TEST_F(RedisHealthCheckerTest, ExistsRedirected) {
@@ -505,7 +610,7 @@ TEST_F(RedisHealthCheckerTest, ExistsRedirected) {
   setupExistsHealthcheck();
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
+      Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
 
   expectSessionCreate();
   expectClientCreate();
@@ -549,7 +654,7 @@ TEST_F(RedisHealthCheckerTest, NoConnectionReuse) {
   setupDontReuseConnection();
 
   cluster_->prioritySet().getMockHostSet(0)->hosts_ = {
-      Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80")};
+      Upstream::makeTestHost(cluster_->info_, "tcp://127.0.0.1:80", simTime())};
 
   expectSessionCreate();
   expectClientCreate();

@@ -1,10 +1,11 @@
-#include "extensions/filters/network/mongo_proxy/utility.h"
+#include "source/extensions/filters/network/mongo_proxy/utility.h"
 
 #include <string>
 
 #include "envoy/common/exception.h"
 
-#include "common/json/json_loader.h"
+#include "source/common/common/thread.h"
+#include "source/common/json/json_loader.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -22,6 +23,17 @@ QueryMessageInfo::QueryMessageInfo(const QueryMessage& query)
     if (command_ == "find") {
       command_ = "";
       parseFindCommand(*command);
+      // command aliases
+    } else if (command_ == "collstats") {
+      command_ = "collStats";
+    } else if (command_ == "dbstats") {
+      command_ = "dbStats";
+    } else if (command_ == "findandmodify") {
+      command_ = "findAndModify";
+    } else if (command_ == "getlasterror") {
+      command_ = "getLastError";
+    } else if (command_ == "ismaster") {
+      command_ = "isMaster";
     }
 
     return;
@@ -90,12 +102,11 @@ std::string QueryMessageInfo::parseCallingFunction(const QueryMessage& query) {
 }
 
 std::string QueryMessageInfo::parseCallingFunctionJson(const std::string& json_string) {
-  try {
+  TRY_NEEDS_AUDIT {
     Json::ObjectSharedPtr json = Json::Factory::loadFromString(json_string);
     return json->getString("callingFunction");
-  } catch (Json::Exception&) {
-    return "";
   }
+  END_TRY catch (Json::Exception&) { return ""; }
 }
 
 QueryMessageInfo::QueryType QueryMessageInfo::parseType(const QueryMessage& query) {

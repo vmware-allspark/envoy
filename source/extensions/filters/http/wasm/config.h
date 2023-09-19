@@ -1,9 +1,9 @@
 #pragma once
 
 #include "envoy/extensions/filters/http/wasm/v3/wasm.pb.h"
+#include "envoy/extensions/filters/http/wasm/v3/wasm.pb.validate.h"
 
-#include "extensions/filters/http/common/factory_base.h"
-#include "extensions/filters/http/well_known_names.h"
+#include "source/extensions/filters/http/common/factory_base.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -16,7 +16,7 @@ namespace Wasm {
 class WasmFilterConfig
     : public Common::FactoryBase<envoy::extensions::filters::http::wasm::v3::Wasm> {
 public:
-  WasmFilterConfig() : FactoryBase(HttpFilterNames::get().Wasm) {}
+  WasmFilterConfig() : FactoryBase("envoy.filters.http.wasm") {}
 
 private:
   Http::FilterFactoryCb createFilterFactoryFromProtoTyped(

@@ -1,44 +1,34 @@
 #!/bin/bash
 
-# This is run on every commit that CircleCI picks up. It assumes that docs have already been built
-# via docs/build.sh. The push behavior differs depending on the nature of the commit:
-# * Tag commit (e.g. v1.6.0): pushes docs to versioned location, e.g.
-#   https://www.envoyproxy.io/docs/envoy/v1.6.0/.
-# * Master commit: pushes docs to https://www.envoyproxy.io/docs/envoy/latest/.
-# * Otherwise: noop.
+# This pushes a prebuilt docs version to the website for published releases.
 
 set -e
 
 DOCS_DIR=generated/docs
-CHECKOUT_DIR=../envoy-docs
-BUILD_SHA=`git rev-parse HEAD`
+CHECKOUT_DIR=envoy-docs
+BUILD_SHA=$(git rev-parse HEAD)
 
-if [ -n "$CIRCLE_TAG" ]
-then
-  PUBLISH_DIR="$CHECKOUT_DIR"/docs/envoy/"$CIRCLE_TAG"
-elif [ -z "$CIRCLE_PULL_REQUEST" ] && [ "$CIRCLE_BRANCH" == "master" ]
-then
-  PUBLISH_DIR="$CHECKOUT_DIR"/docs/envoy/latest
-else
-  echo "Ignoring docs push"
-  exit 0
-fi
+VERSION="$(cat VERSION.txt)"
+PUBLISH_DIR="${CHECKOUT_DIR}/docs/envoy/v${VERSION}"
+DOCS_MAIN_BRANCH="main"
 
 echo 'cloning'
-git clone git@github.com:envoyproxy/envoyproxy.github.io "$CHECKOUT_DIR"
+git clone git@github.com:envoyproxy/envoy-website "${CHECKOUT_DIR}" -b "${DOCS_MAIN_BRANCH}" --depth 1
 
-git -C "$CHECKOUT_DIR" fetch
-git -C "$CHECKOUT_DIR" checkout -B master origin/master
-rm -fr "$PUBLISH_DIR"
+if [[ -e "$PUBLISH_DIR" ]]; then
+    # Defense against the unexpected.
+    echo 'Docs version already exists, not continuing!.'
+    exit 0
+    # exit 1
+fi
+
 mkdir -p "$PUBLISH_DIR"
 cp -r "$DOCS_DIR"/* "$PUBLISH_DIR"
-cd "$CHECKOUT_DIR"
+cd "${CHECKOUT_DIR}"
 
-git config user.name "envoy-docs(travis)"
+git config user.name "envoy-docs(Azure Pipelines)"
 git config user.email envoy-docs@users.noreply.github.com
-echo 'add'
+
 git add .
-echo 'commit'
 git commit -m "docs envoy@$BUILD_SHA"
-echo 'push'
-git push origin master
+git push origin "${DOCS_MAIN_BRANCH}"
