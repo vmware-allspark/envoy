@@ -3,12 +3,14 @@
 #include <vector>
 
 #include "envoy/config/cluster/v3/cluster.pb.h"
+#include "envoy/extensions/load_balancing_policies/ring_hash/v3/ring_hash.pb.h"
+#include "envoy/extensions/load_balancing_policies/ring_hash/v3/ring_hash.pb.validate.h"
 #include "envoy/runtime/runtime.h"
 #include "envoy/stats/scope.h"
 #include "envoy/stats/stats_macros.h"
 
-#include "common/common/logger.h"
-#include "common/upstream/thread_aware_lb_impl.h"
+#include "source/common/common/logger.h"
+#include "source/common/upstream/thread_aware_lb_impl.h"
 
 namespace Envoy {
 namespace Upstream {
@@ -40,11 +42,15 @@ struct RingHashLoadBalancerStats {
 class RingHashLoadBalancer : public ThreadAwareLoadBalancerBase,
                              Logger::Loggable<Logger::Id::upstream> {
 public:
+  RingHashLoadBalancer(const PrioritySet& priority_set, ClusterLbStats& stats, Stats::Scope& scope,
+                       Runtime::Loader& runtime, Random::RandomGenerator& random,
+                       OptRef<const envoy::config::cluster::v3::Cluster::RingHashLbConfig> config,
+                       const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config);
+
   RingHashLoadBalancer(
-      const PrioritySet& priority_set, ClusterStats& stats, Stats::Scope& scope,
-      Runtime::Loader& runtime, Runtime::RandomGenerator& random,
-      const absl::optional<envoy::config::cluster::v3::Cluster::RingHashLbConfig>& config,
-      const envoy::config::cluster::v3::Cluster::CommonLbConfig& common_config);
+      const PrioritySet& priority_set, ClusterLbStats& stats, Stats::Scope& scope,
+      Runtime::Loader& runtime, Random::RandomGenerator& random, uint32_t healthy_panic_threshold,
+      const envoy::extensions::load_balancing_policies::ring_hash::v3::RingHash& config);
 
   const RingHashLoadBalancerStats& stats() const { return stats_; }
 
@@ -74,14 +80,20 @@ private:
   HashingLoadBalancerSharedPtr
   createLoadBalancer(const NormalizedHostWeightVector& normalized_host_weights,
                      double min_normalized_weight, double /* max_normalized_weight */) override {
-    return std::make_shared<Ring>(normalized_host_weights, min_normalized_weight, min_ring_size_,
-                                  max_ring_size_, hash_function_, use_hostname_for_hashing_,
-                                  stats_);
+    HashingLoadBalancerSharedPtr ring_hash_lb =
+        std::make_shared<Ring>(normalized_host_weights, min_normalized_weight, min_ring_size_,
+                               max_ring_size_, hash_function_, use_hostname_for_hashing_, stats_);
+    if (hash_balance_factor_ == 0) {
+      return ring_hash_lb;
+    }
+
+    return std::make_shared<BoundedLoadHashingLoadBalancer>(
+        ring_hash_lb, std::move(normalized_host_weights), hash_balance_factor_);
   }
 
   static RingHashLoadBalancerStats generateStats(Stats::Scope& scope);
 
-  Stats::ScopePtr scope_;
+  Stats::ScopeSharedPtr scope_;
   RingHashLoadBalancerStats stats_;
 
   static const uint64_t DefaultMinRingSize = 1024;
@@ -90,6 +102,7 @@ private:
   const uint64_t max_ring_size_;
   const HashFunction hash_function_;
   const bool use_hostname_for_hashing_;
+  const uint32_t hash_balance_factor_;
 };
 
 } // namespace Upstream

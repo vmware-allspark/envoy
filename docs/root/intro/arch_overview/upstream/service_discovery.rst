@@ -3,7 +3,7 @@
 Service discovery
 =================
 
-When an upstream cluster is defined in the :ref:`configuration <envoy_api_msg_Cluster>`,
+When an upstream cluster is defined in the :ref:`configuration <envoy_v3_api_msg_config.cluster.v3.Cluster>`,
 Envoy needs to know how to resolve the members of the cluster. This is known as *service discovery*.
 
 .. _arch_overview_service_discovery_types:
@@ -12,6 +12,7 @@ Supported service discovery types
 ---------------------------------
 
 .. _arch_overview_service_discovery_types_static:
+.. _extension_envoy.clusters.static:
 
 Static
 ^^^^^^
@@ -20,6 +21,7 @@ Static is the simplest service discovery type. The configuration explicitly spec
 network name (IP address/port, unix domain socket, etc.) of each upstream host.
 
 .. _arch_overview_service_discovery_types_strict_dns:
+.. _extension_envoy.clusters.strict_dns:
 
 Strict DNS
 ^^^^^^^^^^
@@ -41,14 +43,17 @@ This means that care should be taken if active health checking is used with DNS 
 to the same IPs: if an IP is repeated many times between DNS names it might cause undue load on the
 upstream host.
 
-If :ref:`respect_dns_ttl <envoy_api_field_Cluster.respect_dns_ttl>` is enabled, DNS record TTLs and
-:ref:`dns_refresh_rate <envoy_api_field_Cluster.dns_refresh_rate>` are used to control DNS refresh rate.
-For strict DNS cluster, if the minimum of all record TTLs is 0, :ref:`dns_refresh_rate <envoy_api_field_Cluster.dns_refresh_rate>`
-will be used as the cluster's DNS refresh rate. :ref:`dns_refresh_rate <envoy_api_field_Cluster.dns_refresh_rate>`
-defaults to 5000ms if not specified. The :ref:`dns_failure_refresh_rate <envoy_api_field_Cluster.dns_failure_refresh_rate>`
+If :ref:`respect_dns_ttl <envoy_v3_api_field_config.cluster.v3.Cluster.respect_dns_ttl>` is enabled, DNS record TTLs and
+:ref:`dns_refresh_rate <envoy_v3_api_field_config.cluster.v3.Cluster.dns_refresh_rate>` are used to control DNS refresh rate.
+For strict DNS cluster, if the minimum of all record TTLs is 0, :ref:`dns_refresh_rate <envoy_v3_api_field_config.cluster.v3.Cluster.dns_refresh_rate>`
+will be used as the cluster's DNS refresh rate. :ref:`dns_refresh_rate <envoy_v3_api_field_config.cluster.v3.Cluster.dns_refresh_rate>`
+defaults to 5000ms if not specified. The :ref:`dns_failure_refresh_rate <envoy_v3_api_field_config.cluster.v3.Cluster.dns_failure_refresh_rate>`
 controls the refresh frequency during failures, and, if not configured, the DNS refresh rate will be used.
 
+DNS resolving emits :ref:`cluster statistics <config_cluster_manager_cluster_stats>` fields *update_attempt*, *update_success* and *update_failure*.
+
 .. _arch_overview_service_discovery_types_logical_dns:
+.. _extension_envoy.clusters.logical_dns:
 
 Logical DNS
 ^^^^^^^^^^^
@@ -70,12 +75,14 @@ When interacting with large scale web services, this is the best of all possible
 asynchronous/eventually consistent DNS resolution, long lived connections, and zero blocking in the
 forwarding path.
 
-If :ref:`respect_dns_ttl <envoy_api_field_Cluster.respect_dns_ttl>` is enabled, DNS record TTLs and
-:ref:`dns_refresh_rate <envoy_api_field_Cluster.dns_refresh_rate>` are used to control DNS refresh rate.
-For logical DNS cluster, if the TTL of first record is 0, :ref:`dns_refresh_rate <envoy_api_field_Cluster.dns_refresh_rate>`
-will be used as the cluster's DNS refresh rate. :ref:`dns_refresh_rate <envoy_api_field_Cluster.dns_refresh_rate>`
-defaults to 5000ms if not specified. The :ref:`dns_failure_refresh_rate <envoy_api_field_Cluster.dns_failure_refresh_rate>`
+If :ref:`respect_dns_ttl <envoy_v3_api_field_config.cluster.v3.Cluster.respect_dns_ttl>` is enabled, DNS record TTLs and
+:ref:`dns_refresh_rate <envoy_v3_api_field_config.cluster.v3.Cluster.dns_refresh_rate>` are used to control DNS refresh rate.
+For logical DNS cluster, if the TTL of first record is 0, :ref:`dns_refresh_rate <envoy_v3_api_field_config.cluster.v3.Cluster.dns_refresh_rate>`
+will be used as the cluster's DNS refresh rate. :ref:`dns_refresh_rate <envoy_v3_api_field_config.cluster.v3.Cluster.dns_refresh_rate>`
+defaults to 5000ms if not specified. The :ref:`dns_failure_refresh_rate <envoy_v3_api_field_config.cluster.v3.Cluster.dns_failure_refresh_rate>`
 controls the refresh frequency during failures, and, if not configured, the DNS refresh rate will be used.
+
+DNS resolving emits :ref:`cluster statistics <config_cluster_manager_cluster_stats>` fields *update_attempt*, *update_success* and *update_failure*.
 
 .. _arch_overview_service_discovery_types_original_destination:
 
@@ -86,15 +93,17 @@ Original destination cluster can be used when incoming connections are redirecte
 via an iptables REDIRECT or TPROXY target or with Proxy Protocol. In these cases requests routed
 to an original destination cluster are forwarded to upstream hosts as addressed by the redirection
 metadata, without any explicit host configuration or upstream host discovery.
-Connections to upstream hosts are pooled and unused hosts are flushed out when they have been idle longer than
-:ref:`cleanup_interval <envoy_api_field_Cluster.cleanup_interval>`, which defaults to
-5000ms. If the original destination address is not available, no upstream connection is opened.
-Envoy can also pickup the original destination from a :ref:`HTTP header
-<arch_overview_load_balancing_types_original_destination_request_header>`.
-Original destination service discovery must be used with the original destination :ref:`load
-balancer <arch_overview_load_balancing_types_original_destination>`.
+Connections to upstream hosts are pooled and unused hosts are flushed out when they have been not use by any connection
+pool longer than :ref:`cleanup_interval <envoy_v3_api_field_config.cluster.v3.Cluster.cleanup_interval>`, which defaults
+to 5000ms. If the original destination address is not available, no upstream connection is opened.  Envoy can also
+pickup the original destination from a :ref:`HTTP header
+<arch_overview_load_balancing_types_original_destination_request_header>`. Original destination service discovery must
+be used with the original destination :ref:`load balancer <arch_overview_load_balancing_types_original_destination>`.
+When using the original destination cluster for HTTP upstreams, please set :ref:`idle_timeout
+<faq_configuration_connection_timeouts>` to 5min to limit the duration of the upstream HTTP connections.
 
 .. _arch_overview_service_discovery_types_eds:
+.. _extension_envoy.clusters.eds:
 
 Endpoint discovery service (EDS)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -121,7 +130,7 @@ Custom cluster
 ^^^^^^^^^^^^^^
 
 Envoy also supports custom cluster discovery mechanism. Custom clusters are specified using
-:ref:`cluster_type field <envoy_api_field_Cluster.cluster_type>` on the cluster configuration.
+:ref:`cluster_type field <envoy_v3_api_field_config.cluster.v3.Cluster.cluster_type>` on the cluster configuration.
 
 Generally active health checking is used in conjunction with the eventually consistent service
 discovery service data to making load balancing and routing decisions. This is discussed further in

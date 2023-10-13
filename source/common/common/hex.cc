@@ -1,4 +1,4 @@
-#include "common/common/hex.h"
+#include "source/common/common/hex.h"
 
 #include <array>
 #include <cstdint>
@@ -7,8 +7,8 @@
 
 #include "envoy/common/exception.h"
 
-#include "common/common/fmt.h"
-#include "common/common/utility.h"
+#include "source/common/common/fmt.h"
+#include "source/common/common/utility.h"
 
 namespace Envoy {
 std::string Hex::encode(const uint8_t* data, size_t length) {
@@ -70,6 +70,17 @@ std::string Hex::uint32ToHex(uint32_t value) {
   data[2] = (value & 0x0000FF00) >> 8;
   data[1] = (value & 0x00FF0000) >> 16;
   data[0] = (value & 0xFF000000) >> 24;
+
+  return encode(data.data(), data.size());
+}
+
+std::string Hex::uint16ToHex(uint16_t value) {
+  std::array<uint8_t, 2> data;
+
+  // This is explicitly done for performance reasons
+  // using std::stringstream with std::hex is ~3 orders of magnitude slower.
+  data[1] = (value & 0x00FF);
+  data[0] = (value & 0xFF00) >> 8;
 
   return encode(data.data(), data.size());
 }

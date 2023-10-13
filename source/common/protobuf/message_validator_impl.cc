@@ -1,20 +1,51 @@
-#include "common/protobuf/message_validator_impl.h"
+#include "source/common/protobuf/message_validator_impl.h"
 
 #include "envoy/common/exception.h"
 
-#include "common/common/assert.h"
-#include "common/common/hash.h"
-#include "common/common/macros.h"
+#include "source/common/common/assert.h"
+#include "source/common/common/hash.h"
+#include "source/common/common/macros.h"
 
 #include "absl/strings/str_cat.h"
 
 namespace Envoy {
 namespace ProtobufMessage {
 
-void WarningValidationVisitorImpl::setCounter(Stats::Counter& counter) {
-  ASSERT(counter_ == nullptr);
-  counter_ = &counter;
-  counter.add(prestats_count_);
+namespace {
+const char deprecation_error[] = " If continued use of this field is absolutely necessary, "
+                                 "see " ENVOY_DOC_URL_RUNTIME_OVERRIDE_DEPRECATED " for "
+                                 "how to apply a temporary and highly discouraged override.";
+
+void onDeprecatedFieldCommon(absl::string_view description, bool soft_deprecation) {
+  if (soft_deprecation) {
+    ENVOY_LOG_MISC(warn, "Deprecated field: {}", absl::StrCat(description, deprecation_error));
+  } else {
+    throw DeprecatedProtoFieldException(absl::StrCat(description, deprecation_error));
+  }
+}
+} // namespace
+
+void WipCounterBase::setWipCounter(Stats::Counter& wip_counter) {
+  ASSERT(wip_counter_ == nullptr);
+  wip_counter_ = &wip_counter;
+  wip_counter.add(prestats_wip_count_);
+}
+
+void WipCounterBase::onWorkInProgressCommon(absl::string_view description) {
+  ENVOY_LOG_MISC(warn, "{}", description);
+  if (wip_counter_ != nullptr) {
+    wip_counter_->inc();
+  } else {
+    prestats_wip_count_++;
+  }
+}
+
+void WarningValidationVisitorImpl::setCounters(Stats::Counter& unknown_counter,
+                                               Stats::Counter& wip_counter) {
+  setWipCounter(wip_counter);
+  ASSERT(unknown_counter_ == nullptr);
+  unknown_counter_ = &unknown_counter;
+  unknown_counter.add(prestats_unknown_count_);
 }
 
 void WarningValidationVisitorImpl::onUnknownField(absl::string_view description) {
@@ -24,18 +55,37 @@ void WarningValidationVisitorImpl::onUnknownField(absl::string_view description)
   if (!it.second) {
     return;
   }
+
   // It's a new field, log and bump stat.
   ENVOY_LOG(warn, "Unknown field: {}", description);
-  if (counter_ == nullptr) {
-    ++prestats_count_;
+  if (unknown_counter_ == nullptr) {
+    ++prestats_unknown_count_;
   } else {
-    counter_->inc();
+    unknown_counter_->inc();
   }
+}
+
+void WarningValidationVisitorImpl::onDeprecatedField(absl::string_view description,
+                                                     bool soft_deprecation) {
+  onDeprecatedFieldCommon(description, soft_deprecation);
+}
+
+void WarningValidationVisitorImpl::onWorkInProgress(absl::string_view description) {
+  onWorkInProgressCommon(description);
 }
 
 void StrictValidationVisitorImpl::onUnknownField(absl::string_view description) {
   throw UnknownProtoFieldException(
       absl::StrCat("Protobuf message (", description, ") has unknown fields"));
+}
+
+void StrictValidationVisitorImpl::onDeprecatedField(absl::string_view description,
+                                                    bool soft_deprecation) {
+  onDeprecatedFieldCommon(description, soft_deprecation);
+}
+
+void StrictValidationVisitorImpl::onWorkInProgress(absl::string_view description) {
+  onWorkInProgressCommon(description);
 }
 
 ValidationVisitor& getNullValidationVisitor() {

@@ -1,10 +1,10 @@
-#include "extensions/filters/http/fault/config.h"
+#include "source/extensions/filters/http/fault/config.h"
 
 #include "envoy/extensions/filters/http/fault/v3/fault.pb.h"
 #include "envoy/extensions/filters/http/fault/v3/fault.pb.validate.h"
 #include "envoy/registry/registry.h"
 
-#include "extensions/filters/http/fault/fault_filter.h"
+#include "source/extensions/filters/http/fault/fault_filter.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -31,8 +31,8 @@ FaultFilterFactory::createRouteSpecificFilterConfigTyped(
 /**
  * Static registration for the fault filter. @see RegisterFactory.
  */
-REGISTER_FACTORY(FaultFilterFactory,
-                 Server::Configuration::NamedHttpFilterConfigFactory){"envoy.fault"};
+LEGACY_REGISTER_FACTORY(FaultFilterFactory, Server::Configuration::NamedHttpFilterConfigFactory,
+                        "envoy.fault");
 
 } // namespace Fault
 } // namespace HttpFilters

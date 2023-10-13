@@ -5,8 +5,7 @@
 #include "envoy/server/filter_config.h"
 #include "envoy/stream_info/filter_state.h"
 
-#include "extensions/filters/http/common/factory_base.h"
-#include "extensions/filters/http/well_known_names.h"
+#include "source/extensions/filters/http/common/factory_base.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -24,12 +23,16 @@ struct GrpcStatsObject : public StreamInfo::FilterState::Object {
     msg->set_response_message_count(response_message_count);
     return msg;
   }
+
+  absl::optional<std::string> serializeAsString() const override {
+    return absl::StrCat(request_message_count, ",", response_message_count);
+  }
 };
 
 class GrpcStatsFilterConfigFactory
     : public Common::FactoryBase<envoy::extensions::filters::http::grpc_stats::v3::FilterConfig> {
 public:
-  GrpcStatsFilterConfigFactory() : FactoryBase(HttpFilterNames::get().GrpcStats) {}
+  GrpcStatsFilterConfigFactory() : FactoryBase("envoy.filters.http.grpc_stats") {}
 
 private:
   Http::FilterFactoryCb createFilterFactoryFromProtoTyped(

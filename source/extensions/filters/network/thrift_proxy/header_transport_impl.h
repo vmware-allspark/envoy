@@ -4,10 +4,10 @@
 
 #include "envoy/buffer/buffer.h"
 
-#include "extensions/filters/network/thrift_proxy/app_exception_impl.h"
-#include "extensions/filters/network/thrift_proxy/metadata.h"
-#include "extensions/filters/network/thrift_proxy/thrift.h"
-#include "extensions/filters/network/thrift_proxy/transport.h"
+#include "source/extensions/filters/network/thrift_proxy/app_exception_impl.h"
+#include "source/extensions/filters/network/thrift_proxy/metadata.h"
+#include "source/extensions/filters/network/thrift_proxy/thrift.h"
+#include "source/extensions/filters/network/thrift_proxy/transport.h"
 
 #include "absl/types/optional.h"
 
@@ -44,15 +44,6 @@ private:
   static std::string drainVarString(Buffer::Instance& buffer, int32_t& header_size,
                                     const char* desc);
   static void writeVarString(Buffer::Instance& buffer, const absl::string_view str);
-
-  void setException(AppExceptionType type, std::string reason) {
-    if (exception_.has_value()) {
-      return;
-    }
-
-    exception_ = type;
-    exception_reason_ = reason;
-  }
 
   absl::optional<AppExceptionType> exception_;
   std::string exception_reason_;

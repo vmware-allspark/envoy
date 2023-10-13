@@ -1,11 +1,14 @@
+#pragma once
+
 #include "envoy/event/dispatcher.h"
 #include "envoy/service/load_stats/v3/lrs.pb.h"
 #include "envoy/stats/scope.h"
 #include "envoy/stats/stats_macros.h"
 #include "envoy/upstream/cluster_manager.h"
 
-#include "common/common/logger.h"
-#include "common/grpc/async_client_impl.h"
+#include "source/common/common/logger.h"
+#include "source/common/grpc/async_client_impl.h"
+#include "source/common/grpc/typed_async_client.h"
 
 namespace Envoy {
 namespace Upstream {
@@ -31,7 +34,6 @@ class LoadStatsReporter
 public:
   LoadStatsReporter(const LocalInfo::LocalInfo& local_info, ClusterManager& cluster_manager,
                     Stats::Scope& scope, Grpc::RawAsyncClientPtr async_client,
-                    envoy::config::core::v3::ApiVersion transport_api_version,
                     Event::Dispatcher& dispatcher);
 
   // Grpc::AsyncStreamCallbacks
@@ -57,7 +59,6 @@ private:
   Grpc::AsyncClient<envoy::service::load_stats::v3::LoadStatsRequest,
                     envoy::service::load_stats::v3::LoadStatsResponse>
       async_client_;
-  const envoy::config::core::v3::ApiVersion transport_api_version_;
   Grpc::AsyncStream<envoy::service::load_stats::v3::LoadStatsRequest> stream_{};
   const Protobuf::MethodDescriptor& service_method_;
   Event::TimerPtr retry_timer_;
@@ -65,7 +66,7 @@ private:
   envoy::service::load_stats::v3::LoadStatsRequest request_;
   std::unique_ptr<envoy::service::load_stats::v3::LoadStatsResponse> message_;
   // Map from cluster name to start of measurement interval.
-  std::unordered_map<std::string, std::chrono::steady_clock::duration> clusters_;
+  absl::node_hash_map<std::string, std::chrono::steady_clock::duration> clusters_;
   TimeSource& time_source_;
 };
 

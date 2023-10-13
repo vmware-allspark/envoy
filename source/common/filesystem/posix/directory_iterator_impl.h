@@ -4,7 +4,7 @@
 
 #include "envoy/filesystem/filesystem.h"
 
-#include "common/api/os_sys_calls_impl.h"
+#include "source/common/api/os_sys_calls_impl.h"
 
 namespace Envoy {
 namespace Filesystem {
@@ -28,11 +28,14 @@ public:
 private:
   void nextEntry();
   void openDirectory();
-  FileType fileType(const std::string& name) const;
+
+  DirectoryEntry makeEntry(absl::string_view filename) const;
 
   std::string directory_path_;
   DIR* dir_{nullptr};
   Api::OsSysCallsImpl& os_sys_calls_;
+
+  friend class DirectoryTest_MakeEntryThrowsOnStatFailure_Test;
 };
 
 } // namespace Filesystem

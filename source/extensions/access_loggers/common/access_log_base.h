@@ -2,15 +2,14 @@
 
 #include <cstdint>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include "envoy/access_log/access_log.h"
 #include "envoy/runtime/runtime.h"
 #include "envoy/server/access_log_config.h"
 
-#include "common/http/header_utility.h"
-#include "common/protobuf/protobuf.h"
+#include "source/common/http/header_utility.h"
+#include "source/common/protobuf/protobuf.h"
 
 namespace Envoy {
 namespace Extensions {

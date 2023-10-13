@@ -1,8 +1,9 @@
 #pragma once
 
+#include "envoy/network/connection.h"
 #include "envoy/network/filter.h"
 
-#include "common/common/logger.h"
+#include "source/common/common/logger.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -23,6 +24,7 @@ public:
   Network::FilterStatus onNewConnection() override;
   void initializeReadFilterCallbacks(Network::ReadFilterCallbacks& callbacks) override {
     read_callbacks_ = &callbacks;
+    read_callbacks_->connection().enableHalfClose(true);
   }
 
 private:

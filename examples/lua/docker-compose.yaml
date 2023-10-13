@@ -1,33 +1,14 @@
-version: "3.7"
 services:
 
   proxy:
     build:
-      context: .
-      dockerfile: Dockerfile-proxy
-    volumes:
-      - ./envoy.yaml:/etc/envoy.yaml
-    networks:
-      - envoymesh
-    expose:
-      - "80"
-      - "8001"
+      dockerfile: ../shared/envoy/Dockerfile
+      target: envoy-lua
     ports:
-      - "8000:80"
-      - "8001:8001"
+    - "${PORT_PROXY:-8000}:8000"
 
   web_service:
     build:
-      context: .
-      dockerfile: Dockerfile-web-service
-    networks:
-      envoymesh:
-        aliases:
-          - web_service
-    expose:
-      - "80"
+      context: ../shared/echo
     ports:
-      - "8080:80"
-
-networks:
-  envoymesh: {}
+    - "${PORT_WEB:-8080}:8080"

@@ -7,8 +7,9 @@
 #include "envoy/config/subscription.h"
 #include "envoy/service/discovery/v3/discovery.pb.h"
 
-#include "common/common/assert.h"
-#include "common/common/logger.h"
+#include "source/common/common/assert.h"
+#include "source/common/common/logger.h"
+#include "source/common/config/custom_config_validators.h"
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
@@ -17,16 +18,18 @@ namespace Envoy {
 namespace Config {
 
 struct AddedRemoved {
-  AddedRemoved(std::set<std::string>&& added, std::set<std::string>&& removed)
+  AddedRemoved(absl::flat_hash_set<std::string>&& added, absl::flat_hash_set<std::string>&& removed)
       : added_(std::move(added)), removed_(std::move(removed)) {}
-  std::set<std::string> added_;
-  std::set<std::string> removed_;
+  absl::flat_hash_set<std::string> added_;
+  absl::flat_hash_set<std::string> removed_;
 };
 
 struct Watch {
-  Watch(SubscriptionCallbacks& callbacks) : callbacks_(callbacks) {}
+  Watch(SubscriptionCallbacks& callbacks, OpaqueResourceDecoder& resource_decoder)
+      : callbacks_(callbacks), resource_decoder_(resource_decoder) {}
   SubscriptionCallbacks& callbacks_;
-  std::set<std::string> resource_names_; // must be sorted set, for set_difference.
+  OpaqueResourceDecoder& resource_decoder_;
+  absl::flat_hash_set<std::string> resource_names_;
   // Needed only for state-of-the-world.
   // Whether the most recent update contained any resources this watch cares about.
   // If true, a new update that also contains no resources can skip this watch.
@@ -56,14 +59,17 @@ struct Watch {
 // update the subscription accordingly.
 //
 // A WatchMap is assumed to be dedicated to a single type_url type of resource (EDS, CDS, etc).
-class WatchMap : public SubscriptionCallbacks, public Logger::Loggable<Logger::Id::config> {
+class WatchMap : public UntypedConfigUpdateCallbacks, public Logger::Loggable<Logger::Id::config> {
 public:
-  WatchMap() = default;
+  WatchMap(const bool use_namespace_matching, const std::string& type_url,
+           CustomConfigValidators& config_validators)
+      : use_namespace_matching_(use_namespace_matching), type_url_(type_url),
+        config_validators_(config_validators) {}
 
   // Adds 'callbacks' to the WatchMap, with every possible resource being watched.
   // (Use updateWatchInterest() to narrow it down to some specific names).
   // Returns the newly added watch, to be used with updateWatchInterest and removeWatch.
-  Watch* addWatch(SubscriptionCallbacks& callbacks);
+  Watch* addWatch(SubscriptionCallbacks& callbacks, OpaqueResourceDecoder& resource_decoder);
 
   // Updates the set of resource names that the given watch should watch.
   // Returns any resource name additions/removals that are unique across all watches. That is:
@@ -71,41 +77,40 @@ public:
   // 2) if 'resources' does not contain Y, and this watch was the only one that cared about Y,
   //    Y will be in removed_.
   AddedRemoved updateWatchInterest(Watch* watch,
-                                   const std::set<std::string>& update_to_these_names);
+                                   const absl::flat_hash_set<std::string>& update_to_these_names);
 
   // Expects that the watch to be removed has already had all of its resource names removed via
   // updateWatchInterest().
   void removeWatch(Watch* watch);
 
-  // checks is a watch for an alias exists and replaces it with the resource's name
-  AddedRemoved
-  convertAliasWatchesToNameWatches(const envoy::service::discovery::v3::Resource& resource);
-
-  // SubscriptionCallbacks
+  // UntypedConfigUpdateCallbacks.
   void onConfigUpdate(const Protobuf::RepeatedPtrField<ProtobufWkt::Any>& resources,
                       const std::string& version_info) override;
+
+  void onConfigUpdate(const std::vector<DecodedResourcePtr>& resources,
+                      const std::string& version_info) override;
+
   void onConfigUpdate(
       const Protobuf::RepeatedPtrField<envoy::service::discovery::v3::Resource>& added_resources,
       const Protobuf::RepeatedPtrField<std::string>& removed_resources,
       const std::string& system_version_info) override;
-
   void onConfigUpdateFailed(ConfigUpdateFailureReason reason, const EnvoyException* e) override;
-
-  std::string resourceName(const ProtobufWkt::Any&) override { NOT_IMPLEMENTED_GCOVR_EXCL_LINE; }
 
   WatchMap(const WatchMap&) = delete;
   WatchMap& operator=(const WatchMap&) = delete;
 
 private:
+  void removeDeferredWatches();
+
   // Given a list of names that are new to an individual watch, returns those names that are in fact
   // new to the entire subscription.
-  std::set<std::string> findAdditions(const std::vector<std::string>& newly_added_to_watch,
-                                      Watch* watch);
+  absl::flat_hash_set<std::string>
+  findAdditions(const absl::flat_hash_set<std::string>& newly_added_to_watch, Watch* watch);
 
   // Given a list of names that an individual watch no longer cares about, returns those names that
   // in fact the entire subscription no longer cares about.
-  std::set<std::string> findRemovals(const std::vector<std::string>& newly_removed_from_watch,
-                                     Watch* watch);
+  absl::flat_hash_set<std::string>
+  findRemovals(const absl::flat_hash_set<std::string>& newly_removed_from_watch, Watch* watch);
 
   // Returns the union of watch_interest_[resource_name] and wildcard_watches_.
   absl::flat_hash_set<Watch*> watchesInterestedIn(const std::string& resource_name);
@@ -115,10 +120,19 @@ private:
   // Watches whose interest set is currently empty, which is interpreted as "everything".
   absl::flat_hash_set<Watch*> wildcard_watches_;
 
+  // Watches that have been removed inside the call stack of the WatchMap's onConfigUpdate(). This
+  // can happen when a watch's onConfigUpdate() results in another watch being removed via
+  // removeWatch().
+  std::unique_ptr<absl::flat_hash_set<Watch*>> deferred_removed_during_update_;
+
   // Maps a resource name to the set of watches interested in that resource. Has two purposes:
   // 1) Acts as a reference count; no watches care anymore ==> the resource can be removed.
   // 2) Enables efficient lookup of all interested watches when a resource has been updated.
   absl::flat_hash_map<std::string, absl::flat_hash_set<Watch*>> watch_interest_;
+
+  const bool use_namespace_matching_;
+  const std::string type_url_;
+  CustomConfigValidators& config_validators_;
 };
 
 } // namespace Config

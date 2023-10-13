@@ -1,5 +1,3 @@
-licenses(["notice"])  # Apache 2
-
 load(
     "//bazel:envoy_build_system.bzl",
     "envoy_package",
@@ -9,12 +7,14 @@ load(
     "envoy_extension_cc_test",
 )
 
+licenses(["notice"])  # Apache 2
+
 envoy_package()
 
 envoy_extension_cc_test(
     name = "csrf_filter_test",
     srcs = ["csrf_filter_test.cc"],
-    extension_name = "envoy.filters.http.csrf",
+    extension_names = ["envoy.filters.http.csrf"],
     deps = [
         "//source/common/http:header_map_lib",
         "//source/extensions/filters/http/csrf:config",
@@ -29,8 +29,12 @@ envoy_extension_cc_test(
 
 envoy_extension_cc_test(
     name = "csrf_filter_integration_test",
+    size = "large",
     srcs = ["csrf_filter_integration_test.cc"],
-    extension_name = "envoy.filters.http.csrf",
+    extension_names = ["envoy.filters.http.csrf"],
+    # TODO(kbaichoo): remove when deferred processing is enabled by default and the
+    # test is no longer parameterized by it.
+    shard_count = 4,
     deps = [
         "//source/extensions/filters/http/csrf:config",
         "//test/config:utility_lib",

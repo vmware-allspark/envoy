@@ -6,22 +6,20 @@ using testing::Invoke;
 namespace Envoy {
 namespace Http {
 
-MockStreamDecoder::MockStreamDecoder() = default;
-MockStreamDecoder::~MockStreamDecoder() = default;
-
 MockRequestDecoder::MockRequestDecoder() {
-  ON_CALL(*this, decodeHeaders_(_, _)).WillByDefault(Invoke([](RequestHeaderMapPtr& headers, bool) {
-    // Check to see that method is not-null. Path can be null for CONNECT and authority can be null
-    // at the codec level.
-    ASSERT(headers->Method() != nullptr);
-  }));
+  ON_CALL(*this, decodeHeaders_(_, _))
+      .WillByDefault(Invoke([](RequestHeaderMapSharedPtr& headers, bool) {
+        // Check to see that method is not-null. Path can be null for CONNECT and authority can be
+        // null at the codec level.
+        ASSERT_NE(nullptr, headers->Method());
+      }));
 }
 MockRequestDecoder::~MockRequestDecoder() = default;
 
 MockResponseDecoder::MockResponseDecoder() {
   ON_CALL(*this, decodeHeaders_(_, _))
       .WillByDefault(Invoke(
-          [](ResponseHeaderMapPtr& headers, bool) { ASSERT(headers->Status() != nullptr); }));
+          [](ResponseHeaderMapPtr& headers, bool) { ASSERT_NE(nullptr, headers->Status()); }));
 }
 MockResponseDecoder::~MockResponseDecoder() = default;
 

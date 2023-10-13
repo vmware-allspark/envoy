@@ -1,8 +1,9 @@
-#include "envoy/config/retry/omit_canary_hosts/v2/omit_canary_hosts.pb.validate.h"
+#pragma once
+
+#include "envoy/extensions/retry/host/omit_canary_hosts/v3/omit_canary_hosts.pb.validate.h"
 #include "envoy/upstream/retry.h"
 
-#include "extensions/retry/host/omit_canary_hosts/omit_canary_hosts.h"
-#include "extensions/retry/host/well_known_names.h"
+#include "source/extensions/retry/host/omit_canary_hosts/omit_canary_hosts.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -17,13 +18,11 @@ public:
     return std::make_shared<OmitCanaryHostsRetryPredicate>();
   }
 
-  std::string name() const override {
-    return RetryHostPredicateValues::get().OmitCanaryHostsPredicate;
-  }
+  std::string name() const override { return "envoy.retry_host_predicates.omit_canary_hosts"; }
 
   ProtobufTypes::MessagePtr createEmptyConfigProto() override {
     return std::make_unique<
-        envoy::config::retry::omit_canary_hosts::v2::OmitCanaryHostsPredicate>();
+        envoy::extensions::retry::host::omit_canary_hosts::v3::OmitCanaryHostsPredicate>();
   }
 };
 

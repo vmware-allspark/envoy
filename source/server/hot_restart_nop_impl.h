@@ -4,8 +4,8 @@
 
 #include "envoy/server/hot_restart.h"
 
-#include "common/common/thread.h"
-#include "common/stats/allocator_impl.h"
+#include "source/common/common/thread.h"
+#include "source/common/stats/allocator_impl.h"
 
 namespace Envoy {
 namespace Server {
@@ -17,12 +17,15 @@ class HotRestartNopImpl : public Server::HotRestart {
 public:
   // Server::HotRestart
   void drainParentListeners() override {}
-  int duplicateParentListenSocket(const std::string&) override { return -1; }
+  int duplicateParentListenSocket(const std::string&, uint32_t) override { return -1; }
   void initialize(Event::Dispatcher&, Server::Instance&) override {}
-  void sendParentAdminShutdownRequest(time_t&) override {}
+  absl::optional<AdminShutdownResponse> sendParentAdminShutdownRequest() override {
+    return absl::nullopt;
+  }
   void sendParentTerminateRequest() override {}
   ServerStatsFromParent mergeParentStatsIfAny(Stats::StoreRoot&) override { return {}; }
   void shutdown() override {}
+  uint32_t baseId() override { return 0; }
   std::string version() override { return "disabled"; }
   Thread::BasicLockable& logLock() override { return log_lock_; }
   Thread::BasicLockable& accessLogLock() override { return access_log_lock_; }

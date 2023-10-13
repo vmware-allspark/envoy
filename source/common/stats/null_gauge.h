@@ -2,7 +2,7 @@
 
 #include "envoy/stats/stats.h"
 
-#include "common/stats/metric_impl.h"
+#include "source/common/stats/metric_impl.h"
 
 namespace Envoy {
 namespace Stats {
@@ -27,6 +27,7 @@ public:
   void inc() override {}
   void dec() override {}
   void set(uint64_t) override {}
+  void setParentValue(uint64_t) override {}
   void sub(uint64_t) override {}
   uint64_t value() const override { return 0; }
   ImportMode importMode() const override { return ImportMode::NeverImport; }

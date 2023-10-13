@@ -1,5 +1,8 @@
 #pragma once
 
+#include <memory>
+
+#include "envoy/config/metrics/v3/metrics_service.pb.h"
 #include "envoy/grpc/async_client.h"
 #include "envoy/local_info/local_info.h"
 #include "envoy/network/connection.h"
@@ -10,81 +13,139 @@
 #include "envoy/stats/stats.h"
 #include "envoy/upstream/cluster_manager.h"
 
-#include "common/buffer/buffer_impl.h"
-#include "common/grpc/typed_async_client.h"
+#include "source/common/buffer/buffer_impl.h"
+#include "source/common/grpc/typed_async_client.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace StatSinks {
 namespace MetricsService {
 
+using MetricsPtr =
+    std::unique_ptr<Envoy::Protobuf::RepeatedPtrField<io::prometheus::client::MetricFamily>>;
+using HistogramEmitMode = envoy::config::metrics::v3::HistogramEmitMode;
+
 /**
  * Interface for metrics streamer.
  */
-class GrpcMetricsStreamer
-    : public Grpc::AsyncStreamCallbacks<envoy::service::metrics::v3::StreamMetricsResponse> {
+template <class RequestProto, class ResponseProto>
+class GrpcMetricsStreamer : public Grpc::AsyncStreamCallbacks<ResponseProto> {
 public:
+  explicit GrpcMetricsStreamer(const Grpc::RawAsyncClientSharedPtr& raw_async_client)
+      : client_(raw_async_client) {}
   ~GrpcMetricsStreamer() override = default;
 
   /**
    * Send Metrics Message.
    * @param message supplies the metrics to send.
    */
-  virtual void send(envoy::service::metrics::v3::StreamMetricsMessage& message) PURE;
+  virtual void send(MetricsPtr&& metrics) PURE;
 
   // Grpc::AsyncStreamCallbacks
   void onCreateInitialMetadata(Http::RequestHeaderMap&) override {}
   void onReceiveInitialMetadata(Http::ResponseHeaderMapPtr&&) override {}
-  void
-  onReceiveMessage(std::unique_ptr<envoy::service::metrics::v3::StreamMetricsResponse>&&) override {
-  }
+  void onReceiveMessage(std::unique_ptr<ResponseProto>&&) override {}
   void onReceiveTrailingMetadata(Http::ResponseTrailerMapPtr&&) override {}
   void onRemoteClose(Grpc::Status::GrpcStatus, const std::string&) override{};
+
+protected:
+  Grpc::AsyncStream<RequestProto> stream_{};
+  Grpc::AsyncClient<RequestProto, ResponseProto> client_;
 };
 
-using GrpcMetricsStreamerSharedPtr = std::shared_ptr<GrpcMetricsStreamer>;
+template <class RequestProto, class ResponseProto>
+using GrpcMetricsStreamerSharedPtr =
+    std::shared_ptr<GrpcMetricsStreamer<RequestProto, ResponseProto>>;
 
 /**
  * Production implementation of GrpcMetricsStreamer
  */
-class GrpcMetricsStreamerImpl : public Singleton::Instance, public GrpcMetricsStreamer {
+class GrpcMetricsStreamerImpl
+    : public Singleton::Instance,
+      public GrpcMetricsStreamer<envoy::service::metrics::v3::StreamMetricsMessage,
+                                 envoy::service::metrics::v3::StreamMetricsResponse> {
 public:
-  GrpcMetricsStreamerImpl(Grpc::AsyncClientFactoryPtr&& factory,
+  GrpcMetricsStreamerImpl(Grpc::RawAsyncClientSharedPtr raw_async_client,
                           const LocalInfo::LocalInfo& local_info);
 
   // GrpcMetricsStreamer
-  void send(envoy::service::metrics::v3::StreamMetricsMessage& message) override;
+  void send(MetricsPtr&& metrics) override;
 
   // Grpc::AsyncStreamCallbacks
   void onRemoteClose(Grpc::Status::GrpcStatus, const std::string&) override { stream_ = nullptr; }
 
 private:
-  Grpc::AsyncStream<envoy::service::metrics::v3::StreamMetricsMessage> stream_{};
-  Grpc::AsyncClient<envoy::service::metrics::v3::StreamMetricsMessage,
-                    envoy::service::metrics::v3::StreamMetricsResponse>
-      client_;
   const LocalInfo::LocalInfo& local_info_;
+  const Protobuf::MethodDescriptor& service_method_;
+};
+
+using GrpcMetricsStreamerImplPtr = std::unique_ptr<GrpcMetricsStreamerImpl>;
+
+class MetricsFlusher {
+public:
+  MetricsFlusher(
+      bool report_counters_as_deltas, bool emit_labels, HistogramEmitMode histogram_emit_mode,
+      std::function<bool(const Stats::Metric&)> predicate =
+          [](const auto& metric) { return metric.used(); })
+      : report_counters_as_deltas_(report_counters_as_deltas), emit_labels_(emit_labels),
+        emit_summary_(histogram_emit_mode == HistogramEmitMode::SUMMARY_AND_HISTOGRAM ||
+                      histogram_emit_mode == HistogramEmitMode::SUMMARY),
+        emit_histogram_(histogram_emit_mode == HistogramEmitMode::SUMMARY_AND_HISTOGRAM ||
+                        histogram_emit_mode == HistogramEmitMode::HISTOGRAM),
+        predicate_(predicate) {}
+
+  MetricsPtr flush(Stats::MetricSnapshot& snapshot) const;
+
+private:
+  void flushCounter(io::prometheus::client::MetricFamily& metrics_family,
+                    const Stats::MetricSnapshot::CounterSnapshot& counter_snapshot,
+                    int64_t snapshot_time_ms) const;
+  void flushGauge(io::prometheus::client::MetricFamily& metrics_family, const Stats::Gauge& gauge,
+                  int64_t snapshot_time_ms) const;
+  void flushHistogram(io::prometheus::client::MetricFamily& metrics_family,
+                      const Stats::ParentHistogram& envoy_histogram,
+                      int64_t snapshot_time_ms) const;
+  void flushSummary(io::prometheus::client::MetricFamily& metrics_family,
+                    const Stats::ParentHistogram& envoy_histogram, int64_t snapshot_time_ms) const;
+
+  io::prometheus::client::Metric*
+  populateMetricsFamily(io::prometheus::client::MetricFamily& metrics_family,
+                        io::prometheus::client::MetricType type, int64_t snapshot_time_ms,
+                        const Stats::Metric& metric) const;
+
+  const bool report_counters_as_deltas_;
+  const bool emit_labels_;
+  const bool emit_summary_;
+  const bool emit_histogram_;
+  const std::function<bool(const Stats::Metric&)> predicate_;
 };
 
 /**
- * Stat Sink implementation of Metrics Service.
+ * Stat Sink that flushes metrics via a gRPC service.
  */
-class MetricsServiceSink : public Stats::Sink {
+template <class RequestProto, class ResponseProto> class MetricsServiceSink : public Stats::Sink {
 public:
+  MetricsServiceSink(
+      const GrpcMetricsStreamerSharedPtr<RequestProto, ResponseProto>& grpc_metrics_streamer,
+      bool report_counters_as_deltas, bool emit_labels, HistogramEmitMode histogram_emit_mode)
+      : MetricsServiceSink(
+            grpc_metrics_streamer,
+            MetricsFlusher(report_counters_as_deltas, emit_labels, histogram_emit_mode)) {}
+
+  MetricsServiceSink(
+      const GrpcMetricsStreamerSharedPtr<RequestProto, ResponseProto>& grpc_metrics_streamer,
+      MetricsFlusher&& flusher)
+      : flusher_(std::move(flusher)), grpc_metrics_streamer_(std::move(grpc_metrics_streamer)) {}
+
   // MetricsService::Sink
-  MetricsServiceSink(const GrpcMetricsStreamerSharedPtr& grpc_metrics_streamer,
-                     TimeSource& time_system);
-  void flush(Stats::MetricSnapshot& snapshot) override;
+  void flush(Stats::MetricSnapshot& snapshot) override {
+    grpc_metrics_streamer_->send(flusher_.flush(snapshot));
+  }
   void onHistogramComplete(const Stats::Histogram&, uint64_t) override {}
 
-  void flushCounter(const Stats::Counter& counter);
-  void flushGauge(const Stats::Gauge& gauge);
-  void flushHistogram(const Stats::ParentHistogram& envoy_histogram);
-
 private:
-  GrpcMetricsStreamerSharedPtr grpc_metrics_streamer_;
-  envoy::service::metrics::v3::StreamMetricsMessage message_;
-  TimeSource& time_source_;
+  const MetricsFlusher flusher_;
+  GrpcMetricsStreamerSharedPtr<RequestProto, ResponseProto> grpc_metrics_streamer_;
 };
 
 } // namespace MetricsService

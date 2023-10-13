@@ -1,19 +1,24 @@
 #pragma once
 
+#include <memory>
+
 #include "envoy/config/core/v3/base.pb.h"
 #include "envoy/config/core/v3/grpc_service.pb.h"
 #include "envoy/grpc/async_client.h"
 
-#include "common/common/linked_object.h"
-#include "common/grpc/codec.h"
-#include "common/grpc/typed_async_client.h"
-#include "common/http/async_client_impl.h"
+#include "source/common/common/linked_object.h"
+#include "source/common/grpc/codec.h"
+#include "source/common/grpc/typed_async_client.h"
+#include "source/common/http/async_client_impl.h"
+#include "source/common/router/header_parser.h"
 
 namespace Envoy {
 namespace Grpc {
 
 class AsyncRequestImpl;
+
 class AsyncStreamImpl;
+using AsyncStreamImplPtr = std::unique_ptr<AsyncStreamImpl>;
 
 class AsyncClientImpl final : public RawAsyncClient {
 public:
@@ -29,13 +34,16 @@ public:
   RawAsyncStream* startRaw(absl::string_view service_full_name, absl::string_view method_name,
                            RawAsyncStreamCallbacks& callbacks,
                            const Http::AsyncClient::StreamOptions& options) override;
+  absl::string_view destination() override { return remote_cluster_name_; }
 
 private:
   Upstream::ClusterManager& cm_;
   const std::string remote_cluster_name_;
-  const Protobuf::RepeatedPtrField<envoy::config::core::v3::HeaderValue> initial_metadata_;
-  std::list<std::unique_ptr<AsyncStreamImpl>> active_streams_;
+  // The host header value in the http transport.
+  const std::string host_name_;
+  std::list<AsyncStreamImplPtr> active_streams_;
   TimeSource& time_source_;
+  Router::HeaderParserPtr metadata_parser_;
 
   friend class AsyncRequestImpl;
   friend class AsyncStreamImpl;
@@ -44,7 +52,7 @@ private:
 class AsyncStreamImpl : public RawAsyncStream,
                         Http::AsyncClient::StreamCallbacks,
                         public Event::DeferredDeletable,
-                        LinkedObject<AsyncStreamImpl> {
+                        public LinkedObject<AsyncStreamImpl> {
 public:
   AsyncStreamImpl(AsyncClientImpl& parent, absl::string_view service_full_name,
                   absl::string_view method_name, RawAsyncStreamCallbacks& callbacks,
@@ -65,6 +73,9 @@ public:
   void sendMessageRaw(Buffer::InstancePtr&& request, bool end_stream) override;
   void closeStream() override;
   void resetStream() override;
+  bool isAboveWriteBufferHighWatermark() const override {
+    return stream_ && stream_->isAboveWriteBufferHighWatermark();
+  }
 
   bool hasResetStream() const { return http_reset_; }
 

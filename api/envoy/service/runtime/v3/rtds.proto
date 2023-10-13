@@ -15,10 +15,10 @@ import "validate/validate.proto";
 option java_package = "io.envoyproxy.envoy.service.runtime.v3";
 option java_outer_classname = "RtdsProto";
 option java_multiple_files = true;
-option java_generic_services = true;
+option go_package = "github.com/envoyproxy/go-control-plane/envoy/service/runtime/v3;runtimev3";
 option (udpa.annotations.file_status).package_version_status = ACTIVE;
 
-// [#protodoc-title: Runtime Discovery Service (RTDS)]
+// [#protodoc-title: Runtime discovery service (RTDS)]
 // RTDS :ref:`configuration overview <config_runtime_rtds>`
 
 // Discovery service for Runtime resources.
@@ -52,7 +52,7 @@ message Runtime {
 
   // Runtime resource name. This makes the Runtime a self-describing xDS
   // resource.
-  string name = 1 [(validate.rules).string = {min_bytes: 1}];
+  string name = 1 [(validate.rules).string = {min_len: 1}];
 
   google.protobuf.Struct layer = 2;
 }

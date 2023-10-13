@@ -1,23 +1,23 @@
-#include "server/hot_restarting_parent.h"
+#include "source/server/hot_restarting_parent.h"
 
 #include "envoy/server/instance.h"
 
-#include "common/memory/stats.h"
-#include "common/network/utility.h"
-#include "common/stats/stat_merger.h"
-#include "common/stats/symbol_table_impl.h"
-
-#include "server/listener_impl.h"
+#include "source/common/memory/stats.h"
+#include "source/common/network/utility.h"
+#include "source/common/stats/stat_merger.h"
+#include "source/common/stats/symbol_table.h"
+#include "source/common/stats/utility.h"
 
 namespace Envoy {
 namespace Server {
 
 using HotRestartMessage = envoy::HotRestartMessage;
 
-HotRestartingParent::HotRestartingParent(int base_id, int restart_epoch)
+HotRestartingParent::HotRestartingParent(int base_id, int restart_epoch,
+                                         const std::string& socket_path, mode_t socket_mode)
     : HotRestartingBase(base_id), restart_epoch_(restart_epoch) {
-  child_address_ = createDomainSocketAddress(restart_epoch_ + 1, "child");
-  bindDomainSocket(restart_epoch_, "parent");
+  child_address_ = createDomainSocketAddress(restart_epoch_ + 1, "child", socket_path, socket_mode);
+  bindDomainSocket(restart_epoch_, "parent", socket_path, socket_mode);
 }
 
 void HotRestartingParent::initialize(Event::Dispatcher& dispatcher, Server::Instance& server) {
@@ -85,16 +85,8 @@ void HotRestartingParent::onSocketEvent() {
 void HotRestartingParent::shutdown() { socket_event_.reset(); }
 
 HotRestartingParent::Internal::Internal(Server::Instance* server) : server_(server) {
-  // Track the hot-restart generation. Using gauge's accumulate semantics,
-  // the increments will be combined across hot-restart. This may be useful
-  // at some point, though the main motivation for this stat is to enable
-  // an integration test showing that dynamic stat-names can be coalesced
-  // across hot-restarts. There's no other reason this particular stat-name
-  // needs to be created dynamically.
-  Stats::StatNameDynamicPool pool(server_->stats().symbolTable());
-  Stats::Gauge& gauge = server_->stats().gaugeFromStatName(
-      pool.add("server.hot_restart_generation"), Stats::Gauge::ImportMode::Accumulate);
-  gauge.inc();
+  Stats::Gauge& hot_restart_generation = hotRestartGeneration(*server->stats().rootScope());
+  hot_restart_generation.inc();
 }
 
 HotRestartMessage HotRestartingParent::Internal::shutdownAdmin() {
@@ -102,6 +94,8 @@ HotRestartMessage HotRestartingParent::Internal::shutdownAdmin() {
   HotRestartMessage wrapped_reply;
   wrapped_reply.mutable_reply()->mutable_shutdown_admin()->set_original_start_time_unix_seconds(
       server_->startTimeFirstEpoch());
+  wrapped_reply.mutable_reply()->mutable_shutdown_admin()->set_enable_reuse_port_default(
+      server_->enableReusePortDefault());
   return wrapped_reply;
 }
 
@@ -111,15 +105,27 @@ HotRestartingParent::Internal::getListenSocketsForChild(const HotRestartMessage:
   wrapped_reply.mutable_reply()->mutable_pass_listen_socket()->set_fd(-1);
   Network::Address::InstanceConstSharedPtr addr =
       Network::Utility::resolveUrl(request.pass_listen_socket().address());
+
   for (const auto& listener : server_->listenerManager().listeners()) {
-    Network::ListenSocketFactory& socket_factory = listener.get().listenSocketFactory();
-    if (*socket_factory.localAddress() == *addr && listener.get().bindToPort()) {
-      if (socket_factory.sharedSocket().has_value()) {
-        // Pass the socket to the new process iff it is already shared across workers.
-        wrapped_reply.mutable_reply()->mutable_pass_listen_socket()->set_fd(
-            socket_factory.sharedSocket()->get().ioHandle().fd());
+    for (auto& socket_factory : listener.get().listenSocketFactories()) {
+      if (*socket_factory->localAddress() == *addr && listener.get().bindToPort()) {
+        StatusOr<Network::Socket::Type> socket_type =
+            Network::Utility::socketTypeFromUrl(request.pass_listen_socket().address());
+        // socketTypeFromUrl should return a valid value since resolveUrl returned a valid address.
+        ASSERT(socket_type.ok());
+
+        if (socket_factory->socketType() == *socket_type) {
+          // worker_index() will default to 0 if not set which is the behavior before this field
+          // was added. Thus, this should be safe for both roll forward and roll back.
+          if (request.pass_listen_socket().worker_index() < server_->options().concurrency()) {
+            wrapped_reply.mutable_reply()->mutable_pass_listen_socket()->set_fd(
+                socket_factory->getListenSocket(request.pass_listen_socket().worker_index())
+                    ->ioHandle()
+                    .fdDoNotUse());
+          }
+          break;
+        }
       }
-      break;
     }
   }
   return wrapped_reply;
@@ -130,26 +136,26 @@ HotRestartingParent::Internal::getListenSocketsForChild(const HotRestartMessage:
 // magnitude of memory usage that they are meant to avoid, since this map holds full-string
 // names. The problem can be solved by splitting the export up over many chunks.
 void HotRestartingParent::Internal::exportStatsToChild(HotRestartMessage::Reply::Stats* stats) {
-  for (const auto& gauge : server_->stats().gauges()) {
-    if (gauge->used()) {
-      const std::string name = gauge->name();
-      (*stats->mutable_gauges())[name] = gauge->value();
-      recordDynamics(stats, name, gauge->statName());
+  server_->stats().forEachSinkedGauge(nullptr, [this, stats](Stats::Gauge& gauge) mutable {
+    if (gauge.used()) {
+      const std::string name = gauge.name();
+      (*stats->mutable_gauges())[name] = gauge.value();
+      recordDynamics(stats, name, gauge.statName());
     }
-  }
+  });
 
-  for (const auto& counter : server_->stats().counters()) {
-    if (counter->used()) {
+  server_->stats().forEachSinkedCounter(nullptr, [this, stats](Stats::Counter& counter) mutable {
+    if (counter.used()) {
       // The hot restart parent is expected to have stopped its normal stat exporting (and so
       // latching) by the time it begins exporting to the hot restart child.
-      uint64_t latched_value = counter->latch();
+      uint64_t latched_value = counter.latch();
       if (latched_value > 0) {
-        const std::string name = counter->name();
+        const std::string name = counter.name();
         (*stats->mutable_counter_deltas())[name] = latched_value;
-        recordDynamics(stats, name, counter->statName());
+        recordDynamics(stats, name, counter.statName());
       }
     }
-  }
+  });
   stats->set_memory_allocated(Memory::Stats::totalCurrentlyAllocated());
   stats->set_num_connections(server_->listenerManager().numConnections());
 }
