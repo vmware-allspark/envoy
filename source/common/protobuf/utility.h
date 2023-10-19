@@ -15,6 +15,7 @@
 #include "source/common/singleton/const_singleton.h"
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_join.h"
 
 // Obtain the value of a wrapped field (e.g. google.protobuf.UInt32Value) if set. Otherwise, return
@@ -251,6 +252,7 @@ public:
    */
   static std::size_t hash(const Protobuf::Message& message);
 
+#ifdef ENVOY_ENABLE_YAML
   static void loadFromJson(const std::string& json, Protobuf::Message& message,
                            ProtobufMessage::ValidationVisitor& validation_visitor);
   /**
@@ -260,14 +262,14 @@ public:
    * Return error status for relaxed conversion and set has_unknown_field to false if relaxed
    * conversion(ignore unknown field) fails.
    */
-  static Protobuf::util::Status loadFromJsonNoThrow(const std::string& json,
-                                                    Protobuf::Message& message,
-                                                    bool& has_unknown_fileld);
+  static absl::Status loadFromJsonNoThrow(const std::string& json, Protobuf::Message& message,
+                                          bool& has_unknown_fileld);
   static void loadFromJson(const std::string& json, ProtobufWkt::Struct& message);
   static void loadFromYaml(const std::string& yaml, Protobuf::Message& message,
                            ProtobufMessage::ValidationVisitor& validation_visitor);
   static void loadFromFile(const std::string& path, Protobuf::Message& message,
                            ProtobufMessage::ValidationVisitor& validation_visitor, Api::Api& api);
+#endif
 
   /**
    * Checks for use of deprecated fields in message and all sub-messages.
@@ -323,12 +325,14 @@ public:
     }
   }
 
+#ifdef ENVOY_ENABLE_YAML
   template <class MessageType>
   static void loadFromYamlAndValidate(const std::string& yaml, MessageType& message,
                                       ProtobufMessage::ValidationVisitor& validation_visitor) {
     loadFromYaml(yaml, message, validation_visitor);
     validate(message, validation_visitor);
   }
+#endif
 
   /**
    * Downcast and validate protoc-gen-validate constraints on a given protobuf.
@@ -448,6 +452,7 @@ public:
     return reflection->GetString(message, name_field);
   }
 
+#ifdef ENVOY_ENABLE_YAML
   /**
    * Convert between two protobufs via a JSON round-trip. This is used to translate arbitrary
    * messages to/from google.protobuf.Struct.
@@ -456,6 +461,7 @@ public:
    * @param source message.
    * @param dest message.
    */
+  static void jsonConvert(const Protobuf::Message& source, Protobuf::Message& dest);
   static void jsonConvert(const Protobuf::Message& source, ProtobufWkt::Struct& dest);
   static void jsonConvert(const ProtobufWkt::Struct& source,
                           ProtobufMessage::ValidationVisitor& validation_visitor,
@@ -486,7 +492,7 @@ public:
    * @return ProtobufUtil::StatusOr<std::string> of formatted JSON object, or an error status if
    * conversion fails.
    */
-  static ProtobufUtil::StatusOr<std::string>
+  static absl::StatusOr<std::string>
   getJsonStringFromMessage(const Protobuf::Message& message, bool pretty_print = false,
                            bool always_print_primitive_fields = false);
 
@@ -502,6 +508,7 @@ public:
   static std::string getJsonStringFromMessageOrError(const Protobuf::Message& message,
                                                      bool pretty_print = false,
                                                      bool always_print_primitive_fields = false);
+#endif
 
   /**
    * Utility method to create a Struct containing the passed in key/value strings.
@@ -523,7 +530,7 @@ public:
    *
    * @param code the protobuf error code
    */
-  static std::string codeEnumToString(ProtobufUtil::StatusCode code);
+  static std::string codeEnumToString(absl::StatusCode code);
 
   /**
    * Modifies a message such that all sensitive data (that is, fields annotated as
@@ -568,10 +575,12 @@ class ValueUtil {
 public:
   static std::size_t hash(const ProtobufWkt::Value& value) { return MessageUtil::hash(value); }
 
+#ifdef ENVOY_ENABLE_YAML
   /**
    * Load YAML string into ProtobufWkt::Value.
    */
   static ProtobufWkt::Value loadFromYaml(const std::string& yaml);
+#endif
 
   /**
    * Compare two ProtobufWkt::Values for equality.
@@ -673,6 +682,14 @@ public:
    * @throw OutOfRangeException when duration is out-of-range.
    */
   static uint64_t durationToMilliseconds(const ProtobufWkt::Duration& duration);
+
+  /**
+   * Same as DurationUtil::durationToMilliseconds but does not throw an exception.
+   * @param duration protobuf.
+   * @return duration in milliseconds or an error status.
+   */
+  static absl::StatusOr<uint64_t>
+  durationToMillisecondsNoThrow(const ProtobufWkt::Duration& duration);
 
   /**
    * Same as Protobuf::util::TimeUtil::DurationToSeconds but with extra validation logic.

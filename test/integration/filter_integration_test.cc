@@ -12,11 +12,7 @@ public:
     config_helper_.prependFilter(config, testing_downstream_filter_);
   }
 
-  void initialize() override {
-    config_helper_.addRuntimeOverride("envoy.reloadable_features.allow_upstream_filters",
-                                      testing_downstream_filter_ ? "false" : "true");
-    UpstreamDownstreamIntegrationTest::initialize();
-  }
+  void initialize() override { UpstreamDownstreamIntegrationTest::initialize(); }
 
   template <class T> void changeHeadersForStopAllTests(T& headers, bool set_buffer_limit) {
     headers.addCopy("content_size", std::to_string(count_ * size_));
@@ -204,7 +200,9 @@ TEST_P(FilterIntegrationTest, MissingHeadersLocalReplyDownstreamBytesCount) {
   }
 }
 
-TEST_P(FilterIntegrationTest, RoundTripTimeForUpstreamConnection) {
+TEST_P(FilterIntegrationTest, RoundTripTimeForDownstreamConnection) {
+  config_helper_.addRuntimeOverride("envoy.reloadable_features.refresh_rtt_after_request", "true");
+
   config_helper_.prependFilter(R"EOF(
   name: stream-info-to-headers-filter
   )EOF");
@@ -212,19 +210,39 @@ TEST_P(FilterIntegrationTest, RoundTripTimeForUpstreamConnection) {
 
   codec_client_ = makeHttpConnection(lookupPort("http"));
 
-  // Send a headers only request.
-  auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
-  waitForNextUpstreamRequest();
+  // Send first request.
+  {
+    // Send a headers only request.
+    auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+    waitForNextUpstreamRequest();
 
-  // Make sure that the body was injected to the request.
-  EXPECT_TRUE(upstream_request_->complete());
+    // Make sure that the body was injected to the request.
+    EXPECT_TRUE(upstream_request_->complete());
 
-  // Send a headers only response.
-  upstream_request_->encodeHeaders(default_response_headers_, true);
-  ASSERT_TRUE(response->waitForEndStream());
+    // Send a headers only response.
+    upstream_request_->encodeHeaders(default_response_headers_, true);
+    ASSERT_TRUE(response->waitForEndStream());
 
-  // Make sure that round trip time was populated
-  EXPECT_FALSE(response->headers().get(Http::LowerCaseString("round_trip_time")).empty());
+    // Make sure that round trip time was populated
+    EXPECT_FALSE(response->headers().get(Http::LowerCaseString("round_trip_time")).empty());
+  }
+
+  // Send second request.
+  {
+    // Send a headers only request.
+    auto response = codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+    waitForNextUpstreamRequest();
+
+    // Make sure that the body was injected to the request.
+    EXPECT_TRUE(upstream_request_->complete());
+
+    // Send a headers only response.
+    upstream_request_->encodeHeaders(default_response_headers_, true);
+    ASSERT_TRUE(response->waitForEndStream());
+
+    // Make sure that round trip time was populated
+    EXPECT_FALSE(response->headers().get(Http::LowerCaseString("round_trip_time")).empty());
+  }
 }
 
 TEST_P(FilterIntegrationTest, MissingHeadersLocalReplyUpstreamBytesCount) {
@@ -445,7 +463,7 @@ TEST_P(FilterIntegrationTest, DownstreamRequestWithFaultyFilter) {
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_TRUE(response->complete());
   EXPECT_EQ("503", response->headers().getStatusValue());
-  EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("missing_required_header"));
+  EXPECT_THAT(waitForAccessLog(access_log_name_), testing::MatchesRegex(".*required.*header.*"));
 
   // Missing path for non-CONNECT
   response = codec_client_->makeHeaderOnlyRequest(
@@ -457,7 +475,7 @@ TEST_P(FilterIntegrationTest, DownstreamRequestWithFaultyFilter) {
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_TRUE(response->complete());
   EXPECT_EQ("503", response->headers().getStatusValue());
-  EXPECT_THAT(waitForAccessLog(access_log_name_, 1), HasSubstr("missing_required_header"));
+  EXPECT_THAT(waitForAccessLog(access_log_name_, 1), testing::MatchesRegex(".*required.*header.*"));
 }
 
 TEST_P(FilterIntegrationTest, FaultyFilterWithConnect) {
@@ -482,7 +500,7 @@ TEST_P(FilterIntegrationTest, FaultyFilterWithConnect) {
   ASSERT_TRUE(response->waitForEndStream());
   EXPECT_TRUE(response->complete());
   EXPECT_EQ("503", response->headers().getStatusValue());
-  EXPECT_THAT(waitForAccessLog(access_log_name_), HasSubstr("missing_required_header"));
+  EXPECT_THAT(waitForAccessLog(access_log_name_), testing::MatchesRegex(".*required.*header.*"));
 }
 
 // Test hitting the decoder buffer filter with too many request bytes to buffer. Ensure the

@@ -15,10 +15,8 @@ namespace Upstream {
  */
 class StrictDnsClusterImpl : public BaseDynamicClusterImpl {
 public:
-  StrictDnsClusterImpl(Server::Configuration::ServerFactoryContext& server_context,
-                       const envoy::config::cluster::v3::Cluster& cluster,
-                       ClusterFactoryContext& context, Runtime::Loader& runtime,
-                       Network::DnsResolverSharedPtr dns_resolver, bool added_via_api);
+  StrictDnsClusterImpl(const envoy::config::cluster::v3::Cluster& cluster,
+                       ClusterFactoryContext& context, Network::DnsResolverSharedPtr dns_resolver);
 
   // Upstream::Cluster
   InitializePhase initializePhase() const override { return InitializePhase::Primary; }
@@ -70,6 +68,7 @@ private:
   const bool respect_dns_ttl_;
   Network::DnsLookupFamily dns_lookup_family_;
   uint32_t overprovisioning_factor_;
+  bool weighted_priority_health_;
 };
 
 /**
@@ -81,8 +80,7 @@ public:
 
 private:
   std::pair<ClusterImplBaseSharedPtr, ThreadAwareLoadBalancerPtr>
-  createClusterImpl(Server::Configuration::ServerFactoryContext& server_context,
-                    const envoy::config::cluster::v3::Cluster& cluster,
+  createClusterImpl(const envoy::config::cluster::v3::Cluster& cluster,
                     ClusterFactoryContext& context) override;
 };
 

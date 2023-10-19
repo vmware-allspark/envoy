@@ -228,6 +228,7 @@ void SslSocket::drainErrorQueue() {
                                         absl::NullSafeStringView(ERR_func_error_string(err)), ":",
                                         absl::NullSafeStringView(ERR_reason_error_string(err))));
   }
+
   if (!failure_reason_.empty()) {
     ENVOY_CONN_LOG(debug, "remote address:{},{}", callbacks_->connection(),
                    callbacks_->connection().connectionInfoProvider().remoteAddress()->asString(),

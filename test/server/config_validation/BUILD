@@ -61,6 +61,7 @@ envoy_cc_test(
         "//source/extensions/transport_sockets/tls:config",
         "//source/server/config_validation:server_lib",
         "//test/integration:integration_lib",
+        "//test/mocks/network:network_mocks",
         "//test/mocks/server:options_mocks",
         "//test/mocks/stats:stats_mocks",
         "//test/test_common:environment_lib",
@@ -86,6 +87,7 @@ envoy_cc_test(
 
 envoy_cc_fuzz_test(
     name = "config_fuzz_test",
+    size = "large",
     srcs = ["config_fuzz_test.cc"],
     corpus = "//test/server:server_fuzz_test_corpus",
     deps = [

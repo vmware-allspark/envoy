@@ -17,6 +17,7 @@
 #include "source/common/common/fmt.h"
 #include "source/common/common/utility.h"
 #include "source/common/grpc/status.h"
+#include "source/common/http/character_set_validation.h"
 #include "source/common/http/exception.h"
 #include "source/common/http/header_map_impl.h"
 #include "source/common/http/headers.h"
@@ -460,9 +461,28 @@ void Utility::appendVia(RequestOrResponseHeaderMap& headers, const std::string& 
 
 void Utility::updateAuthority(RequestHeaderMap& headers, absl::string_view hostname,
                               const bool append_xfh) {
-  if (append_xfh && !headers.getHostValue().empty()) {
-    headers.appendForwardedHost(headers.getHostValue(), ",");
+  const auto host = headers.getHostValue();
+
+  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.append_xfh_idempotent")) {
+    // Only append to x-forwarded-host if the value was not the last value appended.
+    const auto xfh = headers.getForwardedHostValue();
+
+    if (append_xfh && !host.empty()) {
+      if (!xfh.empty()) {
+        const auto xfh_split = StringUtil::splitToken(xfh, ",");
+        if (!xfh_split.empty() && xfh_split.back() != host) {
+          headers.appendForwardedHost(host, ",");
+        }
+      } else {
+        headers.appendForwardedHost(host, ",");
+      }
+    }
+  } else {
+    if (append_xfh && !host.empty()) {
+      headers.appendForwardedHost(host, ",");
+    }
   }
+
   headers.setHost(hostname);
 }
 
@@ -566,7 +586,8 @@ std::string Utility::parseSetCookieValue(const Http::HeaderMap& headers, const s
 
 std::string Utility::makeSetCookieValue(const std::string& key, const std::string& value,
                                         const std::string& path, const std::chrono::seconds max_age,
-                                        bool httponly) {
+                                        bool httponly,
+                                        const Http::CookieAttributeRefVector attributes) {
   std::string cookie_value;
   // Best effort attempt to avoid numerous string copies.
   cookie_value.reserve(value.size() + path.size() + 30);
@@ -578,6 +599,15 @@ std::string Utility::makeSetCookieValue(const std::string& key, const std::strin
   if (!path.empty()) {
     absl::StrAppend(&cookie_value, "; Path=", path);
   }
+
+  for (auto const& attribute : attributes) {
+    if (attribute.get().value().empty()) {
+      absl::StrAppend(&cookie_value, "; ", attribute.get().name());
+    } else {
+      absl::StrAppend(&cookie_value, "; ", attribute.get().name(), "=", attribute.get().value());
+    }
+  }
+
   if (httponly) {
     absl::StrAppend(&cookie_value, "; HttpOnly");
   }
@@ -993,8 +1023,12 @@ std::string Utility::queryParamsToString(const QueryParams& params) {
 
 const std::string Utility::resetReasonToString(const Http::StreamResetReason reset_reason) {
   switch (reset_reason) {
-  case Http::StreamResetReason::ConnectionFailure:
-    return "connection failure";
+  case Http::StreamResetReason::LocalConnectionFailure:
+    return "local connection failure";
+  case Http::StreamResetReason::RemoteConnectionFailure:
+    return "remote connection failure";
+  case Http::StreamResetReason::ConnectionTimeout:
+    return "connection timeout";
   case Http::StreamResetReason::ConnectionTermination:
     return "connection termination";
   case Http::StreamResetReason::LocalReset:
@@ -1149,7 +1183,7 @@ namespace {
 // %-encode all ASCII character codepoints, EXCEPT:
 // ALPHA | DIGIT | * | - | . | _
 // SPACE is encoded as %20, NOT as the + character
-constexpr uint32_t kUrlEncodedCharTable[] = {
+constexpr std::array<uint32_t, 8> kUrlEncodedCharTable = {
     // control characters
     0b11111111111111111111111111111111,
     // !"#$%&'()*+,-./0123456789:;<=>?
@@ -1165,7 +1199,7 @@ constexpr uint32_t kUrlEncodedCharTable[] = {
     0b11111111111111111111111111111111,
 };
 
-constexpr uint32_t kUrlDecodedCharTable[] = {
+constexpr std::array<uint32_t, 8> kUrlDecodedCharTable = {
     // control characters
     0b00000000000000000000000000000000,
     // !"#$%&'()*+,-./0123456789:;<=>?
@@ -1181,14 +1215,9 @@ constexpr uint32_t kUrlDecodedCharTable[] = {
     0b00000000000000000000000000000000,
 };
 
-bool testChar(const uint32_t table[8], char c) {
-  uint8_t uc = static_cast<uint8_t>(c);
-  return (table[uc >> 5] & (0x80000000 >> (uc & 0x1f))) != 0;
-}
+bool shouldPercentEncodeChar(char c) { return testCharInTable(kUrlEncodedCharTable, c); }
 
-bool shouldPercentEncodeChar(char c) { return testChar(kUrlEncodedCharTable, c); }
-
-bool shouldPercentDecodeChar(char c) { return testChar(kUrlDecodedCharTable, c); }
+bool shouldPercentDecodeChar(char c) { return testCharInTable(kUrlDecodedCharTable, c); }
 } // namespace
 
 std::string Utility::PercentEncoding::urlEncodeQueryParameter(absl::string_view value) {
@@ -1467,21 +1496,6 @@ bool Utility::isValidRefererValue(absl::string_view value) {
     return !(url.containsFragment() || url.containsUserinfo());
   }
 
-  constexpr uint32_t pathCharTable[] = {
-      // control characters
-      0b00000000000000000000000000000000,
-      // !"#$%&'()*+,-./0123456789:;<=>?
-      0b01001111111111111111111111110101,
-      //@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_
-      0b11111111111111111111111111100001,
-      //`abcdefghijklmnopqrstuvwxyz{|}~
-      0b01111111111111111111111111100010,
-      // extended ascii
-      0b00000000000000000000000000000000,
-      0b00000000000000000000000000000000,
-      0b00000000000000000000000000000000,
-      0b00000000000000000000000000000000,
-  };
   bool seen_slash = false;
 
   for (char c : value) {
@@ -1497,7 +1511,7 @@ bool Utility::isValidRefererValue(absl::string_view value) {
       seen_slash = true;
       continue;
     default:
-      if (!testChar(pathCharTable, c)) {
+      if (!testCharInTable(kUriQueryAndFragmentCharTable, c)) {
         return false;
       }
     }

@@ -29,7 +29,7 @@ parameters:
 jobs:
 - job: prechecks
   displayName: Precheck
-  timeoutInMinutes: 20
+  timeoutInMinutes: 30
   pool:
     vmImage: $(agentUbuntu)
   variables:

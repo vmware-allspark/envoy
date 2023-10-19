@@ -17,6 +17,7 @@ ARN
 ASAN
 ASCII
 ASM
+ASN
 ASSERTed
 ASSERTs
 AST
@@ -293,6 +294,7 @@ OCSP
 OD
 ODCDS
 middlewildcard
+monostate
 mpd
 oghttp
 OID
@@ -445,6 +447,7 @@ VH
 VHDS
 VLOG
 VM
+VPN
 WAITFORONE
 WASM
 WAVM
@@ -477,6 +480,7 @@ acks
 acls
 addr
 agg
+AggregationTemporality
 alice
 alignas
 alignof
@@ -490,6 +494,8 @@ alls
 alphanumerics
 amongst
 anno
+anonymization
+anonymizing
 anys
 appmesh
 arg
@@ -757,6 +763,9 @@ gRPC
 gateway
 gcov
 genrule
+geolocation
+geoip
+Geoip
 getaddrinfo
 getaffinity
 gethostname
@@ -806,6 +815,7 @@ idx
 ifdef
 iff
 ified
+ifndef
 impl
 implementors
 impls
@@ -915,6 +925,7 @@ metatable
 microbenchmarks
 midp
 milli
+mimics
 misconfiguration
 misconfigured
 mixin
@@ -1151,10 +1162,12 @@ responder
 restarter
 resync
 ret
+retransmissions
 retransmitted
 retransmitting
 retriable
 retriggers
+retryable
 revalidated
 revalidation
 reverify
@@ -1195,6 +1208,7 @@ serv
 servercert
 setenv
 setsockopt
+sfixed
 sig
 sigaction
 sigactions
@@ -1204,6 +1218,7 @@ signalstack
 siloed
 sim
 sinked
+sint
 sizeof
 smatch
 snapshotted

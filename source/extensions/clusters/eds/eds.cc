@@ -13,16 +13,13 @@
 namespace Envoy {
 namespace Upstream {
 
-EdsClusterImpl::EdsClusterImpl(Server::Configuration::ServerFactoryContext& server_context,
-                               const envoy::config::cluster::v3::Cluster& cluster,
-                               ClusterFactoryContext& cluster_context, Runtime::Loader& runtime,
-                               bool added_via_api)
-    : BaseDynamicClusterImpl(server_context, cluster, cluster_context, runtime, added_via_api,
-                             cluster_context.mainThreadDispatcher().timeSource()),
+EdsClusterImpl::EdsClusterImpl(const envoy::config::cluster::v3::Cluster& cluster,
+                               ClusterFactoryContext& cluster_context)
+    : BaseDynamicClusterImpl(cluster, cluster_context),
       Envoy::Config::SubscriptionBase<envoy::config::endpoint::v3::ClusterLoadAssignment>(
           cluster_context.messageValidationVisitor(), "cluster_name"),
-      local_info_(cluster_context.localInfo()) {
-  Event::Dispatcher& dispatcher = cluster_context.mainThreadDispatcher();
+      local_info_(cluster_context.serverFactoryContext().localInfo()) {
+  Event::Dispatcher& dispatcher = cluster_context.serverFactoryContext().mainThreadDispatcher();
   assignment_timeout_ = dispatcher.createTimer([this]() -> void { onAssignmentTimeout(); });
   const auto& eds_config = cluster.eds_cluster_config().eds_config();
   if (Config::SubscriptionFactory::isPathBasedConfigSource(
@@ -80,6 +77,8 @@ void EdsClusterImpl::BatchUpdateHelper::batchUpdate(PrioritySet::HostUpdateCb& h
 
   const uint32_t overprovisioning_factor = PROTOBUF_GET_WRAPPED_OR_DEFAULT(
       cluster_load_assignment_.policy(), overprovisioning_factor, kDefaultOverProvisioningFactor);
+  const bool weighted_priority_health =
+      cluster_load_assignment_.policy().weighted_priority_health();
 
   LocalityWeightsMap empty_locality_map;
 
@@ -91,14 +90,16 @@ void EdsClusterImpl::BatchUpdateHelper::batchUpdate(PrioritySet::HostUpdateCb& h
     }
     if (priority_state[i].first != nullptr) {
       cluster_rebuilt |= parent_.updateHostsPerLocality(
-          i, overprovisioning_factor, *priority_state[i].first, parent_.locality_weights_map_[i],
-          priority_state[i].second, priority_state_manager, *all_hosts, all_new_hosts);
+          i, weighted_priority_health, overprovisioning_factor, *priority_state[i].first,
+          parent_.locality_weights_map_[i], priority_state[i].second, priority_state_manager,
+          *all_hosts, all_new_hosts);
     } else {
       // If the new update contains a priority with no hosts, call the update function with an empty
       // set of hosts.
-      cluster_rebuilt |= parent_.updateHostsPerLocality(
-          i, overprovisioning_factor, {}, parent_.locality_weights_map_[i], empty_locality_map,
-          priority_state_manager, *all_hosts, all_new_hosts);
+      cluster_rebuilt |=
+          parent_.updateHostsPerLocality(i, weighted_priority_health, overprovisioning_factor, {},
+                                         parent_.locality_weights_map_[i], empty_locality_map,
+                                         priority_state_manager, *all_hosts, all_new_hosts);
     }
   }
 
@@ -110,8 +111,8 @@ void EdsClusterImpl::BatchUpdateHelper::batchUpdate(PrioritySet::HostUpdateCb& h
       parent_.locality_weights_map_.resize(i + 1);
     }
     cluster_rebuilt |= parent_.updateHostsPerLocality(
-        i, overprovisioning_factor, {}, parent_.locality_weights_map_[i], empty_locality_map,
-        priority_state_manager, *all_hosts, all_new_hosts);
+        i, weighted_priority_health, overprovisioning_factor, {}, parent_.locality_weights_map_[i],
+        empty_locality_map, priority_state_manager, *all_hosts, all_new_hosts);
   }
 
   if (!cluster_rebuilt) {
@@ -128,14 +129,22 @@ void EdsClusterImpl::BatchUpdateHelper::updateLocalityEndpoints(
     const envoy::config::endpoint::v3::LocalityLbEndpoints& locality_lb_endpoint,
     PriorityStateManager& priority_state_manager, absl::flat_hash_set<std::string>& all_new_hosts) {
   const auto address = parent_.resolveProtoAddress(lb_endpoint.endpoint().address());
+  std::vector<Network::Address::InstanceConstSharedPtr> address_list;
+  if (!lb_endpoint.endpoint().additional_addresses().empty()) {
+    address_list.push_back(address);
+    for (const auto& additional_address : lb_endpoint.endpoint().additional_addresses()) {
+      address_list.emplace_back(parent_.resolveProtoAddress(additional_address.address()));
+    }
+  }
+
   // When the configuration contains duplicate hosts, only the first one will be retained.
   const auto address_as_string = address->asString();
-  if (all_new_hosts.count(address_as_string) > 0) {
+  if (all_new_hosts.contains(address_as_string)) {
     return;
   }
 
   priority_state_manager.registerHostForPriority(lb_endpoint.endpoint().hostname(), address,
-                                                 locality_lb_endpoint, lb_endpoint,
+                                                 address_list, locality_lb_endpoint, lb_endpoint,
                                                  parent_.time_source_);
   all_new_hosts.emplace(address_as_string);
 }
@@ -320,17 +329,17 @@ void EdsClusterImpl::reloadHealthyHostsHelper(const HostSharedPtr& host) {
     HostsPerLocalityConstSharedPtr hosts_per_locality_copy = host_set->hostsPerLocality().filter(
         {[&host_to_exclude](const Host& host) { return &host != host_to_exclude.get(); }})[0];
 
-    prioritySet().updateHosts(priority,
-                              HostSetImpl::partitionHosts(hosts_copy, hosts_per_locality_copy),
-                              host_set->localityWeights(), {}, hosts_to_remove, absl::nullopt);
+    prioritySet().updateHosts(
+        priority, HostSetImpl::partitionHosts(hosts_copy, hosts_per_locality_copy),
+        host_set->localityWeights(), {}, hosts_to_remove, absl::nullopt, absl::nullopt);
   }
 }
 
 bool EdsClusterImpl::updateHostsPerLocality(
-    const uint32_t priority, const uint32_t overprovisioning_factor, const HostVector& new_hosts,
-    LocalityWeightsMap& locality_weights_map, LocalityWeightsMap& new_locality_weights_map,
-    PriorityStateManager& priority_state_manager, const HostMap& all_hosts,
-    const absl::flat_hash_set<std::string>& all_new_hosts) {
+    const uint32_t priority, bool weighted_priority_health, const uint32_t overprovisioning_factor,
+    const HostVector& new_hosts, LocalityWeightsMap& locality_weights_map,
+    LocalityWeightsMap& new_locality_weights_map, PriorityStateManager& priority_state_manager,
+    const HostMap& all_hosts, const absl::flat_hash_set<std::string>& all_new_hosts) {
   const auto& host_set = priority_set_.getOrCreateHostSet(priority, overprovisioning_factor);
   HostVectorSharedPtr current_hosts_copy(new HostVector(host_set.hosts()));
 
@@ -348,7 +357,8 @@ bool EdsClusterImpl::updateHostsPerLocality(
   // about this. In the future we may need to do better here.
   const bool hosts_updated = updateDynamicHostList(new_hosts, *current_hosts_copy, hosts_added,
                                                    hosts_removed, all_hosts, all_new_hosts);
-  if (hosts_updated || host_set.overprovisioningFactor() != overprovisioning_factor ||
+  if (hosts_updated || host_set.weightedPriorityHealth() != weighted_priority_health ||
+      host_set.overprovisioningFactor() != overprovisioning_factor ||
       locality_weights_map != new_locality_weights_map) {
     ASSERT(std::all_of(current_hosts_copy->begin(), current_hosts_copy->end(),
                        [&](const auto& host) { return host->priority() == priority; }));
@@ -357,9 +367,9 @@ bool EdsClusterImpl::updateHostsPerLocality(
               "EDS hosts or locality weights changed for cluster: {} current hosts {} priority {}",
               info_->name(), host_set.hosts().size(), host_set.priority());
 
-    priority_state_manager.updateClusterPrioritySet(priority, std::move(current_hosts_copy),
-                                                    hosts_added, hosts_removed, absl::nullopt,
-                                                    overprovisioning_factor);
+    priority_state_manager.updateClusterPrioritySet(
+        priority, std::move(current_hosts_copy), hosts_added, hosts_removed, absl::nullopt,
+        weighted_priority_health, overprovisioning_factor);
     return true;
   }
   return false;
@@ -373,16 +383,13 @@ void EdsClusterImpl::onConfigUpdateFailed(Envoy::Config::ConfigUpdateFailureReas
 }
 
 std::pair<ClusterImplBaseSharedPtr, ThreadAwareLoadBalancerPtr>
-EdsClusterFactory::createClusterImpl(Server::Configuration::ServerFactoryContext& server_context,
-                                     const envoy::config::cluster::v3::Cluster& cluster,
+EdsClusterFactory::createClusterImpl(const envoy::config::cluster::v3::Cluster& cluster,
                                      ClusterFactoryContext& context) {
   if (!cluster.has_eds_cluster_config()) {
     throw EnvoyException("cannot create an EDS cluster without an EDS config");
   }
 
-  return std::make_pair(std::make_unique<EdsClusterImpl>(server_context, cluster, context,
-                                                         context.runtime(), context.addedViaApi()),
-                        nullptr);
+  return std::make_pair(std::make_unique<EdsClusterImpl>(cluster, context), nullptr);
 }
 
 bool EdsClusterImpl::validateAllLedsUpdated() const {
